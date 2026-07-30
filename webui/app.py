@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import threading
 import uuid
 from pathlib import Path
@@ -15,7 +16,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from commands import COMMAND_TREE, find_command
+from commands import COMMAND_TREES, find_command
 from db import Database
 from devices import DeviceConfigError, StoredDevice, load_devices
 from loki_client import LokiClient, LokiError
@@ -30,14 +31,18 @@ log = logging.getLogger("webui")
 
 BASE_DIR = Path(__file__).parent
 DEVICES_PATH = os.environ.get("DEVICES_FILE", str(BASE_DIR / "devices.yaml"))
-DB_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "data" / "switchboard.db"))
 LEGACY_STORE_PATH = os.environ.get("DEVICE_STORE_FILE", str(BASE_DIR / "data" / "devices_store.json"))
+LEGACY_SQLITE_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "data" / "switchboard.db"))
 LOKI_URL = os.environ.get("LOKI_URL", "http://192.168.0.145:3100")
 
 WEBUI_USER = os.environ.get("WEBUI_USER")
 WEBUI_PASS = os.environ.get("WEBUI_PASS")
 if not WEBUI_USER or not WEBUI_PASS:
     raise RuntimeError("WEBUI_USER and WEBUI_PASS must be set - this tool runs commands against production network gear")
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL must be set - Switchboard's device store and saved results live in Postgres")
 
 security = HTTPBasic()
 
@@ -53,9 +58,9 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(security)):
 app = FastAPI(title="Switchboard")
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-DB = Database(DB_PATH)
+DB = Database(DATABASE_URL)
 STORE = DeviceStore(DB)
+RESULTS = ResultsStore(DB)
 
 
 def _migrate_legacy_json_devices():
@@ -76,13 +81,64 @@ def _migrate_legacy_json_devices():
             STORE.add(record)
         except ValueError:
             pass
-    log.info("migrated %d device(s) from legacy %s into %s", len(legacy), LEGACY_STORE_PATH, DB_PATH)
+    log.info("migrated %d device(s) from legacy %s into Postgres", len(legacy), LEGACY_STORE_PATH)
+
+
+def _migrate_legacy_sqlite():
+    """One-time import from the pre-Postgres switchboard.db, if it's ever
+    present with rows on an existing volume. A no-op on any volume created
+    after this change (no legacy file), or once Postgres already has rows
+    (so this is safe to run every startup, same as the JSON migration
+    above) - checked per-table since devices and results are independent."""
+    if not os.path.exists(LEGACY_SQLITE_PATH):
+        return
+    try:
+        legacy_conn = sqlite3.connect(LEGACY_SQLITE_PATH)
+        legacy_conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return
+
+    if not STORE.load():
+        rows = legacy_conn.execute("SELECT data FROM devices ORDER BY rowid").fetchall()
+        migrated = 0
+        for row in rows:
+            try:
+                STORE.add(json.loads(row["data"]))
+                migrated += 1
+            except ValueError:
+                pass
+        if migrated:
+            log.info("migrated %d device(s) from legacy %s into Postgres", migrated, LEGACY_SQLITE_PATH)
+
+    if not RESULTS.list(limit=1):
+        rows = legacy_conn.execute(
+            """SELECT filename, device_id, device_name, host, category_id, command_id, command, summary,
+                      output, markdown, auto_saved, created_at
+               FROM results ORDER BY filename"""
+        ).fetchall()
+        for row in rows:
+            DB.execute(
+                """INSERT INTO results
+                   (filename, device_id, device_name, host, category_id, command_id, command, summary, output,
+                    markdown, auto_saved, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (filename) DO NOTHING""",
+                (
+                    row["filename"], row["device_id"], row["device_name"], row["host"], row["category_id"],
+                    row["command_id"], row["command"], row["summary"], row["output"], row["markdown"],
+                    row["auto_saved"], row["created_at"],
+                ),
+            )
+        if rows:
+            log.info("migrated %d result(s) from legacy %s into Postgres", len(rows), LEGACY_SQLITE_PATH)
+
+    legacy_conn.close()
 
 
 _migrate_legacy_json_devices()
+_migrate_legacy_sqlite()
 
 DEVICES = load_devices(DEVICES_PATH, STORE)
-RESULTS = ResultsStore(DB)
 LOKI = LokiClient(LOKI_URL)
 DEVICES_BY_ID = {d.id: d for d in DEVICES}
 
@@ -106,6 +162,7 @@ def _make_switch(device):
         enable_password=device.enable_password,
         private_key=device.private_key,
         passphrase=device.passphrase,
+        platform=device.platform,
     )
 
 
@@ -155,9 +212,26 @@ class DeviceCreateRequest(BaseModel):
     private_key: Optional[str] = None
     passphrase: Optional[str] = None
     enable_password: Optional[str] = None
+    # Whitelist for parameterized commands (e.g. "show interfaces <port>
+    # transceiver") - same shape as devices.yaml's `ports`/`port_channels`,
+    # just entered through the UI instead of a static file. Optional:
+    # a device with none of this set simply can't run parameterized
+    # commands, everything else still works.
+    ports: Optional[list] = None
+    port_channels: Optional[dict] = None
+    # Only used by /api/devices/test, when testing a draft edit of an
+    # existing device without re-entering its secret - lets the test fall
+    # back to the already-stored password/key the same way a real save
+    # would, instead of a confusing "password is required" for a field the
+    # user deliberately left blank to keep unchanged.
+    edit_id: Optional[str] = None
 
 
-def _validate_device_request(req):
+def _validate_device_request(req, existing=None):
+    """`existing` is the current raw record when editing - a blank
+    password/private_key in the request then means "keep what's on file"
+    rather than "missing", so it isn't rejected the way a genuinely new
+    device with no credential at all would be."""
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="name is required")
     if not req.host.strip():
@@ -165,13 +239,20 @@ def _validate_device_request(req):
     if not req.username.strip():
         raise HTTPException(status_code=400, detail="username is required")
     if req.auth_method == "password":
-        if not req.password:
+        if not req.password and not (existing and existing.get("password")):
             raise HTTPException(status_code=400, detail="password is required for password auth")
     elif req.auth_method == "ssh_key":
-        if not req.private_key:
+        if not req.private_key and not (existing and existing.get("private_key")):
             raise HTTPException(status_code=400, detail="private_key is required for SSH key auth")
     else:
         raise HTTPException(status_code=400, detail="auth_method must be 'password' or 'ssh_key'")
+    for spec in req.ports or []:
+        if "prefix" not in spec or "range" not in spec or len(spec["range"]) != 2:
+            raise HTTPException(status_code=400, detail="each ports entry needs 'prefix' and a 2-value 'range'")
+    if req.port_channels is not None and (
+        "range" not in req.port_channels or len(req.port_channels["range"]) != 2
+    ):
+        raise HTTPException(status_code=400, detail="port_channels needs a 2-value 'range'")
 
 
 @app.get("/api/devices")
@@ -197,6 +278,8 @@ def api_create_device(req: DeviceCreateRequest, user: str = Depends(require_auth
             "private_key": req.private_key,
             "passphrase": req.passphrase,
             "enable_password": req.enable_password,
+            "ports": req.ports,
+            "port_channels": req.port_channels,
         }
         STORE.add(record)
         device = StoredDevice(record)
@@ -206,6 +289,67 @@ def api_create_device(req: DeviceCreateRequest, user: str = Depends(require_auth
     STATUS.start(device)
     log.info("user=%s added device %s (%s)", user, device.id, device.host)
     return device.to_public_dict()
+
+
+@app.get("/api/devices/{device_id}/edit")
+def api_get_device_for_edit(device_id: str, user: str = Depends(require_auth)):
+    """Everything the Edit form needs to repopulate itself - see
+    `StoredDevice.to_edit_dict()` for exactly what is (and isn't)
+    included. Static (devices.yaml) devices aren't editable through the
+    UI at all."""
+    device = DEVICES_BY_ID.get(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    if device.source != "added":
+        raise HTTPException(status_code=400, detail="only devices added through the UI can be edited")
+    return device.to_edit_dict()
+
+
+@app.put("/api/devices/{device_id}")
+def api_update_device(device_id: str, req: DeviceCreateRequest, user: str = Depends(require_auth)):
+    device = DEVICES_BY_ID.get(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    if device.source != "added":
+        raise HTTPException(status_code=400, detail="only devices added through the UI can be edited")
+
+    existing = STORE.get_raw(device_id)
+    _validate_device_request(req, existing=existing)
+
+    with _registry_lock:
+        record = {
+            "id": device_id,
+            "name": req.name.strip(),
+            "host": req.host.strip(),
+            "make": req.make.strip(),
+            "model": req.model.strip(),
+            "platform": req.platform,
+            "username": req.username.strip(),
+            "auth_method": req.auth_method,
+            # Blank in the request means "keep the existing secret" - a
+            # secret already on file never has to round-trip through the
+            # browser just to let someone fix an unrelated field like `make`.
+            "password": req.password or (existing or {}).get("password"),
+            "private_key": req.private_key or (existing or {}).get("private_key"),
+            "passphrase": req.passphrase or (existing or {}).get("passphrase"),
+            "enable_password": req.enable_password or (existing or {}).get("enable_password"),
+            "ports": req.ports,
+            "port_channels": req.port_channels,
+        }
+        STORE.update(device_id, record)
+        new_device = StoredDevice(record)
+        idx = next(i for i, d in enumerate(DEVICES) if d.id == device_id)
+        DEVICES[idx] = new_device
+        DEVICES_BY_ID[device_id] = new_device
+        # Host/credentials may have changed - drop any live session rather
+        # than keep running against stale connection details.
+        switch = _sessions.pop(device_id, None)
+    STATUS.stop(device_id)
+    STATUS.start(new_device)
+    if switch is not None:
+        switch.close()
+    log.info("user=%s updated device %s (%s)", user, device_id, new_device.host)
+    return new_device.to_public_dict()
 
 
 @app.delete("/api/devices/{device_id}")
@@ -256,17 +400,28 @@ def api_device_status_refresh(device_id: str, user: str = Depends(require_auth))
 def api_test_device(req: DeviceCreateRequest, user: str = Depends(require_auth)):
     """Try connecting with the given draft device details, without saving
     anything. Best-effort: a failure here doesn't block Save, since the
-    enable-mode handshake this checks is Dell OS9-specific and a device
-    running something else may legitimately fail it while still being
-    fine to store for later."""
-    _validate_device_request(req)
+    login handshake this checks only has real support for `os9`/`junos`
+    today and a device running something else may legitimately fail it
+    while still being fine to store for later.
+
+    `edit_id`, if set, is the device being edited - a blank
+    password/private_key then falls back to what's already stored, same
+    as a real save would, rather than failing validation for a field the
+    user deliberately left untouched."""
+    existing = STORE.get_raw(req.edit_id) if req.edit_id else None
+    _validate_device_request(req, existing=existing)
+    password = req.password or (existing or {}).get("password")
+    private_key = req.private_key or (existing or {}).get("private_key")
+    passphrase = req.passphrase or (existing or {}).get("passphrase")
+    enable_password = req.enable_password or (existing or {}).get("enable_password")
     switch = SwitchSSH(
         req.host.strip(),
         req.username.strip(),
-        req.password,
-        enable_password=req.enable_password or req.password,
-        private_key=req.private_key,
-        passphrase=req.passphrase,
+        password,
+        enable_password=enable_password or password,
+        private_key=private_key,
+        passphrase=passphrase,
+        platform=req.platform,
         timeout=8,
     )
     try:
@@ -274,7 +429,8 @@ def api_test_device(req: DeviceCreateRequest, user: str = Depends(require_auth))
         switch.close()
     except SwitchSSHError as e:
         return {"ok": False, "message": str(e)}
-    return {"ok": True, "message": "Connected and reached privileged EXEC mode."}
+    reached = "privileged EXEC mode" if req.platform != "junos" else "Junos operational mode"
+    return {"ok": True, "message": f"Connected and reached {reached}."}
 
 
 @app.get("/api/devices/{device_id}/values/{param_name}")
@@ -287,7 +443,7 @@ def api_device_param_values(device_id: str, param_name: str, user: str = Depends
 
 @app.get("/api/commands")
 def api_commands(user: str = Depends(require_auth)):
-    return COMMAND_TREE
+    return COMMAND_TREES
 
 
 @app.post("/api/run")
@@ -296,7 +452,7 @@ def api_run(req: RunRequest, user: str = Depends(require_auth)):
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
 
-    spec = find_command(req.category_id, req.command_id)
+    spec = find_command(req.category_id, req.command_id, device.platform)
     if spec is None:
         raise HTTPException(status_code=404, detail="unknown command")
 
@@ -319,7 +475,7 @@ def api_run(req: RunRequest, user: str = Depends(require_auth)):
     except SwitchSSHError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    summary = summarize(req.category_id, req.command_id, output)
+    summary = summarize(device.platform, req.category_id, req.command_id, output)
 
     # Every run is auto-saved - no separate "Save result" click needed.
     # (Kept the manual POST below too, for scripted/API use.)

@@ -1,31 +1,35 @@
 """Best-effort one/two-line human summaries for command output.
 
-Keyed by (category_id, command_id) so the same literal command text used
-in two different menu spots can't accidentally get mismatched summarizers.
-Every summarizer takes the raw output string and returns a short string,
-or None if it has nothing useful to add (the raw output is always shown
-regardless - this is a supplement, never a replacement).
+Keyed by (platform, category_id, command_id) - platform included so Dell
+and Junos can both use category ids like "system"/"version" without
+colliding, since the two command trees are otherwise independent.
+`platform` defaults to "os9" so every summarizer already written before
+Junos support existed needs no change. Every summarizer takes the raw
+output string and returns a short string, or None if it has nothing
+useful to add (the raw output is always shown regardless - this is a
+supplement, never a replacement).
 
 A summarizer must never raise - anything that goes wrong here should just
 mean "no summary", not a broken response to the user's click.
 """
 import re
 
+import junos_parsers
 import parsers
 
 SUMMARIZERS = {}
 
 
-def summarizer(category_id, command_id):
+def summarizer(category_id, command_id, platform="os9"):
     def deco(fn):
-        SUMMARIZERS[(category_id, command_id)] = fn
+        SUMMARIZERS[(platform, category_id, command_id)] = fn
         return fn
 
     return deco
 
 
-def summarize(category_id, command_id, output):
-    fn = SUMMARIZERS.get((category_id, command_id))
+def summarize(platform, category_id, command_id, output):
+    fn = SUMMARIZERS.get((platform, category_id, command_id))
     if fn is None:
         return None
     try:
@@ -406,3 +410,95 @@ def _vrrp(out):
 def _users(out):
     n = _count(r"^\s*\*?\d+\s+vty", out, re.MULTILINE)
     return f"{n} active vty session(s)" if n else None
+
+
+# --- Junos (EX3300) --------------------------------------------------------
+
+
+@summarizer("system", "version", platform="junos")
+def _junos_version(out):
+    model = re.search(r"Model:\s*(\S+)", out)
+    junos = re.search(r"Junos:\s*(\S+)", out)
+    parts = []
+    if model:
+        parts.append(model.group(1))
+    if junos:
+        parts.append(f"Junos {junos.group(1)}")
+    return " | ".join(parts) or None
+
+
+@summarizer("system", "routing_engine", platform="junos")
+def _junos_routing_engine(out):
+    d = junos_parsers.parse_junos_routing_engine(out)
+    parts = []
+    if d.get("temp_c") is not None:
+        parts.append(f"{d['temp_c']}C")
+    if d.get("memory_pct") is not None:
+        parts.append(f"{d['memory_pct']}% memory used")
+    idle = d.get("cpu", {}).get("idle")
+    if idle is not None:
+        parts.append(f"{100 - idle}% CPU")
+    if d.get("uptime"):
+        parts.append(f"up {d['uptime']}")
+    return " | ".join(parts) or None
+
+
+@summarizer("system", "chassis_alarms", platform="junos")
+@summarizer("system", "system_alarms", platform="junos")
+def _junos_alarms(out):
+    m = re.match(r"(\d+) alarms currently active", out.strip())
+    return f"{m.group(1)} alarm(s) currently active" if m else None
+
+
+@summarizer("interfaces", "if_terse", platform="junos")
+def _junos_if_terse(out):
+    rows = junos_parsers.parse_junos_interfaces_terse(out)
+    if not rows:
+        return None
+    up = sum(1 for r in rows if r["link"] == "up")
+    return f"{len(rows)} interfaces: {up} up, {len(rows) - up} down"
+
+
+@summarizer("interfaces", "if_desc", platform="junos")
+def _junos_if_desc(out):
+    rows = junos_parsers.parse_junos_interfaces_descriptions(out)
+    return f"{len(rows)} interface(s) with a description set" if rows else None
+
+
+@summarizer("l2", "vlans", platform="junos")
+def _junos_vlans(out):
+    n = _count(r"^\S+\s+\d+\s*$", out, re.MULTILINE)
+    return f"{n} VLAN(s)" if n else None
+
+
+@summarizer("l2", "eth_switching", platform="junos")
+def _junos_eth_switching(out):
+    m = re.search(r"(\d+) entries,\s*(\d+) learned", out)
+    return f"{m.group(1)} entries ({m.group(2)} learned)" if m else None
+
+
+@summarizer("l2", "stp", platform="junos")
+def _junos_stp(out):
+    m = re.search(r"Enabled protocol\s*:\s*(\S+)", out)
+    root = re.search(r"Root ID\s*:\s*(\S+)", out)
+    parts = []
+    if m:
+        parts.append(m.group(1))
+    if root:
+        parts.append(f"root {root.group(1)}")
+    return ", ".join(parts) or None
+
+
+@summarizer("neighbors", "lldp", platform="junos")
+def _junos_lldp(out):
+    n = _count(r"^\S+\s+\S+\s+[0-9a-f:]{17}\s", out, re.MULTILINE)
+    return f"{n} LLDP neighbor(s)" if n else "0 LLDP neighbors"
+
+
+@summarizer("port_channels", "lacp_detail", platform="junos")
+def _junos_lacp_detail(out):
+    m = re.search(r"Aggregated interface:\s*(\S+)", out)
+    members = set(re.findall(r"^\s+(\S+)\s+Actor\b", out, re.MULTILINE))
+    if not m:
+        return None
+    return f"{m.group(1)}: {len(members)} member(s)" if members else m.group(1)

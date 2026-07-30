@@ -1,23 +1,24 @@
-"""SQLite-backed storage for everything Switchboard persists: devices added
-through the UI, and saved command results. Replaces the earlier
-JSON-file-per-store / one-.md-file-per-result approach with a single
-database file on the same Docker volume, using only the standard library
-(`sqlite3`) - no ORM, no new dependency.
+"""Postgres-backed storage for everything Switchboard persists: devices added
+through the UI, and saved command results. Was SQLite on a Docker volume
+until this app outgrew "one file, one process" (see ROADMAP.md Phase 2) -
+this is the same storage layer, same interface, pointed at a real database.
 
-One shared connection guarded by a lock: sqlite3 connections aren't safe
-to use concurrently from multiple threads, and FastAPI's sync endpoints
-(plus status_poller's background threads, which don't touch this at all)
-can run on different worker threads. A single lock around every statement
-is simple and correct at the request volumes this tool sees - this is an
-internal ops console, not a high-throughput service.
+One shared connection guarded by a lock: this is still an internal ops
+console at low request volume, not a case for a connection pool. What's
+different from the SQLite version is that a network database connection
+can actually drop (a local file never does), so every method retries once
+after reconnecting if it hits a dead connection.
 """
-import sqlite3
 import threading
+
+import psycopg2
+import psycopg2.extras
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
     id TEXT PRIMARY KEY,
-    data TEXT NOT NULL
+    data TEXT NOT NULL,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS results (
@@ -40,24 +41,65 @@ CREATE INDEX IF NOT EXISTS idx_results_created ON results(created_at);
 
 
 class Database:
-    def __init__(self, path):
+    def __init__(self, dsn):
+        self._dsn = dsn
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self._conn = None
+        self._connect()
         with self._lock:
-            self._conn.executescript(SCHEMA)
+            with self._conn.cursor() as cur:
+                cur.execute(SCHEMA)
             self._conn.commit()
+
+    def _connect(self):
+        self._conn = psycopg2.connect(self._dsn, cursor_factory=psycopg2.extras.RealDictCursor)
+        self._conn.autocommit = False
+
+    def _with_reconnect(self, fn):
+        """Run `fn(cursor)` under the lock, retrying once after a fresh
+        reconnect if the connection turned out to be dead - a network
+        Postgres box can drop an idle connection in ways a local SQLite
+        file never could."""
+        with self._lock:
+            try:
+                with self._conn.cursor() as cur:
+                    result = fn(cur)
+                self._conn.commit()
+                return result
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                self._connect()
+                with self._conn.cursor() as cur:
+                    result = fn(cur)
+                self._conn.commit()
+                return result
 
     def execute(self, sql, params=()):
-        with self._lock:
-            cur = self._conn.execute(sql, params)
-            self._conn.commit()
-            return cur
+        def run(cur):
+            cur.execute(sql, params)
+            return cur.rowcount
+
+        rowcount = self._with_reconnect(run)
+        return _ExecResult(rowcount)
 
     def query(self, sql, params=()):
-        with self._lock:
-            return self._conn.execute(sql, params).fetchall()
+        def run(cur):
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+        return self._with_reconnect(run)
 
     def query_one(self, sql, params=()):
-        with self._lock:
-            return self._conn.execute(sql, params).fetchone()
+        def run(cur):
+            cur.execute(sql, params)
+            return cur.fetchone()
+
+        return self._with_reconnect(run)
+
+
+class _ExecResult:
+    """Mirrors the bit of sqlite3's cursor that callers actually use
+    (`cur.rowcount`) without exposing a psycopg2 cursor that's already
+    been closed by the time `execute()` returns."""
+
+    def __init__(self, rowcount):
+        self.rowcount = rowcount

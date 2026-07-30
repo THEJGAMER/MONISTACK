@@ -127,8 +127,76 @@ COMMAND_TREE = [
 ]
 
 
-def find_command(category_id, command_id):
-    for cat in COMMAND_TREE:
+JUNOS_COMMAND_TREE = [
+    {
+        "id": "system",
+        "label": "System",
+        "items": [
+            {"id": "version", "label": "Version", "cmd": "show version"},
+            {"id": "hardware", "label": "Hardware Inventory", "cmd": "show chassis hardware"},
+            {"id": "routing_engine", "label": "Routing Engine (CPU/memory/temp)", "cmd": "show chassis routing-engine"},
+            {"id": "uptime", "label": "Uptime", "cmd": "show system uptime"},
+            {"id": "environment", "label": "Environment (fans / PSU / temp)", "cmd": "show chassis environment"},
+            {"id": "chassis_alarms", "label": "Chassis Alarms", "cmd": "show chassis alarms"},
+            {"id": "system_alarms", "label": "System Alarms", "cmd": "show system alarms"},
+        ],
+    },
+    {
+        "id": "interfaces",
+        "label": "Interfaces",
+        "items": [
+            {"id": "if_terse", "label": "Status (all interfaces)", "cmd": "show interfaces terse"},
+            {"id": "if_desc", "label": "Descriptions", "cmd": "show interfaces descriptions"},
+            {
+                "id": "if_optics",
+                "label": "Transceiver Diagnostics",
+                "cmd": "show interfaces diagnostics optics {port}",
+                "param": "port",
+            },
+        ],
+    },
+    {
+        "id": "port_channels",
+        "label": "Port Channels",
+        "items": [
+            {
+                "id": "pc_detail",
+                "label": "Aggregate Interface Detail (counters)",
+                "cmd": "show interfaces {port_channel} extensive",
+                "param": "port_channel",
+            },
+            {
+                "id": "lacp_detail",
+                "label": "LACP Detail",
+                "cmd": "show lacp interfaces {port_channel}",
+                "param": "port_channel",
+            },
+        ],
+    },
+    {
+        "id": "l2",
+        "label": "Layer 2",
+        "items": [
+            {"id": "vlans", "label": "VLANs", "cmd": "show vlans"},
+            {"id": "eth_switching", "label": "Ethernet Switching Table", "cmd": "show ethernet-switching table"},
+            {"id": "stp", "label": "Spanning Tree Bridge", "cmd": "show spanning-tree bridge"},
+        ],
+    },
+    {
+        "id": "neighbors",
+        "label": "Neighbors",
+        "items": [
+            {"id": "lldp", "label": "LLDP Neighbors", "cmd": "show lldp neighbors"},
+        ],
+    },
+]
+
+COMMAND_TREES = {"os9": COMMAND_TREE, "junos": JUNOS_COMMAND_TREE}
+
+
+def find_command(category_id, command_id, platform="os9"):
+    tree = COMMAND_TREES.get(platform, COMMAND_TREE)
+    for cat in tree:
         if cat["id"] != category_id:
             continue
         for item in cat["items"]:

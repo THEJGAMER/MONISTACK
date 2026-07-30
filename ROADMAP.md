@@ -89,8 +89,10 @@ build on.
 - [ ] Timeout/retry policy review across SSH, Loki, and the frontend.
 
 ### 0.6 Frontend hygiene
-- [ ] Bundle is ~996 KB JS / ~1.15 MB CSS (Vite warns). Code-split by
-      route/tab so first paint isn't the whole app.
+- [ ] Bundle is ~1.03 MB JS / ~1.14 MB CSS (Vite warns; grew from ~996 KB
+      after adding `@cloudscape-design/board-components` for the Console's
+      dynamic board). Code-split by route/panel so first paint isn't the
+      whole app.
 - [ ] Pagination is client-side (`useClientPagination`) — the API returns
       everything and the browser slices it. Fine at 200 rows, wrong at
       50k. Move to server-side pagination for results and syslog.
@@ -137,9 +139,20 @@ The gate on anyone other than you using this.
 - [ ] **Multi-device exporter.** `exporter/exporter.py` is hardcoded to a
       single switch via `SWITCH_HOST`/`SWITCH_USER`/`SWITCH_PASS` env
       vars. It should read the same device registry the webui uses.
-- [ ] **Postgres instead of SQLite** once there's real concurrency (the
-      current single-connection-behind-a-lock design is deliberate and
-      correct for SQLite, but it's a throughput ceiling).
+- [x] **Postgres instead of SQLite** — done 2026-07-30. `webui/db.py` now
+      connects to Postgres via `DATABASE_URL`; `store.py`/`results_store.py`
+      unchanged in shape (same public methods, `?` → `%s` placeholders).
+      Single-connection-behind-a-lock design kept as-is (still correct at
+      this request volume) with one addition: a retry-once-after-reconnect
+      wrapper, since a network DB can drop a connection in ways a local
+      SQLite file never could. Existing data (54 saved results, 0 UI-added
+      devices) migrated automatically on first startup via
+      `_migrate_legacy_sqlite()` in `app.py`, mirroring the existing
+      `_migrate_legacy_json_devices()` idiom. See `webui/README.md`
+      "Storage" section for the encoding gotcha this surfaced (the Postgres
+      cluster was `SQL_ASCII` by default, not UTF8 - crashed on the first
+      migrated row until the database was recreated with
+      `ENCODING 'UTF8' TEMPLATE template0`).
 - [ ] **Streaming telemetry** — gNMI/gRPC or SNMP traps where hardware
       supports it, instead of polling `show` commands over SSH. SSH
       polling was the right call for *this* switch; it doesn't scale as
@@ -168,10 +181,19 @@ The gate on anyone other than you using this.
 - [ ] Alarm acknowledgement and assignment.
 
 ### 3.3 Multi-vendor
-- [ ] Per-platform command trees. The Devices page already accepts
-      Cisco/Arista/NX-OS, but the Console sends Dell OS9 syntax at them —
-      currently flagged "(experimental)" in the UI, which is honest but
-      not useful.
+- [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added
+      a real Juniper EX3300-48P (root SSH, verified live), with its own
+      command tree (`commands.py`'s `JUNOS_COMMAND_TREE`), login flow
+      (`ssh_client.py` - Junos lands in a FreeBSD shell, needs `cli`, no
+      enable concept, its own `---(more)---` pagination), parsers
+      (`junos_parsers.py`, built from real captured output), status
+      polling (`status_poller.py`'s `_poll_once_junos`), summaries, and an
+      accurate Front Panel illustration (`chassisProfiles.js`'s
+      `ex3300-48p`, traced against real reference photos). Devices with
+      any other "Operating System" selection (Cisco/Arista/NX-OS/Other)
+      are still "(experimental)" - saved and reachable over SSH, but with
+      no command tree wired up, so the Console shows an empty Commands
+      panel rather than guessing at syntax.
 - [ ] Replace hand-rolled paramiko + regex with Netmiko/Scrapli +
       ntc-templates/TextFSM for parsing across vendors.
 - [ ] Normalize parsed output into a vendor-neutral shape so the UI and
@@ -216,6 +238,30 @@ The gate on anyone other than you using this.
 
 ## Known issues / tech debt
 
+- **The Juniper EX3300 has no Syslog/Alarm History data** - deliberate
+  scope decision (2026-07-30), not a bug: enabling it needs a config
+  write on the device itself (`set system syslog host ...`) that wasn't
+  authorized. Switch Status still shows live alarms via `show chassis
+  alarms`/`show system alarms` polling, just no historical log.
+- **The Juniper EX3300's own clock is drifted** (`show system uptime`
+  showed April 2026 while it was really July 2026, found live during
+  Junos support work). Not fixed here - out of scope for a monitoring
+  tool to change production device config - but worth knowing before
+  trusting any Junos-side timestamp (device_timestamp-equivalent) at
+  face value, unlike the Dell switch's NTP-synced clock.
+- **Junos transceiver diagnostics aren't polled automatically.**
+  `status_poller.py`'s slow-cadence transceiver poll only has a Dell OS9
+  implementation; the Junos command (`show interfaces diagnostics optics
+  <port>`) is available manually from the Console but not wired into the
+  background poll or the Front Panel hover data yet.
+- **Junos memory/CPU numbers in Switch Status are derived, not exact.**
+  `show chassis routing-engine` reports `DRAM 1024 MB` + a single
+  `Memory utilization N percent`, not exact used/free byte counts like
+  Dell's `show memory` - `status_poller.py` computes used/free from those
+  two real numbers rather than fabricating them, and CPU only has one
+  current data point (no rolling 5sec/1min/5min average like Dell), so
+  the Switch Status tab's three-tier CPU display shows the same number
+  three times for Junos devices.
 - **`webui/README.md:80` claims the read-only allowlist is "enforced by a
   test, not just convention."** There are no tests. Fix the claim or write
   the test (see 0.2).
@@ -263,9 +309,23 @@ The gate on anyone other than you using this.
   populated, so a still-removed PSU reverts to simply not being listed
   until it reappears. Persist known bays to survive restarts.
 - **`.env` still holds placeholder credentials** (`admin` /
-  `changeme-webui`) and real switch credentials in plaintext.
+  `changeme-webui`), real switch credentials, and now `DATABASE_URL` with
+  temporary Postgres credentials (`claude`/`claude`) - all in plaintext.
 - **Vector's `loki_sink` runs with
   `dangerously_allow_unconfined_template_resolution: true`** — Vector
   itself warns on every start that a log producer controlling a templated
   field could write to arbitrary label keys. Pre-existing, worth revisiting.
 - **Frontend has no tests** and no linting configured.
+- **Loki's storage was configured under `/tmp/loki`** on its host
+  (192.168.0.145) — `/tmp` there is `tmpfs` (RAM-backed), so every reboot
+  silently wiped all log/alarm history with no error anywhere. This is how
+  the 33 historical hardware alarm events recovered on 2026-07-30 (see
+  Alarm History fix above) were then permanently lost a few hours later
+  when that LXC restarted for an unrelated reason. Fixed same day: moved
+  `path_prefix`/`chunks_directory`/`rules_directory` in
+  `/etc/loki/loki-config.yaml` to `/var/lib/loki` (the host's real
+  ZFS-backed root, 7.5G free) and verified data survives a restart.
+  Dated backup of the old config left at
+  `/etc/loki/loki-config.yaml.bak-20260730154409` on that host. Same class
+  of risk applies to Prometheus/Grafana if their storage is ever pointed
+  at `/tmp` on any host - worth auditing.

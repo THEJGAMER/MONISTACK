@@ -8,6 +8,9 @@ async function api(path, opts) {
 }
 
 export const getDevices = () => api("/api/devices");
+// Returns { platform_id: [...command tree...] } - one tree per supported
+// platform (currently "os9"/"junos") - index by the selected device's
+// `platform` field, not a single flat tree.
 export const getCommands = () => api("/api/commands");
 export const getParamValues = (deviceId, paramName) => api(`/api/devices/${deviceId}/values/${paramName}`);
 
@@ -28,6 +31,15 @@ export const createDevice = (body) =>
 export const testDevice = (body) =>
   api("/api/devices/test", {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+export const getDeviceForEdit = (id) => api(`/api/devices/${id}/edit`);
+
+export const updateDevice = (id, body) =>
+  api(`/api/devices/${id}`, {
+    method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });

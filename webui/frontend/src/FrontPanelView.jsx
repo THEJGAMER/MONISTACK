@@ -9,10 +9,8 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 
 import { CHASSIS_PROFILES } from "./chassisProfiles.js";
 
-const PORT_RE = /^(\S+)\s*1\/(\d+)$/;
-
-function parsePort(port) {
-  const m = PORT_RE.exec(port);
+function parsePort(port, regex) {
+  const m = regex.exec(port);
   if (!m) return null;
   return { prefix: m[1], num: parseInt(m[2], 10) };
 }
@@ -76,9 +74,20 @@ function Cage({ wide, accurate }) {
 // arrow = top port's state, down arrow = bottom port's), right pair is
 // Activity (real traffic from the switch's own Rate info, not a
 // fabricated blink) - same arrow shapes, different color logic.
-function MidRow({ top, bottom }) {
+function MidRow({ top, bottom, ledStyle }) {
   const topState = getPortState(top);
   const bottomState = getPortState(bottom);
+  if (ledStyle === "single") {
+    // Real EX3300 reference photos show one small link LED per port
+    // column (not Dell's four-arrow link/activity pair) - a single dot
+    // per port, stacked to match the top/bottom port it belongs to.
+    return (
+      <div className="switch-port-midrow single">
+        <span className="switch-port-dot" data-state={topState} />
+        <span className="switch-port-dot" data-state={bottomState} />
+      </div>
+    );
+  }
   return (
     <div className="switch-port-midrow">
       <span className="switch-port-arrow up link" data-state={topState} />
@@ -89,16 +98,13 @@ function MidRow({ top, bottom }) {
   );
 }
 
-function Port({ iface, wide, variant, accurate }) {
-  const parsed = parsePort(iface.port);
+function Port({ iface, num, wide, variant, accurate }) {
   const state = getPortState(iface);
   const hoverBits = [iface.port, portStateLabel(state)];
   if (iface.description) hoverBits.push(iface.description);
   if (iface.transceiver?.present && iface.transceiver.type) hoverBits.push(iface.transceiver.type);
   if (iface.speed && iface.speed !== "Auto") hoverBits.push(iface.speed);
   if (iface.activity) hoverBits.push("active");
-
-  const num = parsed ? parsed.num : "?";
   const body =
     variant === "top" ? (
       <>
@@ -168,28 +174,28 @@ function EmptyPort({ num, wide, variant, accurate }) {
 // bank) - both share the same top-numbers / top-cages / link-LEDs /
 // bottom-cages / bottom-numbers structure seen in the reference photo, the
 // uplink bank just has wider cages and its own "QSFP+" divider label.
-function PortBlock({ columns, staggered, wide, accurate, dividerLabel }) {
+function PortBlock({ columns, staggered, wide, accurate, dividerLabel, ledStyle }) {
   return (
     <div className="switch-port-block">
       <div className="switch-port-columns">
         {columns.map((col, idx) => (
           <div key={idx} style={{ display: "flex", flexDirection: "column", marginRight: col.groupBreak ? 12 : 1 }}>
             {col.top ? (
-              <Port iface={col.top} wide={wide} variant="top" accurate={accurate} />
+              <Port iface={col.top} num={col.topNum} wide={wide} variant="top" accurate={accurate} />
             ) : (
               <EmptyPort num={col.topNum} wide={wide} variant="top" accurate={accurate} />
             )}
-            {staggered && <MidRow top={col.top} bottom={col.bottom} />}
+            {staggered && <MidRow top={col.top} bottom={col.bottom} ledStyle={ledStyle} />}
             {staggered &&
               (col.bottom ? (
-                <Port iface={col.bottom} wide={wide} variant="bottom" accurate={accurate} />
+                <Port iface={col.bottom} num={col.bottomNum} wide={wide} variant="bottom" accurate={accurate} />
               ) : (
                 <EmptyPort num={col.bottomNum} wide={wide} variant="bottom" accurate={accurate} />
               ))}
           </div>
         ))}
       </div>
-      {staggered && accurate && (
+      {staggered && accurate && dividerLabel && (
         <div className="switch-port-divider">
           <span>{dividerLabel}</span>
         </div>
@@ -218,39 +224,44 @@ function Led({ label, ok, title }) {
 
 export default function FrontPanelView({ device, status, profileId, onProfileChange, onRefresh, refreshing }) {
   const profile = CHASSIS_PROFILES[profileId] || CHASSIS_PROFILES["generic-48"];
-  const isAccurate = profile.id === "s4048-on";
+  const isAccurate = profile.chassisType !== "generic";
+  const isJuniper = profile.chassisType === "juniper";
 
   const { mainByNum, uplinkByNum, uplinkCount } = useMemo(() => {
     const interfaces = status?.interfaces || [];
     const byNum = new Map();
-    interfaces.filter((i) => parsePort(i.port)?.prefix === profile.mainPrefix).forEach((i) => byNum.set(parsePort(i.port).num, i));
+    interfaces
+      .filter((i) => parsePort(i.port, profile.portRegex)?.prefix === profile.mainPrefix)
+      .forEach((i) => byNum.set(parsePort(i.port, profile.portRegex).num, i));
     const upByNum = new Map();
     let count = 0;
+    const uplinkRegex = profile.uplinkPortRegex || profile.portRegex;
     if (profile.uplinkPrefix) {
       interfaces
-        .filter((i) => parsePort(i.port)?.prefix === profile.uplinkPrefix)
-        .forEach((i) => upByNum.set(parsePort(i.port).num, i));
+        .filter((i) => parsePort(i.port, uplinkRegex)?.prefix === profile.uplinkPrefix)
+        .forEach((i) => upByNum.set(parsePort(i.port, uplinkRegex).num, i));
       count = upByNum.size;
     }
     return { mainByNum: byNum, uplinkByNum: upByNum, uplinkCount: count };
   }, [status, profile]);
 
   const mainColumns = useMemo(() => {
+    const start = profile.mainStart;
     if (profile.staggered) {
       const numCols = profile.mainCount / 2;
       const colsPerGroup = profile.groupSize / 2;
       return Array.from({ length: numCols }, (_, c) => ({
-        top: mainByNum.get(2 * c + 1),
-        bottom: mainByNum.get(2 * c + 2),
-        topNum: 2 * c + 1,
-        bottomNum: 2 * c + 2,
+        top: mainByNum.get(start + 2 * c),
+        bottom: mainByNum.get(start + 2 * c + 1),
+        topNum: start + 2 * c,
+        bottomNum: start + 2 * c + 1,
         groupBreak: (c + 1) % colsPerGroup === 0 && c !== numCols - 1,
       }));
     }
     return Array.from({ length: profile.mainCount }, (_, c) => ({
-      top: mainByNum.get(c + 1),
+      top: mainByNum.get(start + c),
       bottom: null,
-      topNum: c + 1,
+      topNum: start + c,
       bottomNum: null,
       groupBreak: (c + 1) % profile.groupSize === 0 && c !== profile.mainCount - 1,
     }));
@@ -307,7 +318,7 @@ export default function FrontPanelView({ device, status, profileId, onProfileCha
             </div>
 
             <div className="switch-mgmt">
-              {isAccurate ? (
+              {profile.chassisType === "dell" ? (
                 <>
                   <div className="switch-logo">DELL</div>
                   <div className="switch-icon-grid">
@@ -318,6 +329,12 @@ export default function FrontPanelView({ device, status, profileId, onProfileCha
                   </div>
                   <div className="switch-model-label">S4048-ON</div>
                 </>
+              ) : isJuniper ? (
+                // Real photos show a small, subtle "Juniper" wordmark at
+                // the far left above the port bank - not a prominent
+                // colored badge like Dell's - the model name/status
+                // instead lives in the LCD panel between the port banks.
+                <div className="switch-juniper-logo">Juniper</div>
               ) : (
                 <div className="switch-model-label" style={{ writingMode: "vertical-rl" }}>
                   {profile.label}
@@ -335,12 +352,30 @@ export default function FrontPanelView({ device, status, profileId, onProfileCha
                   this way there's nothing to misalign. */}
               <div className="switch-port-group">
                 <div className="switch-port-group-header" />
-                <PortBlock columns={mainColumns} staggered={profile.staggered} accurate={isAccurate} dividerLabel="SFP+" />
+                <PortBlock columns={mainColumns} staggered={profile.staggered} accurate={isAccurate} dividerLabel={isJuniper ? null : "SFP+"} ledStyle={profile.ledStyle} />
               </div>
+
+              {isJuniper && (
+                // Real photos show the "EX3300" label, an LCD status
+                // display, and a couple of small indicator LEDs clustered
+                // together between the RJ45 bank and the SFP+ uplinks -
+                // not before all the ports like Dell's mgmt panel.
+                <div className="switch-juniper-status">
+                  <div className="switch-juniper-model">EX3300</div>
+                  <div className="switch-juniper-lcd">
+                    {status.state === "down" ? "DOWN" : status.state === "alarm" ? "ALARM" : "OK"}
+                  </div>
+                  <SpaceBetween size="xs" direction="horizontal" alignItems="center">
+                    <Led label="STAT" ok={status.state !== "down"} title={`System: ${status.state}`} />
+                    <Led label="ALM" ok={status.state !== "alarm"} title={status.state === "alarm" ? "Active alarm" : "No alarms"} />
+                  </SpaceBetween>
+                </div>
+              )}
+
               {profile.uplinkCount > 0 && (
                 <div className="switch-port-group">
                   <div className="switch-port-group-header">
-                    {isAccurate && (
+                    {profile.chassisType === "dell" && (
                       <>
                         <div className="switch-stackid">
                           <div className="switch-stackid-digit">1</div>
@@ -357,9 +392,10 @@ export default function FrontPanelView({ device, status, profileId, onProfileCha
                   <PortBlock
                     columns={uplinkColumns}
                     staggered={profile.uplinkStaggered}
-                    wide
+                    wide={profile.chassisType === "dell"}
                     accurate={isAccurate}
-                    dividerLabel="QSFP+"
+                    dividerLabel={isJuniper ? null : "QSFP+"}
+                    ledStyle={profile.ledStyle}
                   />
                 </div>
               )}

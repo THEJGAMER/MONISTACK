@@ -83,24 +83,38 @@ the highest-value item in `ROADMAP.md` §0.2, since it's the one check that
 protects the core security property of this whole tool. (An earlier
 version of this README claimed the rule *was* test-enforced; it wasn't.)
 
-## Storage: SQLite, one file, one volume
+## Storage: Postgres
 
-Devices added through the UI and every saved result now live in a single
-SQLite database (`data/switchboard.db`, on the same `webui-data` Docker
-volume everything else already used) instead of a JSON file plus a
-directory of `.md` files. `db.py` is a ~50-line wrapper (stdlib `sqlite3`,
-no ORM, no new dependency) - one shared connection behind a lock, since
-sqlite3 connections aren't safe to use from multiple threads concurrently
-and FastAPI's sync endpoints can run on different worker threads.
-`store.py` and `results_store.py` keep the exact same public methods they
-had as file-backed stores (`.load()`/`.add()`/`.delete()` and
-`.save()`/`.list()`/`.read()`/`.delete()`), so nothing above them had to
-change shape - only what's underneath. On startup, if an old
-`devices_store.json` exists and the DB is still empty, its contents are
-imported once so upgrading an existing deployment doesn't silently drop
-devices (there was nothing to migrate when this shipped - both the legacy
-file and the results directory were already empty - but the import path
-exists and is exercised by that check either way).
+Devices added through the UI and every saved result live in Postgres
+(`DATABASE_URL` env var - see `.env.example`), replacing an earlier SQLite
+file on the `webui-data` Docker volume once the app outgrew "one file, one
+process" (see ROADMAP.md Phase 2). `db.py`'s `Database` class is still a
+thin wrapper with no ORM - one shared connection behind a lock, same
+reasoning as before (this is a low-request-volume internal ops console,
+not a case for pooling) - but now retries once after reconnecting if the
+connection drops, since a network database can actually do that in a way
+a local SQLite file never could. `store.py` and `results_store.py` keep the
+exact same public methods they've always had (`.load()`/`.add()`/`.delete()`
+and `.save()`/`.list()`/`.read()`/`.delete()`), so nothing above them had to
+change shape - only the driver and SQL placeholder style (`?` → `%s`)
+underneath.
+
+On startup, if an old `devices_store.json` or `switchboard.db` exists on
+the volume and Postgres is still empty, their contents are imported once
+(`_migrate_legacy_json_devices()` / `_migrate_legacy_sqlite()` in
+`app.py`) - both checks are idempotent, safe to run on every startup, and
+a no-op once Postgres already has rows. Verified live: 54 real saved
+results and the device store migrated cleanly from the old SQLite file,
+survived a container restart, and new saves/device adds land in Postgres
+correctly.
+
+One thing this surfaced worth knowing: the Postgres cluster this points at
+was initialized with `SQL_ASCII` encoding, not UTF8, which can't store the
+em-dash characters this app's own markdown rendering uses (`render_markdown`
+in `results_store.py`) - the very first migrated row crashed the app on
+startup until the database was recreated with `ENCODING 'UTF8' TEMPLATE
+template0`. Worth checking `SHOW server_encoding;` before pointing this app
+at any other Postgres instance.
 
 Every result now also carries an `auto_saved` flag: `/api/run` saves a row
 on every single command execution, no click required: the "Kind" column
@@ -210,11 +224,28 @@ reference photos of this switch (kept at the repo root: `S4048-ON.webp`,
 
 **Illustration accuracy** (`chassisProfiles.js`) is a `Select` on the tab
 itself, not auto-locked: `s4048-on` uses the photo-traced layout above;
-`generic-48` and `generic-16` are an honest fallback for any other device -
-a plain sequential grid, no staggering, no fake Dell branding, since
-there's no documented or photographed layout to trust for hardware this
-app doesn't actually know. The dropdown defaults to `s4048-on` when the
-device's `model` field contains "S4048", and to `generic-48` otherwise.
+`ex3300-48p` is the same treatment for the Juniper EX3300-48P, traced
+against real photos (`img_5c7d30bd92eae48P.webp`, `1862015.webp`) rather
+than Dell's layout reused with different labels - materially different in
+several ways confirmed from those photos: 48 RJ45 ports in 4 groups of 12
+(not 3 groups of 16), **one link LED per port column** (not Dell's
+four-arrow link/activity pair - EX-series switches don't have a separate
+activity indicator per port at all), an "EX3300" label + green LCD status
+readout + two small STAT/ALM LEDs positioned *between* the RJ45 bank and
+the SFP+ uplinks (not a logo block before all the ports, like Dell's), and
+4 individually-numbered SFP+ uplinks in one row rather than a staggered
+3x2 QSFP+ bank - rendered exactly as populated on the real unit (2 empty,
+2 real DAC-connected ports, from live `show chassis hardware`). One thing
+the reference photos' resolution couldn't confirm: which physical port is
+"top" vs "bottom" in each column - that follows Juniper's documented
+even-top/odd-bottom convention, not a pixel-verified read of a legible
+silkscreen number, unlike everything else above. `generic-48` and
+`generic-16` remain an honest fallback for any other device - a plain
+sequential grid, no staggering, no fake branding, since there's no
+documented or photographed layout to trust for hardware this app doesn't
+actually know. The dropdown defaults to `s4048-on` when the device's
+`model` field contains "S4048", `ex3300-48p` for "EX3300", and
+`generic-48` otherwise.
 
 **Three port states, not two** - `show interfaces status` alone can't
 distinguish an administratively-shut-down port from one that's simply
@@ -258,6 +289,43 @@ type either way but only shows light readings when the transceiver
 actually has them - no fabricated numbers for cables that don't support
 DOM.
 
+## Console: dynamic board layout
+
+All nine sections of the Console page (Devices, Device summary, Commands,
+Output, Recent results, Syslog, Alarm History, Front Panel, Switch Status)
+render simultaneously as a Cloudscape `Board` - the drag/resize/auto-reflow
+dashboard system AWS Console uses for CloudWatch dashboards - instead of
+the fixed sidebar + `Tabs` layout this replaced. Every panel has a drag
+handle and a resize handle; the board reflows (with Cloudscape's own
+built-in animation) as panels move or resize, and auto-collapses to fewer
+columns as the viewport narrows.
+
+`src/boardConfig.js` holds the static config: `DEFAULT_BOARD_ITEMS` (id,
+default `columnSpan`/`rowSpan`/`columnOffset` per panel - sidebar panels
+default to the left column, richer panels like Front Panel and Switch
+Status default to full width) and the `i18nStrings` both `Board` and
+`BoardItem` require for accessible drag/resize (live announcements for
+screen readers, ARIA labels on the drag/resize handles).
+
+Layout persists to `localStorage` (`switchboard-console-board-layout`,
+same `switchboard-*` key convention as the dark-mode/density toggles in
+`App.jsx`), saved on every `onItemsChange`. A real bug was caught and
+fixed here during verification: the first version of the merge-on-load
+logic preserved each panel's saved size but always rebuilt the array in
+`DEFAULT_BOARD_ITEMS`'s fixed order - since Board has no explicit
+row-position field (vertical stacking comes from array order plus
+`columnOffset`/`rowSpan`), this silently discarded every drag-reorder on
+reload while resizes kept working, which made the bug easy to miss.
+Fixed by preserving the saved array's order for known panel ids and only
+appending unrecognized/new ids at the end. A "Reset layout" button
+(top-right) clears the saved layout back to `DEFAULT_BOARD_ITEMS`.
+
+Verified live in a real browser: all nine panels render with real data
+simultaneously, dragging a panel's handle reorders it and the new order
+survives a page reload, resizing a panel's handle changes its size and
+that also survives a reload, and "Reset layout" clears `localStorage` and
+reverts to the default arrangement.
+
 ## Two ways a device gets into Switchboard
 
 1. **Static** (`devices.yaml`) — id/name/platform plus **env var names**
@@ -266,28 +334,48 @@ DOM.
    by editing the yaml + `.env` and restarting the container.
 2. **Added** (Devices page, `store.py`) — filled in through the UI: name,
    host, make, model, OS, username, and either a password or a pasted SSH
-   private key (+ optional passphrase) plus an optional enable password.
-   Saved to `data/devices_store.json` inside the container (0600
-   permissions, on a named Docker volume so it survives restarts/rebuilds)
-   - same threat model as `.env`: plaintext secrets on disk, protected by
-   filesystem permissions, not encryption. A "Test connection" button
-   attempts a real login before you save, but doesn't block saving if it
-   fails - a device running something other than Dell OS9 may legitimately
-   fail the enable-mode handshake this checks while still being fine to
-   store for later. Devices added this way can be deleted from the table;
-   static ones can't (edit the yaml/`.env` instead).
+   private key (+ optional passphrase) plus an optional enable password
+   (skipped for Junos - see below), plus an optional "Interface whitelist"
+   JSON field (same `ports`/`port_channels` shape `devices.yaml` uses,
+   with an optional per-entry `template` for non-Dell interface naming -
+   e.g. Junos's `{"prefix": "ge", "range": [0, 47], "template":
+   "{prefix}-0/0/{n}"}`) so parameterized commands have a real value list
+   without needing a devices.yaml entry at all. Saved to Postgres (see
+   "Storage" above) - same threat model as `.env`: plaintext secrets on
+   disk, protected by database access, not encryption. A "Test connection"
+   button attempts a real login before you save, but doesn't block saving
+   if it fails - a device running something other than Dell OS9/Junos may
+   legitimately fail the login handshake this checks while still being
+   fine to store for later. Devices added this way can be deleted from the
+   table; static ones can't (edit the yaml/`.env` instead).
 
-**Only Dell OS9's command set is wired up today.** The "Operating System"
-field on the add-device form lets you record a Cisco/Arista/other device
-and reach it over SSH, but the Console's command menu will still send
-Dell OS9 syntax at it - marked "(experimental)" in the dropdown for
-anything but OS9 for that reason. Making the command tree vary by platform
-would be the natural next step if more device types get added for real.
+**Dell OS9 and Juniper Junos both have real command trees, parsers, and
+live status polling today** (`commands.py`'s `COMMAND_TREES`, keyed by
+`device.platform`; `parsers.py` vs `junos_parsers.py`; `status_poller.py`'s
+`_poll_once_os9`/`_poll_once_junos`). Verified live against a real EX3300-48P
+(root SSH at 192.168.4.1) - see `ssh_client.py`'s module docstring for the
+real, materially different login flow Junos needs (lands in a FreeBSD
+shell, not the Junos CLI; no enable/privilege-escalation concept; its own
+`---(more)---` pagination). Any other "Operating System" selection is
+still marked "(experimental)" - it can be saved and reached over SSH, but
+the Console's command menu has nothing wired up for it and will show an
+empty Commands panel rather than guessing at syntax.
+
+**Known gaps for the Juniper device specifically** (a deliberate scope
+decision, not an oversight): it has no remote syslog configured, so its
+Syslog and Alarm History tabs are empty - Switch Status instead shows
+live alarms straight from `show chassis alarms`/`show system alarms`
+polling. Per-port transceiver diagnostics aren't polled automatically
+(no slow-cadence Junos equivalent to Dell's transceiver poll yet), though
+the command is available manually. See ROADMAP.md's known issues for
+both of these plus one more found live: the EX3300's own clock is
+drifted (shows April 2026 while it's really July) - informational only,
+not something this tool changes on production gear.
 
 ## Layout
 
 - `devices.yaml` — static device registry (see above).
-- `db.py` — shared SQLite connection + schema (`devices`, `results`
+- `db.py` — shared Postgres connection + schema (`devices`, `results`
   tables), behind a lock. See "Storage" above.
 - `store.py` — devices added through the UI, backed by `db.py`.
 - `loki_client.py` — stdlib HTTP client for Loki's query API. See
@@ -295,18 +383,31 @@ would be the natural next step if more device types get added for real.
 - `devices.py` — `Device` base class plus `StaticDevice` (env-var creds)
   and `StoredDevice` (inline creds, password or SSH key) subclasses;
   `load_devices()` merges both into one registry.
-- `commands.py` — the command allowlist: 40 commands across System,
-  Interfaces, Port Channels, Layer 2, Layer 3, OSPF, Neighbors, Logging,
-  and Diagnostics. This is the "command hierarchy" - add a new command by
-  adding an entry here, not by accepting new input from the client.
-- `parsers.py` — regex parsers for a handful of command outputs (copied
-  from `exporter/parsers.py`, reused by `summarize.py`), plus three added
-  for the Front Panel and verified against real captured output before
-  being wired in: `parse_interfaces_description` (admin-down/down/up
+- `commands.py` — the command allowlist: `COMMAND_TREE` (40 Dell OS9
+  commands across System, Interfaces, Port Channels, Layer 2, Layer 3,
+  OSPF, Neighbors, Logging, Diagnostics) and `JUNOS_COMMAND_TREE` (System,
+  Interfaces, Port Channels, Layer 2, Neighbors), both in
+  `COMMAND_TREES` keyed by platform id. This is the "command hierarchy" -
+  add a new command by adding an entry here, not by accepting new input
+  from the client. `find_command(category_id, command_id, platform)`
+  looks up the right tree.
+- `parsers.py` — regex parsers for Dell OS9 command outputs (copied from
+  `exporter/parsers.py`, reused by `summarize.py`), plus three added for
+  the Front Panel and verified against real captured output before being
+  wired in: `parse_interfaces_description` (admin-down/down/up
   three-state), an extended `parse_transceiver` (transceiver type +
   `dom_supported`), and `parse_interfaces_rates` (real per-port
   Mbit/s + packets/sec from a single bare `show interfaces` call, backing
   the Activity LED) - see "Front Panel" above.
+- `junos_parsers.py` — the Junos equivalent, kept in its own file since
+  the two platforms' output shares no format in common: `parse_junos_
+  alarms` (merges `show chassis alarms` + `show system alarms` into the
+  same `{'minor': [...], 'major': [...]}` shape `parse_alarms` already
+  returns), `parse_junos_routing_engine` (temp/CPU/memory/uptime),
+  `parse_junos_environment` (fans/PSUs/sensors), `parse_junos_
+  interfaces_terse`/`parse_junos_interfaces_descriptions`. Every sample
+  these were built against was captured live from the real EX3300, not
+  guessed from Junos documentation.
 - `summarize.py` — best-effort one-line summaries per command (e.g. "54
   ports: 8 up, 46 down" for interface status, "1 neighbor(s): 1 FULL" for
   OSPF). Keyed by `(category_id, command_id)`; can never raise - anything
@@ -343,24 +444,34 @@ would be the natural next step if more device types get added for real.
 - `results_store.py` — saved results, backed by `db.py` (see "Storage"
   above). Each row keeps a pre-rendered Markdown snapshot plus an
   `auto_saved` flag.
-- `ssh_client.py` — connect/enable-escalate/run logic, shared in spirit
-  with the exporter's copy (kept separate across the two Docker build
-  contexts). `load_private_key()` parses a pasted PEM (RSA/Ed25519/ECDSA)
-  for SSH-key auth.
+- `ssh_client.py` — `SwitchSSH.connect()` dispatches on `platform`:
+  `_connect_os9` (enable escalation, shared in spirit with the exporter's
+  copy) or `_connect_junos` (send `cli` to leave the FreeBSD shell SSH
+  actually lands in, no enable concept, its own `---(more)---`
+  pagination handling in `run()`) - see the module docstring for what was
+  verified live against the real EX3300 to get this right.
+  `load_private_key()` parses a pasted PEM (RSA/Ed25519/ECDSA) for
+  SSH-key auth.
 - `frontend/` — React + `@cloudscape-design/components`, built with Vite.
   `src/App.jsx` is the `AppLayout` shell (`TopNavigation`, `SideNavigation`,
   `BreadcrumbGroup`, `Flashbar` for notifications, plus the dark
   mode/density toggle) for the three top-level pages: `src/ConsolePage.jsx`,
   `src/DevicesPage.jsx`, and `src/ResultsPage.jsx`. Syslog and the Front
-  Panel are no longer separate pages - `ConsolePage.jsx` renders them
-  inline as two of its five tabs, scoped to whichever device is selected,
-  using `src/FrontPanelView.jsx` (presentational - takes `device`/`status`
-  as props, doesn't fetch anything itself) and `src/chassisProfiles.js`
-  (the accurate-vs-generic illustration profiles). `src/syslogUtils.js`
-  holds the category options and severity/time formatting for the Syslog
-  tab. `src/useClientPagination.js` is a small shared hook (slice +
-  page-count + reset-on-filter) since Cloudscape's `Pagination` is
-  presentation-only and four different tables needed the same logic.
+  Panel are no longer separate pages - `ConsolePage.jsx` renders them as two
+  of nine panels on a dashboard (`@cloudscape-design/board-components`'
+  `Board`/`BoardItem` - the same drag/resize/reflow system AWS Console uses
+  for CloudWatch dashboards), scoped to whichever device is selected, using
+  `src/FrontPanelView.jsx` (presentational - takes `device`/`status` as
+  props, doesn't fetch anything itself) and `src/chassisProfiles.js` (the
+  accurate-vs-generic illustration profiles). `src/boardConfig.js` holds
+  the board's static config: panel titles, default position/size per
+  panel, and the fairly verbose `i18nStrings` Board/BoardItem require for
+  drag/resize accessibility - see "Console: dynamic board layout" below.
+  `src/syslogUtils.js` holds the category options and severity/time
+  formatting for the Syslog panel. `src/useClientPagination.js` is a small
+  shared hook (slice + page-count + reset-on-filter) since Cloudscape's
+  `Pagination` is presentation-only and four different tables needed the
+  same logic.
   `src/markdown.js` formats a result into the same Markdown shape the
   backend generates; `src/MiniMarkdown.jsx` is a ~50-line renderer for
   exactly that subset (`##` headings, `**bold**`, `` `code` ``,
@@ -471,17 +582,19 @@ it from Saved Results (content matched what was saved), and confirmed the
 file survives a full container restart via the same `webui-data` volume
 before deleting it.
 
-The SQLite storage, auto-save, Syslog, and Front Panel work was verified
-in a real browser too, across two rounds (the first round caught two real
+The storage, auto-save, Syslog, and Front Panel work was verified in a
+real browser too, across two rounds (the first round caught two real
 bugs, both fixed and re-verified before calling this done):
 
 - **Auto-save**: running a command with no "Save" click produces an
   immediate row in both the Console's "Recent results" tab (Kind: Auto)
   and the global Saved Results page; "Download .md" triggers a real
   browser download whose filename matches the "auto-saved as ..." note.
-- **SQLite persistence**: results and the device's make/model survived a
-  full image rebuild + container recreate (not just a restart) via the
-  `webui-data` volume.
+- **Persistence**: results and the device's make/model survived a full
+  image rebuild + container recreate (not just a restart) via the
+  `webui-data` volume when this was SQLite; re-verified against Postgres
+  after the migration - 54 real results and the device store survived a
+  container restart with the database on a separate host entirely.
 - **Syslog**: both the standalone page and the Console's per-device tab
   render real, live, non-empty syslog (this switch has active auth
   traffic); category filter and text search were confirmed to actually

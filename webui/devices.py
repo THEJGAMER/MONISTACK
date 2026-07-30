@@ -8,20 +8,29 @@ class DeviceConfigError(Exception):
 
 
 def _generate_ports(port_ranges):
+    """Each spec is {prefix, range, template?}. `template` defaults to
+    Dell's "{prefix} 1/{n}" (e.g. "Te 1/1") - Junos interface names don't
+    fit that shape (e.g. "ge-0/0/0", "xe-0/1/2", no space, no fixed "1/"
+    unit prefix), so a spec can override it, e.g. "{prefix}-0/0/{n}"."""
     ports = []
     for spec in port_ranges or []:
         prefix = spec["prefix"]
         lo, hi = spec["range"]
+        template = spec.get("template", "{prefix} 1/{n}")
         for n in range(lo, hi + 1):
-            ports.append(f"{prefix} 1/{n}")
+            ports.append(template.format(prefix=prefix, n=n))
     return ports
 
 
 def _generate_port_channels(spec):
+    """Defaults to Dell's bare-number style ("1".."8") - Junos aggregate
+    interfaces are named "ae<n>", so a spec can override with a
+    `template` (e.g. "ae{n}")."""
     if not spec:
         return []
     lo, hi = spec["range"]
-    return [str(n) for n in range(lo, hi + 1)]
+    template = spec.get("template", "{n}")
+    return [template.format(n=n) for n in range(lo, hi + 1)]
 
 
 class Device:
@@ -134,6 +143,11 @@ class StoredDevice(Device):
         self._private_key = raw.get("private_key")
         self._passphrase = raw.get("passphrase")
         self._enable_password = raw.get("enable_password")
+        # Kept as originally entered (not the expanded valid_ports list) so
+        # the Edit form can repopulate the same prefix/range/template spec
+        # instead of an unreadable flat list of hundreds of port names.
+        self._ports_spec = raw.get("ports")
+        self._port_channels_spec = raw.get("port_channels")
 
     @property
     def host(self):
@@ -164,6 +178,20 @@ class StoredDevice(Device):
         # Enable mode is independent of how you logged in over SSH - a
         # key-authenticated login can still need a typed enable password.
         return self._enable_password or self._password
+
+    def to_edit_dict(self):
+        """Everything the Edit form needs to repopulate itself - unlike
+        `to_public_dict()`, includes `username` and the ports/port_channels
+        whitelist spec, but deliberately never any secret (password,
+        private_key, passphrase, enable_password) - the edit form leaves
+        those blank and the server keeps the existing value when blank is
+        submitted back, so a secret already on file never round-trips
+        through the browser just to change an unrelated field."""
+        d = self.to_public_dict()
+        d["username"] = self.username
+        d["ports"] = self._ports_spec
+        d["port_channels"] = self._port_channels_spec
+        return d
 
 
 def _require_env(name, device_id):

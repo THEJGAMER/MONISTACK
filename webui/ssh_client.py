@@ -1,10 +1,24 @@
-"""Persistent interactive-shell SSH client for the Dell S4048 (Dell OS9 / FTOS).
+"""Persistent interactive-shell SSH client for network switches.
 
-The switch does not reliably support paramiko's exec_command for `show`
-commands - it needs an interactive shell (vty) session with paging disabled,
-same as a human at a terminal. This client logs in, escalates to privileged
-EXEC (`enable`), disables paging, and then lets the caller send arbitrary
-`show` commands and read the response back up to the next prompt.
+Neither Dell OS9 (FTOS) nor Junos reliably support paramiko's exec_command
+for `show` commands - both need an interactive shell (vty) session with
+paging disabled, same as a human at a terminal. This client logs in,
+reaches a state where `run()` can send arbitrary `show` commands and read
+the response back up to the next prompt - but *how* it gets there differs
+by platform:
+
+- Dell OS9: lands directly in the operational `>` prompt, escalates to
+  privileged EXEC via `enable` (+ password if prompted), disables paging
+  with `terminal length 0`.
+- Junos (verified live against a real EX3300): SSH lands in a FreeBSD
+  shell (`root@:RE:0%`, no `>`/`#` at all), not the Junos CLI - `cli` has
+  to be sent first to reach the operational `root>` prompt. There's no
+  enable/privilege-escalation concept in Junos; paging is disabled with
+  `set cli screen-length 0` / `set cli screen-width 0`. Junos also paces
+  long or piped output with `---(more)---`/`---(more N%)---` prompts that
+  screen-length 0 doesn't always suppress (seen live on `| last N` output)
+  - `run()` handles this by sending a space and continuing to read rather
+    than disabling it once at connect time.
 """
 import io
 import logging
@@ -17,6 +31,8 @@ import paramiko
 log = logging.getLogger("ssh_client")
 
 PROMPT_RE = re.compile(r"[\r\n]?\S+[>#]\s*$")
+JUNOS_SHELL_PROMPT_RE = re.compile(r"[\r\n]?\S+%\s*$")
+JUNOS_MORE_RE = re.compile(r"---\(more.*?\)---\s*$")
 
 _KEY_TYPES = [paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey]
 
@@ -39,7 +55,10 @@ def load_private_key(pem_text, passphrase=None):
 
 
 class SwitchSSH:
-    def __init__(self, host, username, password=None, port=22, enable_password=None, timeout=10, private_key=None, passphrase=None):
+    def __init__(
+        self, host, username, password=None, port=22, enable_password=None, timeout=10,
+        private_key=None, passphrase=None, platform="os9",
+    ):
         self.host = host
         self.username = username
         self.password = password
@@ -48,6 +67,7 @@ class SwitchSSH:
         self.timeout = timeout
         self.private_key = private_key  # pasted PEM text, or None to use password auth
         self.passphrase = passphrase
+        self.platform = platform
         self._client = None
         self._chan = None
 
@@ -100,6 +120,13 @@ class SwitchSSH:
         chan.settimeout(self.timeout)
         self._client = client
         self._chan = chan
+
+        if self.platform == "junos":
+            self._connect_junos()
+        else:
+            self._connect_os9()
+
+    def _connect_os9(self):
         self._read_until_prompt()  # initial ">" prompt
 
         self._raw_send("enable")
@@ -113,6 +140,21 @@ class SwitchSSH:
         self._raw_send("terminal length 0")
         self._read_until_prompt()
         log.info("connected and escalated to privileged EXEC on %s", self.host)
+
+    def _connect_junos(self):
+        # SSH lands in a FreeBSD shell (`root@:RE:0%`), not Junos CLI.
+        self._read_until_prompt(prompt_re=JUNOS_SHELL_PROMPT_RE)
+
+        self._raw_send("cli")
+        resp = self._read_until_prompt()
+        if not resp.rstrip().endswith(">"):
+            raise SwitchSSHError(f"failed to reach Junos operational mode, got: {resp!r}")
+
+        self._raw_send("set cli screen-length 0")
+        self._read_until_prompt()
+        self._raw_send("set cli screen-width 0")
+        self._read_until_prompt()
+        log.info("connected and reached Junos CLI on %s", self.host)
 
     def close(self):
         if self._chan is not None:
@@ -131,7 +173,8 @@ class SwitchSSH:
     def _raw_send(self, line):
         self._chan.send(line + "\n")
 
-    def _read_until_prompt(self, expect_password=False, overall_timeout=15):
+    def _read_until_prompt(self, expect_password=False, overall_timeout=15, prompt_re=None):
+        prompt_re = prompt_re or PROMPT_RE
         buf = ""
         deadline = time.time() + overall_timeout
         while time.time() < deadline:
@@ -141,7 +184,20 @@ class SwitchSSH:
                     buf += chunk
                     if expect_password and buf.rstrip().endswith(":"):
                         return buf
-                    if PROMPT_RE.search(buf):
+                    # Junos paces long/piped output with "---(more)---" /
+                    # "---(more N%)---" prompts that `set cli screen-length 0`
+                    # doesn't always suppress (seen live on `| last N`
+                    # output) - answer it with a space and keep reading
+                    # rather than returning truncated output. Strip the
+                    # marker itself out of the accumulated buffer so it
+                    # doesn't end up embedded in the command's real output.
+                    if self.platform == "junos":
+                        m = JUNOS_MORE_RE.search(buf.rstrip())
+                        if m:
+                            self._chan.send(" ")
+                            buf = buf[: buf.rstrip().rfind(m.group(0))]
+                            continue
+                    if prompt_re.search(buf):
                         # give it a brief moment in case more is trickling in
                         time.sleep(0.05)
                         if self._chan.recv_ready():

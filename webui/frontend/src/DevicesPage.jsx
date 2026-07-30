@@ -17,11 +17,12 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Box from "@cloudscape-design/components/box";
 import Alert from "@cloudscape-design/components/alert";
 
-import { createDevice, deleteDevice, testDevice } from "./api.js";
+import { createDevice, deleteDevice, getDeviceForEdit, testDevice, updateDevice } from "./api.js";
 import { useClientPagination } from "./useClientPagination.js";
 
 const PLATFORM_OPTIONS = [
   { label: "Dell OS9 / Force10 (fully supported)", value: "os9" },
+  { label: "Juniper Junos (fully supported)", value: "junos" },
   { label: "Cisco IOS (experimental)", value: "ios" },
   { label: "Arista EOS (experimental)", value: "eos" },
   { label: "Cisco NX-OS (experimental)", value: "nxos" },
@@ -40,9 +41,23 @@ const EMPTY_FORM = {
   private_key: "",
   passphrase: "",
   enable_password: "",
+  portsJson: "",
 };
 
-function toRequestBody(form) {
+// Parses the optional "Interface whitelist" textarea: a single JSON object
+// shaped like { "ports": [...], "port_channels": {...} } - the same shape
+// devices.yaml uses for statically-configured devices - so parameterized
+// commands (e.g. "show interfaces <port> transceiver"/"diagnostics optics")
+// have a value list to offer. Returns null (not an error) for blank input;
+// throws for genuinely malformed JSON so the caller can surface it.
+function parsePortsJson(text) {
+  if (!text.trim()) return { ports: null, port_channels: null };
+  const parsed = JSON.parse(text);
+  return { ports: parsed.ports ?? null, port_channels: parsed.port_channels ?? null };
+}
+
+function toRequestBody(form, editId) {
+  const { ports, port_channels } = parsePortsJson(form.portsJson);
   return {
     name: form.name,
     host: form.host,
@@ -55,11 +70,18 @@ function toRequestBody(form) {
     private_key: form.authMethod === "ssh_key" ? form.private_key || null : null,
     passphrase: form.authMethod === "ssh_key" ? form.passphrase || null : null,
     enable_password: form.enable_password || null,
+    ports,
+    port_channels,
+    // Only meaningful to /api/devices/test - lets it fall back to the
+    // existing stored secret when testing an edit without re-entering it.
+    edit_id: editId || null,
   };
 }
 
 export default function DevicesPage({ devices, refreshDevices, pushFlash }) {
   const [modalOpen, setModalOpen] = useState(false);
+  const [editingId, setEditingId] = useState(null); // null = adding a new device
+  const [loadingEdit, setLoadingEdit] = useState(false);
   const [form, setForm] = useState(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -78,20 +100,54 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash }) {
     setForm((prev) => ({ ...prev, [name]: value }));
   }
 
-  function openModal() {
+  function openAddModal() {
+    setEditingId(null);
     setForm(EMPTY_FORM);
     setTestResult(null);
     setModalOpen(true);
+  }
+
+  async function openEditModal(device) {
+    setEditingId(device.id);
+    setTestResult(null);
+    setModalOpen(true);
+    setLoadingEdit(true);
+    try {
+      const data = await getDeviceForEdit(device.id);
+      const portsJson =
+        data.ports || data.port_channels
+          ? JSON.stringify({ ports: data.ports ?? undefined, port_channels: data.port_channels ?? undefined }, null, 2)
+          : "";
+      setForm({
+        ...EMPTY_FORM,
+        name: data.name,
+        host: data.host,
+        make: data.make,
+        model: data.model,
+        platform: data.platform,
+        username: data.username,
+        authMethod: data.auth_method,
+        // Secrets never come back from the server - left blank here, and
+        // a blank submission means "keep the existing value" (see
+        // app.py's api_update_device).
+        portsJson,
+      });
+    } catch (e) {
+      pushFlash("error", `Could not load device for editing: ${e.message}`);
+      setModalOpen(false);
+    } finally {
+      setLoadingEdit(false);
+    }
   }
 
   async function handleTest() {
     setTesting(true);
     setTestResult(null);
     try {
-      const res = await testDevice(toRequestBody(form));
+      const res = await testDevice(toRequestBody(form, editingId));
       setTestResult(res);
     } catch (e) {
-      setTestResult({ ok: false, message: e.message });
+      setTestResult({ ok: false, message: e instanceof SyntaxError ? `Interface whitelist: invalid JSON - ${e.message}` : e.message });
     } finally {
       setTesting(false);
     }
@@ -101,12 +157,17 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash }) {
     e.preventDefault();
     setSaving(true);
     try {
-      await createDevice(toRequestBody(form));
+      if (editingId) {
+        await updateDevice(editingId, toRequestBody(form));
+      } else {
+        await createDevice(toRequestBody(form));
+      }
       setModalOpen(false);
       await refreshDevices();
-      pushFlash("success", `Device "${form.name}" added.`);
+      pushFlash("success", `Device "${form.name}" ${editingId ? "updated" : "added"}.`);
     } catch (e) {
-      pushFlash("error", `Could not save device: ${e.message}`);
+      const message = e instanceof SyntaxError ? `Interface whitelist: invalid JSON - ${e.message}` : e.message;
+      pushFlash("error", `Could not save device: ${message}`);
     } finally {
       setSaving(false);
     }
@@ -132,7 +193,7 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash }) {
             variant="h2"
             description="Switches and other network devices Switchboard can run commands against."
             actions={
-              <Button variant="primary" onClick={openModal}>
+              <Button variant="primary" onClick={openAddModal}>
                 Add device
               </Button>
             }
@@ -172,9 +233,14 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash }) {
               header: "",
               cell: (d) =>
                 d.source === "added" ? (
-                  <Button variant="inline-link" onClick={() => setDeleteTarget(d)}>
-                    Delete
-                  </Button>
+                  <SpaceBetween size="xs" direction="horizontal">
+                    <Button variant="inline-link" onClick={() => openEditModal(d)}>
+                      Edit
+                    </Button>
+                    <Button variant="inline-link" onClick={() => setDeleteTarget(d)}>
+                      Delete
+                    </Button>
+                  </SpaceBetween>
                 ) : null,
             },
           ]}
@@ -184,19 +250,19 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash }) {
       <Modal
         visible={modalOpen}
         onDismiss={() => setModalOpen(false)}
-        header="Add a device"
+        header={editingId ? "Edit device" : "Add a device"}
         size="large"
         footer={
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={handleTest} loading={testing}>
+              <Button onClick={handleTest} loading={testing} disabled={loadingEdit}>
                 Test connection
               </Button>
               <Button variant="link" onClick={() => setModalOpen(false)}>
                 Cancel
               </Button>
-              <Button variant="primary" onClick={handleSave} loading={saving} formAction="none">
-                Save device
+              <Button variant="primary" onClick={handleSave} loading={saving} disabled={loadingEdit} formAction="none">
+                {editingId ? "Save changes" : "Save device"}
               </Button>
             </SpaceBetween>
           </Box>
@@ -248,12 +314,12 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash }) {
               </FormField>
 
               {form.authMethod === "password" ? (
-                <FormField label="Password">
+                <FormField label="Password" description={editingId ? "Leave blank to keep the current password." : undefined}>
                   <Input type="password" value={form.password} onChange={({ detail }) => setField("password", detail.value)} />
                 </FormField>
               ) : (
                 <>
-                  <FormField label="Private key (PEM)">
+                  <FormField label="Private key (PEM)" description={editingId ? "Leave blank to keep the current key." : undefined}>
                     <Textarea
                       value={form.private_key}
                       onChange={({ detail }) => setField("private_key", detail.value)}
@@ -261,14 +327,40 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash }) {
                       placeholder={"-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"}
                     />
                   </FormField>
-                  <FormField label="Key passphrase (if encrypted)">
+                  <FormField label="Key passphrase (if encrypted)" description={editingId ? "Leave blank to keep the current passphrase." : undefined}>
                     <Input type="password" value={form.passphrase} onChange={({ detail }) => setField("passphrase", detail.value)} />
                   </FormField>
                 </>
               )}
 
-              <FormField label="Enable password" description="Defaults to the login password if left blank.">
-                <Input type="password" value={form.enable_password} onChange={({ detail }) => setField("enable_password", detail.value)} />
+              {form.platform !== "junos" && (
+                <FormField
+                  label="Enable password"
+                  description={
+                    editingId
+                      ? "Leave blank to keep the current enable password."
+                      : "Defaults to the login password if left blank. Not used for Junos - it has no enable/privileged-mode concept."
+                  }
+                >
+                  <Input type="password" value={form.enable_password} onChange={({ detail }) => setField("enable_password", detail.value)} />
+                </FormField>
+              )}
+
+              <FormField
+                label="Interface whitelist (optional)"
+                description={
+                  'JSON: {"ports": [{"prefix": "Te", "range": [1, 48]}], "port_channels": {"range": [1, 8]}} - ' +
+                  "generates the exact values parameterized commands (e.g. transceiver diagnostics) are allowed to " +
+                  "run against; nothing outside this list is ever accepted. Add a \"template\" per ports entry for " +
+                  'non-Dell naming, e.g. {"prefix": "ge", "range": [0, 47], "template": "{prefix}-0/0/{n}"} for Junos.'
+                }
+              >
+                <Textarea
+                  value={form.portsJson}
+                  onChange={({ detail }) => setField("portsJson", detail.value)}
+                  rows={4}
+                  placeholder='{"ports": [{"prefix": "ge", "range": [0, 47], "template": "{prefix}-0/0/{n}"}], "port_channels": {"range": [1, 1], "template": "ae{n}"}}'
+                />
               </FormField>
             </SpaceBetween>
           </Form>

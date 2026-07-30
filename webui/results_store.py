@@ -1,4 +1,4 @@
-"""Saved command results, backed by the shared SQLite database (db.py).
+"""Saved command results, backed by the shared Postgres database (db.py).
 
 Every command run through /api/run is auto-saved (see app.py) - manual
 saves from the UI are just a flag (`auto_saved=0`) distinguishing
@@ -45,7 +45,7 @@ class ResultsStore:
             """INSERT INTO results
                (filename, device_id, device_name, host, category_id, command_id, command, summary, output,
                 markdown, auto_saved, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 filename, device_id, device_name, host, category_id, command_id, command, summary, output,
                 markdown, 1 if auto_saved else 0, generated_at,
@@ -57,13 +57,13 @@ class ResultsStore:
         if device_id is not None:
             rows = self.db.query(
                 "SELECT filename, device_id, command, auto_saved, created_at, length(markdown) AS size "
-                "FROM results WHERE device_id = ? ORDER BY filename DESC LIMIT ?",
+                "FROM results WHERE device_id = %s ORDER BY filename DESC LIMIT %s",
                 (device_id, limit),
             )
         else:
             rows = self.db.query(
                 "SELECT filename, device_id, command, auto_saved, created_at, length(markdown) AS size "
-                "FROM results ORDER BY filename DESC LIMIT ?",
+                "FROM results ORDER BY filename DESC LIMIT %s",
                 (limit,),
             )
         items = []
@@ -83,9 +83,9 @@ class ResultsStore:
         return items
 
     def read(self, filename):
-        row = self.db.query_one("SELECT markdown FROM results WHERE filename = ?", (filename,))
+        row = self.db.query_one("SELECT markdown FROM results WHERE filename = %s", (filename,))
         return row["markdown"] if row else None
 
     def delete(self, filename):
-        cur = self.db.execute("DELETE FROM results WHERE filename = ?", (filename,))
+        cur = self.db.execute("DELETE FROM results WHERE filename = %s", (filename,))
         return cur.rowcount > 0

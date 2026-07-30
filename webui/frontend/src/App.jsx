@@ -105,7 +105,6 @@ export default function App() {
         navigation={
           <SideNavigation
             activeHref={activeHref}
-            header={{ href: "#/console", text: "Switchboard" }}
             onFollow={(e) => {
               e.preventDefault();
               setActiveHref(e.detail.href);

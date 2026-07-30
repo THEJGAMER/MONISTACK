@@ -28,6 +28,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import junos_parsers
 import parsers
 from ssh_client import SwitchSSHError
 
@@ -238,7 +239,13 @@ class StatusPoller:
 
     def _run(self, device):
         last_transceiver_poll = 0.0
-        while not self._stop.is_set() and device.id in self._threads:
+        # Compares thread *identity*, not just id membership: stop()+start()
+        # for the same device id (done on device edit, to pick up changed
+        # host/credentials) re-adds that id to _threads immediately, so a
+        # plain "device.id in self._threads" check would let the old,
+        # stale-credentialed thread keep looping right alongside the new
+        # one instead of exiting.
+        while not self._stop.is_set() and self._threads.get(device.id) is threading.current_thread():
             self._poll_once(device)
             now = time.time()
             if now - last_transceiver_poll >= self.transceiver_interval:
@@ -247,6 +254,96 @@ class StatusPoller:
             self._stop.wait(self.interval)
 
     def _poll_once(self, device):
+        if device.platform == "junos":
+            self._poll_once_junos(device)
+        else:
+            self._poll_once_os9(device)
+
+    def _poll_once_junos(self, device):
+        """Junos equivalent of _poll_once_os9 - same DeviceStatus fields,
+        populated from junos_parsers instead. Some fields are approximated
+        rather than exact, since Junos doesn't expose the same data:
+        `cpu.overall` only has a single current utilization (Junos'
+        `show chassis routing-engine` gives one point-in-time
+        user/background/kernel/interrupt/idle breakdown, not Dell's
+        rolling 5sec/1min/5min averages) - reported as 1min/5min too since
+        it's the only real number available, not fabricated smoothing.
+        `memory.used`/`free` are derived from the real `memory_pct` against
+        total DRAM (Junos reports a percentage, not exact byte counts)."""
+        status = self._status.setdefault(device.id, DeviceStatus())
+        try:
+            with self._lock_for(device.id):
+                switch = self._get_session(device)
+                re_data = junos_parsers.parse_junos_routing_engine(switch.run("show chassis routing-engine"))
+                env_raw = junos_parsers.parse_junos_environment(switch.run("show chassis environment"))
+                interfaces = junos_parsers.parse_junos_interfaces_terse(switch.run("show interfaces terse"))
+                desc_rows = junos_parsers.parse_junos_interfaces_descriptions(switch.run("show interfaces descriptions"))
+                device_alarms = junos_parsers.parse_junos_alarms(
+                    switch.run("show chassis alarms"), switch.run("show system alarms")
+                )
+
+            desc_by_iface = {d["interface"]: d["description"] for d in desc_rows}
+            for iface in interfaces:
+                iface["port"] = iface["interface"]
+                iface["status"] = "Up" if iface["link"] == "up" else "Down"
+                iface["port_state"] = "up" if iface["link"] == "up" else ("admin_down" if iface["admin"] == "down" else "down")
+                iface["description"] = desc_by_iface.get(iface["interface"], "")
+                iface["activity"] = False  # not available from `show interfaces terse`
+
+            fans = [
+                {
+                    "unit": "0", "bay": str(i),
+                    "fan1_status": "up" if f["status"] == "OK" else "down", "fan1_rpm": None,
+                    "fan2_status": None, "fan2_rpm": None,
+                }
+                for i, f in enumerate(env_raw["fans"])
+            ]
+            psus = [
+                {
+                    "unit": "0", "bay": str(i), "status": "up" if p["status"] == "OK" else "down", "type": "-",
+                    "fan_status": None, "fan_speed_rpm": None, "power_watts": None, "avg_power_watts": None,
+                }
+                for i, p in enumerate(env_raw["psus"])
+            ]
+            env = {"fans": fans, "psus": psus, "units": [], "sensors": env_raw["sensors"]}
+
+            cpu_pct = 100 - re_data.get("cpu", {}).get("idle", 100)
+            cpu = {"overall": {"5sec": cpu_pct, "1min": cpu_pct, "5min": cpu_pct}, "cores": {}}
+
+            memory = {}
+            if re_data.get("dram_mb") is not None and re_data.get("memory_pct") is not None:
+                total = re_data["dram_mb"] * 1_000_000
+                used = round(total * re_data["memory_pct"] / 100)
+                memory = {"total": total, "used": used, "free": total - used, "lowest": None, "largest": None}
+
+            up_count = sum(1 for i in interfaces if i["link"] == "up")
+            total = len(interfaces)
+            state = STATE_ALARM if device_alarms.get("major") else STATE_UP
+            alarms = [f"Major alarm: {e['text']}" for e in device_alarms.get("major", [])]
+            alarms += [f"Minor alarm: {e['text']}" for e in device_alarms.get("minor", [])]
+
+            status.state = state
+            status.alarms = alarms
+            status.interfaces = interfaces
+            status.interfaces_up = up_count
+            status.interfaces_total = total
+            status.env = env
+            status.cpu = cpu
+            status.memory = memory
+            status.device_alarms = device_alarms
+            status.last_error = None
+        except SwitchSSHError as e:
+            status.state = STATE_DOWN
+            status.alarms = []
+            status.last_error = str(e)
+        except Exception:
+            log.exception("unexpected error polling status for %s", device.id)
+            status.state = STATE_DOWN
+            status.last_error = "internal error"
+        finally:
+            status.last_polled = datetime.now(timezone.utc)
+
+    def _poll_once_os9(self, device):
         status = self._status.setdefault(device.id, DeviceStatus())
         try:
             with self._lock_for(device.id):
@@ -296,6 +393,12 @@ class StatusPoller:
             status.last_polled = datetime.now(timezone.utc)
 
     def _poll_transceivers_once(self, device):
+        # Not wired up for Junos yet - `show interfaces <port> transceiver`
+        # is Dell OS9 syntax; sending it at a Junos device would just fail
+        # per-port (or worse, silently mean something else). Leave
+        # transceivers empty for those devices rather than guess.
+        if device.platform == "junos":
+            return
         status = self._status.get(device.id)
         if status is None:
             return

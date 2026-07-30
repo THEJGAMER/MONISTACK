@@ -9,6 +9,19 @@ html, body {
   font-family: "Open Sans", "Helvetica Neue", Roboto, Arial, sans-serif;
 }
 
+/* AppLayout's `headerSelector="#top-nav"` only tells Cloudscape to offset
+   its own sticky elements (side nav, drawers) below this element - it
+   doesn't make the element itself stick. Without this, the top bar was
+   plain document flow and scrolled away with the page like any other
+   content. z-index high enough to stay above AppLayout's side navigation
+   panel and drawers, matching Cloudscape's own documented pattern for a
+   custom sticky TopNavigation. */
+#top-nav {
+  position: sticky;
+  top: 0;
+  z-index: 1002;
+}
+
 /* Scoped to the raw command-output panel only - everything else uses
    Cloudscape components/tokens untouched. A "terminal" reading of device
    CLI output is a deliberate, distinct surface, not a Cloudscape content
@@ -358,6 +371,83 @@ html, body {
 .switch-port-arrow.act[data-active="true"] {
   background: #f2b100;
   box-shadow: 0 0 2px 1px #f2b100;
+}
+
+/* Single link LED per port column - real EX3300 photos show one small
+   LED under each RJ45 port, not Dell's four-arrow link/activity pair.
+   Same state->color mapping as the arrows above, just one dot instead
+   of four, stacked to match the top/bottom port it belongs to. */
+.switch-port-midrow.single {
+  flex-direction: column;
+  gap: 1px;
+  height: auto;
+  justify-content: space-between;
+}
+.switch-port-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #1b1d20;
+  align-self: center;
+}
+.switch-port-dot[data-state="up"] {
+  background: #2bb534;
+  box-shadow: 0 0 2px 1px #2bb534;
+}
+.switch-port-dot[data-state="down"] {
+  background: #db0000;
+  box-shadow: 0 0 2px 1px #db0000;
+}
+.switch-port-dot[data-state="alarm"] {
+  background: #f2b100;
+  box-shadow: 0 0 2px 1px #f2b100;
+}
+
+/* Juniper's small, subtle wordmark - top-left, above the port bank,
+   nothing like Dell's colored logo badge (see reference photos). */
+.switch-juniper-logo {
+  color: #7d8189;
+  font-size: 7px;
+  font-style: italic;
+  letter-spacing: 0.3px;
+  writing-mode: vertical-rl;
+}
+
+/* The EX3300 label + LCD status display + small indicator LEDs sit
+   together between the RJ45 bank and the SFP+ uplinks in the real
+   photos - its own group, not the far-left mgmt panel Dell uses. */
+.switch-juniper-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 10px;
+  margin: 0 4px;
+  align-self: stretch;
+  border-left: 1px solid rgba(255, 255, 255, 0.15);
+  border-right: 1px solid rgba(255, 255, 255, 0.15);
+}
+.switch-juniper-model {
+  color: #c0392b;
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+.switch-juniper-lcd {
+  width: 44px;
+  height: 14px;
+  background: #0a0c0e;
+  border: 1px solid #000;
+  border-radius: 1px;
+  color: #3ecf3e;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 7px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-shadow: 0 0 4px #3ecf3e;
 }
 
 .switch-port-cage {

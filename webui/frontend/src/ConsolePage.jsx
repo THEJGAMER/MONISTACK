@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useState } from "react";
-import Grid from "@cloudscape-design/components/grid";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import Table from "@cloudscape-design/components/table";
@@ -13,9 +12,10 @@ import Alert from "@cloudscape-design/components/alert";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
-import Tabs from "@cloudscape-design/components/tabs";
 import Modal from "@cloudscape-design/components/modal";
 import Pagination from "@cloudscape-design/components/pagination";
+import Board from "@cloudscape-design/board-components/board";
+import BoardItem from "@cloudscape-design/board-components/board-item";
 
 import {
   getParamValues,
@@ -34,6 +34,38 @@ import { useClientPagination } from "./useClientPagination.js";
 import { CATEGORY_OPTIONS, severityType, formatTime } from "./syslogUtils.js";
 import FrontPanelView from "./FrontPanelView.jsx";
 import { defaultProfileId } from "./chassisProfiles.js";
+import { DEFAULT_BOARD_ITEMS, boardI18nStrings, boardItemI18nStrings } from "./boardConfig.js";
+
+const BOARD_LAYOUT_KEY = "switchboard-console-board-layout";
+
+function loadBoardLayout() {
+  try {
+    const raw = localStorage.getItem(BOARD_LAYOUT_KEY);
+    if (!raw) return DEFAULT_BOARD_ITEMS;
+    const saved = JSON.parse(raw);
+    const defById = Object.fromEntries(DEFAULT_BOARD_ITEMS.map((d) => [d.id, d]));
+    const savedIds = new Set(saved.map((i) => i.id));
+    // Board has no explicit row-position field - vertical stacking order
+    // comes from array order plus columnOffset/rowSpan, so a drag-reorder
+    // has to be reflected in array order here, not just merged onto each
+    // item by id (that preserved sizes but silently dropped every reorder
+    // on reload). Known ids keep the saved order and get their saved
+    // size/position merged over the current default (so `data`/
+    // `definition` stay in sync with boardConfig.js); ids not present in
+    // the saved layout (e.g. a panel added after it was saved) are
+    // appended in their default order rather than breaking the board.
+    const ordered = saved.filter((i) => defById[i.id]).map((i) => ({ ...defById[i.id], ...i }));
+    const missing = DEFAULT_BOARD_ITEMS.filter((d) => !savedIds.has(d.id));
+    return [...ordered, ...missing];
+  } catch {
+    return DEFAULT_BOARD_ITEMS;
+  }
+}
+
+function saveBoardLayout(items) {
+  const slim = items.map(({ id, columnSpan, rowSpan, columnOffset }) => ({ id, columnSpan, rowSpan, columnOffset }));
+  localStorage.setItem(BOARD_LAYOUT_KEY, JSON.stringify(slim));
+}
 
 function distinctParamNames(commandTree) {
   const names = new Set();
@@ -74,7 +106,6 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
   const [result, setResult] = useState(null); // { device, command, output, summary, deviceName, host, categoryId, commandId }
   const [runError, setRunError] = useState(null);
   const [viewMode, setViewMode] = useState("markdown"); // "raw" | "markdown"
-  const [activeTab, setActiveTab] = useState("output");
   const [status, setStatus] = useState(null);
   const [recentResults, setRecentResults] = useState([]);
   const [viewing, setViewing] = useState(null); // { filename, content }
@@ -87,16 +118,29 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
   const [statusRefreshing, setStatusRefreshing] = useState(false);
   const [alarmHistory, setAlarmHistory] = useState([]);
   const [alarmHistoryLoading, setAlarmHistoryLoading] = useState(false);
+  const [boardItems, setBoardItems] = useState(loadBoardLayout);
+
+  function handleBoardItemsChange({ detail }) {
+    setBoardItems(detail.items);
+    saveBoardLayout(detail.items);
+  }
+
+  function handleResetLayout() {
+    setBoardItems(DEFAULT_BOARD_ITEMS);
+    localStorage.removeItem(BOARD_LAYOUT_KEY);
+  }
 
   useEffect(() => {
     if (devices.length === 1 && !selected) setSelected(devices[0]);
   }, [devices, selected]);
 
+  const platformCommandTree = (selected && commandTree[selected.platform]) || [];
+
   useEffect(() => {
     if (!selected) return;
     let cancelled = false;
     (async () => {
-      const names = distinctParamNames(commandTree);
+      const names = distinctParamNames(platformCommandTree);
       const updates = {};
       await Promise.all(
         names.map(async (name) => {
@@ -114,7 +158,8 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
     return () => {
       cancelled = true;
     };
-  }, [selected, commandTree]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, selected?.platform, commandTree]);
 
   async function refreshStatus(deviceId) {
     try {
@@ -239,7 +284,6 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
     try {
       const res = await runCommand({ device_id: selected.id, category_id: cat.id, command_id: item.id, params });
       setResult({ ...res, deviceName: selected.name, host: selected.host, categoryId: cat.id, commandId: item.id });
-      setActiveTab("output");
       // Every run is auto-saved server-side now - just reflect that here.
       refreshRecentResults(selected.id);
     } catch (e) {
@@ -309,33 +353,44 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
 
   return (
     <>
-    <Grid gridDefinition={[{ colspan: { default: 12, xs: 4 } }, { colspan: { default: 12, xs: 8 } }]}>
-      <SpaceBetween size="l">
-        <Container header={<Header variant="h2">Devices</Header>}>
-          <Table
-            variant="embedded"
-            columnDefinitions={[
-              { id: "name", header: "Name", cell: (d) => d.name },
-              { id: "host", header: "Host", cell: (d) => d.host },
-            ]}
-            items={filteredDevices}
-            selectionType="single"
-            selectedItems={selected ? [selected] : []}
-            onSelectionChange={({ detail }) => setSelected(detail.selectedItems[0] ?? null)}
-            filter={
-              <TextFilter
-                filteringText={filterText}
-                onChange={({ detail }) => setFilterText(detail.filteringText)}
-                filteringPlaceholder="Search devices..."
+    <SpaceBetween size="m">
+      <Header variant="h1" actions={<Button onClick={handleResetLayout}>Reset layout</Button>}>
+        Console
+      </Header>
+      {(() => {
+        const panels = [
+          {
+            id: "devices",
+            label: "Devices",
+            content: (
+              <Table
+                variant="embedded"
+                columnDefinitions={[
+                  { id: "name", header: "Name", cell: (d) => d.name },
+                  { id: "host", header: "Host", cell: (d) => d.host },
+                ]}
+                items={filteredDevices}
+                selectionType="single"
+                selectedItems={selected ? [selected] : []}
+                onSelectionChange={({ detail }) => setSelected(detail.selectedItems[0] ?? null)}
+                filter={
+                  <TextFilter
+                    filteringText={filterText}
+                    onChange={({ detail }) => setFilterText(detail.filteringText)}
+                    filteringPlaceholder="Search devices..."
+                  />
+                }
+                empty={<Box textAlign="center">No devices match.</Box>}
               />
-            }
-            empty={<Box textAlign="center">No devices match.</Box>}
-          />
-        </Container>
-
-        {selected && (
-          <Container header={<Header variant="h2">Device summary</Header>}>
-            <SpaceBetween size="l">
+            ),
+          },
+          {
+            id: "deviceSummary",
+            label: "Device summary",
+            content: !selected ? (
+              <Box color="text-status-inactive">Select a device first.</Box>
+            ) : (
+              <SpaceBetween size="l">
               <KeyValuePairs columns={2} items={summaryItems} />
               {status?.alarms?.length > 0 && (
                 <Alert type="warning">
@@ -360,16 +415,22 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
                   </SpaceBetween>
                 )}
               </Box>
-            </SpaceBetween>
-          </Container>
-        )}
-
-        <Container header={<Header variant="h2">Commands</Header>}>
-          {!selected ? (
-            <Box color="text-status-inactive">Select a device first.</Box>
-          ) : (
-            <SpaceBetween size="xs">
-              {commandTree.map((cat) => (
+              </SpaceBetween>
+            ),
+          },
+          {
+            id: "commands",
+            label: "Commands",
+            content: !selected ? (
+              <Box color="text-status-inactive">Select a device first.</Box>
+            ) : (
+              <SpaceBetween size="xs">
+              {platformCommandTree.length === 0 && (
+                <Box color="text-status-inactive">
+                  No command tree wired up yet for platform "{selected.platform}".
+                </Box>
+              )}
+              {platformCommandTree.map((cat) => (
                 <ExpandableSection key={cat.id} headerText={cat.label}>
                   <SpaceBetween size="xs">
                     {cat.items.map((item) => {
@@ -405,22 +466,14 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
                 </ExpandableSection>
               ))}
             </SpaceBetween>
-          )}
-        </Container>
-      </SpaceBetween>
-
-      <Container header={<Header variant="h2">{selected ? `${selected.name} (${selected.host})` : "No device selected"}</Header>}>
-        {!selected ? (
-          <Box color="text-status-inactive">Pick a device, then a command, on the left.</Box>
-        ) : (
-          <Tabs
-            activeTabId={activeTab}
-            onChange={({ detail }) => setActiveTab(detail.activeTabId)}
-            tabs={[
-              {
-                id: "output",
+            ),
+          },
+          {
+            id: "output",
                 label: "Output",
-                content: (
+                content: !selected ? (
+                  <Box color="text-status-inactive">Select a device first.</Box>
+                ) : (
                   <SpaceBetween size="m">
                     {runError && <Alert type="error">{runError}</Alert>}
                     {!result && <Box color="text-status-inactive">Pick a command on the left, then Run.</Box>}
@@ -491,7 +544,9 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
               {
                 id: "recent",
                 label: "Recent results",
-                content: (
+                content: !selected ? (
+                  <Box color="text-status-inactive">Select a device first.</Box>
+                ) : (
                   <Table
                     variant="embedded"
                     items={recentResultsPage}
@@ -530,7 +585,9 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
               {
                 id: "syslog",
                 label: "Syslog",
-                content: (
+                content: !selected ? (
+                  <Box color="text-status-inactive">Select a device first.</Box>
+                ) : (
                   <SpaceBetween size="m">
                     <SpaceBetween size="s" direction="horizontal" alignItems="center">
                       <Select
@@ -579,7 +636,9 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
               {
                 id: "alarmHistory",
                 label: "Alarm History",
-                content: (
+                content: !selected ? (
+                  <Box color="text-status-inactive">Select a device first.</Box>
+                ) : (
                   <SpaceBetween size="m">
                     <Button
                       iconName="refresh"
@@ -625,7 +684,9 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
               {
                 id: "frontpanel",
                 label: "Front Panel",
-                content: (
+                content: !selected ? (
+                  <Box color="text-status-inactive">Select a device first.</Box>
+                ) : (
                   <FrontPanelView
                     device={selected}
                     status={statusWithInterfaces}
@@ -639,7 +700,9 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
               {
                 id: "switchStatus",
                 label: "Switch Status",
-                content: (
+                content: !selected ? (
+                  <Box color="text-status-inactive">Select a device first.</Box>
+                ) : (
                   <SpaceBetween size="l">
                     <Button iconName="refresh" loading={statusRefreshing} onClick={handleManualRefresh}>
                       Refresh
@@ -710,18 +773,23 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
                             header: "Fan 1",
                             cell: (f) => (
                               <StatusIndicator type={f.fan1_status === "up" ? "success" : "error"}>
-                                {f.removed ? "Removed" : `${f.fan1_rpm} rpm`}
+                                {f.removed ? "Removed" : f.fan1_rpm != null ? `${f.fan1_rpm} rpm` : "OK"}
                               </StatusIndicator>
                             ),
                           },
                           {
                             id: "fan2",
                             header: "Fan 2",
-                            cell: (f) => (
-                              <StatusIndicator type={f.fan2_status === "up" ? "success" : "error"}>
-                                {f.removed ? "Removed" : `${f.fan2_rpm} rpm`}
-                              </StatusIndicator>
-                            ),
+                            cell: (f) =>
+                              // Junos only reports one fan per bay - fan2_status is null there,
+                              // not a fault, so don't render a fake error state for it.
+                              f.fan2_status == null ? (
+                                "-"
+                              ) : (
+                                <StatusIndicator type={f.fan2_status === "up" ? "success" : "error"}>
+                                  {f.removed ? "Removed" : f.fan2_rpm != null ? `${f.fan2_rpm} rpm` : "OK"}
+                                </StatusIndicator>
+                              ),
                           },
                         ]}
                         empty={<Box textAlign="center">No fan data yet.</Box>}
@@ -748,7 +816,9 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
                           {
                             id: "power",
                             header: "Power draw",
-                            cell: (p) => (p.removed ? "-" : `${p.power_watts} W (avg ${p.avg_power_watts} W)`),
+                            cell: (p) =>
+                              // Junos doesn't report PSU wattage at all (power_watts is null there)
+                              p.removed || p.power_watts == null ? "-" : `${p.power_watts} W (avg ${p.avg_power_watts} W)`,
                           },
                         ]}
                         empty={<Box textAlign="center">No PSU data yet.</Box>}
@@ -760,18 +830,38 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
                         columns={5}
                         items={Object.entries(status?.env?.sensors || {}).map(([name, val]) => ({
                           label: name.toUpperCase(),
-                          value: `${val} C`,
+                          // Dell's sensors are bare numbers (append " C");
+                          // Junos's are already a full descriptive string
+                          // ("36 degrees C / 96 degrees F") - don't double up.
+                          value: typeof val === "string" && val.includes("degrees") ? val : `${val} C`,
                         }))}
                       />
                     </ExpandableSection>
                   </SpaceBetween>
                 ),
               },
-            ]}
-          />
-        )}
-      </Container>
-    </Grid>
+            ];
+            return (
+              <Board
+                items={boardItems}
+                onItemsChange={handleBoardItemsChange}
+                i18nStrings={boardI18nStrings}
+                empty={<Box textAlign="center">No panels.</Box>}
+                renderItem={(item) => {
+                  const panel = panels.find((p) => p.id === item.id);
+                  return (
+                    <BoardItem
+                      header={<Header variant="h2">{panel.label}</Header>}
+                      i18nStrings={boardItemI18nStrings(panel.label)}
+                    >
+                      {panel.content}
+                    </BoardItem>
+                  );
+                }}
+              />
+            );
+          })()}
+    </SpaceBetween>
 
     <Modal visible={!!viewing} onDismiss={() => setViewing(null)} header={viewing?.filename} size="large">
       {viewing && <MiniMarkdown source={viewing.content} />}
