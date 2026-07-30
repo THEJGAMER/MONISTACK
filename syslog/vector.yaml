@@ -1,0 +1,182 @@
+# Vector Configuration for Network Syslog Ingestion
+
+sources:
+  syslog_udp:
+    type: syslog
+    mode: udp
+    address: 0.0.0.0:514
+
+  syslog_tcp:
+    type: syslog
+    mode: tcp
+    address: 0.0.0.0:514
+
+transforms:
+  process_syslog:
+    type: remap
+    inputs:
+      - syslog_udp
+      - syslog_tcp
+    source: |
+      .service = "syslog"
+
+      # Standardize host string cleanly
+      if exists(.host) && .host != null {
+        .device_host = to_string!(.host)
+      } else if exists(.source_ip) && .source_ip != null {
+        .device_host = to_string!(.source_ip)
+      } else {
+        .device_host = "unknown"
+      }
+
+      # The S4048 is configured with its clock in local time ("show clock
+      # detail" reports "sydney", NTP-synced) and sends legacy BSD-syslog
+      # timestamps with no UTC offset on the wire (verified by sniffing
+      # the raw packet: "<189>Jul 30 17:48:00 S4048 ..." - no year, no
+      # offset). Vector's `syslog` source has no config to tell it the
+      # sender's zone (checked `vector generate-schema`: the source's
+      # only options are host_key/log_namespace/max_length), so it
+      # assumes naive timestamps are already UTC - every device_timestamp
+      # came out 10 hours fast (a message logged at real UTC 07:42:17
+      # arrived with device_timestamp 17:42:17Z: the switch's local wall
+      # clock digits, mislabeled UTC). Fixed by taking the wall-clock
+      # digits Vector parsed, discarding its incorrect UTC label, and
+      # reinterpreting them as Australia/Sydney - using the real zone
+      # database (not a hardcoded +10) so this keeps working across
+      # Sydney's DST transitions.
+      naive_str = format_timestamp!(.timestamp, "%Y-%m-%dT%H:%M:%S")
+      corrected, tz_err = parse_timestamp(naive_str, "%Y-%m-%dT%H:%M:%S", timezone: "Australia/Sydney")
+      if tz_err == null {
+        .device_timestamp = corrected
+      } else {
+        .device_timestamp = .timestamp
+      }
+
+      # Keep the device-reported (now timezone-corrected) time for
+      # humans, but ship on ingestion time so out-of-order UDP/TCP
+      # delivery can't produce out-of-order timestamps within a Loki
+      # stream (Loki rejects those).
+      .timestamp = now()
+
+  # --- Dell OS9 syslog interpreter -----------------------------------
+  # Turns the free-text `%FACILITY-SEVERITY-MNEMONIC: detail` message Dell
+  # switches emit into structured fields, so consumers can filter/alert on
+  # e.g. "interface link-state changes" without regexing raw text again.
+  interpret_switch_event:
+    type: remap
+    inputs:
+      - process_syslog
+    source: |
+      parsed, err = parse_regex(.message, r'%(?P<facility>[A-Z0-9]+)-(?P<severity_num>\d)-(?P<mnemonic>[A-Z0-9_-]+):\s*(?P<detail>.*)$')
+      if err == null {
+        .facility = parsed.facility
+        .severity_num = to_int(parsed.severity_num) ?? null
+        .mnemonic = parsed.mnemonic
+        .detail = parsed.detail
+      } else {
+        .detail = .message
+      }
+
+      category_map = {
+        "SEC": "auth", "SSH": "auth", "AAA": "auth",
+        "IFM": "interface", "LINK": "interface", "IFAGT": "interface",
+        "IFMGR": "interface", "LACP": "interface",
+        "STP": "spanning-tree", "RPM": "hardware", "ENVMON": "hardware",
+        "OSTATE": "hardware", "CHMGR": "hardware",
+        "FIB": "routing", "OSPF": "routing", "BGP": "routing"
+      }
+      .event_category = "other"
+      if exists(.facility) {
+        mapped = get(category_map, [.facility]) ?? null
+        if mapped != null {
+          .event_category = mapped
+        }
+      }
+
+      detail_str = to_string(.detail) ?? ""
+
+      iface, iferr = parse_regex(detail_str, r'(?i)(?P<if_type>TenGigabitEthernet|GigabitEthernet|fortyGigE|Port-channel|Vlan|Te|Gi|Fo)\s?(?P<if_num>\d+(/\d+)*)')
+      if iferr == null {
+        if_type_str = to_string(iface.if_type)
+        if_num_str = to_string(iface.if_num)
+        .interface = if_type_str + " " + if_num_str
+      }
+
+      .link_state = null
+      detail_lower = downcase(detail_str)
+      if contains(detail_lower, "is down") || contains(detail_lower, "changed state to down") || contains(detail_lower, "link down") || contains(detail_lower, "down mode") {
+        .link_state = "down"
+      } else if contains(detail_lower, "is up") || contains(detail_lower, "changed state to up") || contains(detail_lower, "link up") {
+        .link_state = "up"
+      }
+      .link_event = .link_state != null
+
+      # --- Hardware alarm normalization -----------------------------
+      # Dell's own severity for these (both the syslog PRI-derived
+      # `.severity` and the digit embedded in "%FACILITY-N-MNEMONIC")
+      # is unreliable for CHMGR (chassis manager - fan/PSU) messages:
+      # verified live that "%CHMGR-0-PS_UP: Power supply 2 in unit 1 is
+      # up" - a plain recovery notice - comes in at digit 0 (nominally
+      # "emergency"), the same tier as an actual "%CHMGR-0-PS_DOWN:
+      # Major alarm: Power supply 2 in unit 1 is down". The only
+      # reliable signal is the free text itself, so alarm severity is
+      # derived from that instead, checked against the real captured
+      # samples that exposed this before shipping:
+      #   "Major alarm: ..."          -> critical, active
+      #   "Minor Alarm : ..."         -> minor, active
+      #   "... is down"/"is removed" (no explicit alarm text) -> minor, active
+      #   "... is up"/"is inserted"   -> not an alarm (recovery)
+      #   anything else (e.g. fan-speed-% telemetry, no fault language) -> not an alarm
+      .alarm_severity = null
+      .alarm_active = null
+      .alarm_component = null
+      # "cleared" must be checked before the "major/minor alarm" text
+      # match below - Dell's own recovery messages ("Major alarm
+      # cleared: ...") contain the literal substring "major alarm", so
+      # without this ordering a recovery gets misread as a brand-new
+      # active critical alarm (verified against real captured
+      # "... alarm cleared ..." / "... alarm cleared : ..." text).
+      if contains(detail_lower, "cleared") {
+        .alarm_active = false
+      } else if contains(detail_lower, "major alarm") {
+        .alarm_severity = "critical"
+        .alarm_active = true
+      } else if contains(detail_lower, "minor alarm") {
+        .alarm_severity = "minor"
+        .alarm_active = true
+      } else if contains(detail_lower, "is down") || contains(detail_lower, "is removed") {
+        .alarm_severity = "minor"
+        .alarm_active = true
+      } else if contains(detail_lower, "is up") || contains(detail_lower, "is inserted") {
+        .alarm_active = false
+      }
+      if .alarm_severity != null || .alarm_active == false {
+        component = detail_str
+        component = replace(component, r'(?i)^(major|minor)\s+alarm\s+cleared\s*:?\s*', "")
+        component = replace(component, r'(?i)^(major alarm:\s*|minor alarm\s*:\s*)', "")
+        component = replace(component, r'(?i)\s+is\s+(up|down|inserted|removed)\s*$', "")
+        component = replace(component, r'(?i)\s+(alarm\s+)?reported(\s+in\s+unit\s+\d+)?\s+is\s+cleared\s*$', "")
+        .alarm_component = strip_whitespace(component)
+      }
+
+sinks:
+  loki_sink:
+    type: loki
+    inputs:
+      - interpret_switch_event
+    endpoint: http://192.168.0.145:3100
+    healthcheck:
+      enabled: false
+    dangerously_allow_unconfined_template_resolution: true
+    encoding:
+      codec: json
+    labels:
+      job: syslog
+      host: "{{ device_host }}"
+
+  console_out:
+    type: console
+    inputs:
+      - interpret_switch_event
+    encoding:
+      codec: json

@@ -1,0 +1,23 @@
+# Device registry. No secrets here - each device's credentials come from
+# environment variables (named below), read at request time. To add a
+# device: add an entry here, and set its env vars in .env.
+devices:
+  - id: s4048
+    name: "S4048 (core switch)"
+    platform: os9
+    make: "Dell EMC"
+    model: "S4048-ON"
+    host_env: SWITCH_HOST
+    user_env: SWITCH_USER
+    pass_env: SWITCH_PASS
+    enable_pass_env: SWITCH_ENABLE_PASS # optional - falls back to pass_env
+    # Port ranges used to generate the whitelist of valid values for
+    # parameterized commands (e.g. "show interfaces <port> transceiver").
+    # Nothing outside these generated strings is ever accepted from a client.
+    ports:
+      - { prefix: "Te", range: [1, 48] } # Te 1/1 .. Te 1/48
+      - { prefix: "Fo", range: [49, 54] } # Fo 1/49 .. Fo 1/54
+    # Only 1-3 are configured today; a small range of headroom is safe to
+    # whitelist since an out-of-range number just gets a harmless
+    # "% Error: No such interface" back from the switch - confirmed live.
+    port_channels: { range: [1, 8] } # port-channel 1 .. 8

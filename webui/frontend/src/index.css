@@ -1,0 +1,390 @@
+/* Cloudscape's own CSS only sets font-family inside its component classes
+   (e.g. .awsui_* rules) - it never sets one on html/body. Anything not
+   wrapped in a Cloudscape typographic component (a bare <span>, a Table
+   cell's raw string, etc.) was falling back to the browser's default serif
+   font instead of Cloudscape's Open Sans stack. Setting it here once, at
+   the root, is a design-token value (matches --font-family-base exactly),
+   not an arbitrary override. */
+html, body {
+  font-family: "Open Sans", "Helvetica Neue", Roboto, Arial, sans-serif;
+}
+
+/* Scoped to the raw command-output panel only - everything else uses
+   Cloudscape components/tokens untouched. A "terminal" reading of device
+   CLI output is a deliberate, distinct surface, not a Cloudscape content
+   area, so a dark monospace treatment here doesn't fight the design
+   system - it's a new kind of content, not an override of an existing one.
+   The ::before strip is a fake macOS-style title bar (three dots) - purely
+   decorative, applied once here so every place that renders CLI output
+   (raw view, and Markdown's code fences via the same class) gets it for
+   free without extra markup. */
+.terminal-output {
+  /* Cloudscape's Box variant="code" renders an inline <code> element by
+     default - vertical padding on an inline element doesn't reserve space
+     in the surrounding block flow, it only paints, so the title-bar strip
+     visually overlapped whatever text came before it instead of pushing
+     content down. Forcing block display (belt-and-suspenders with the
+     `display="block"` prop passed at each call site) fixes that. */
+  display: block;
+  position: relative;
+  /* `!important` is load-bearing here, not laziness. Cloudscape's
+     `Box variant="code"` ships a deliberate anti-override rule:
+       .awsui_box_X.awsui_code-variant_X.awsui_color-default_X:not(#\9)
+     The `:not(#\9)` injects ID-level specificity (~1,3,0) purely so app
+     CSS can't override it - it forces `background: 0 0` (transparent) and
+     `color: <body text>`. A plain `.terminal-output` rule (0,1,0) loses
+     regardless of source order, which is exactly what happened: the
+     ::before title bar rendered correctly (pseudo-element, untargeted by
+     Cloudscape) while the output body silently stayed white-on-dark-text
+     in light mode. Since Cloudscape's rules are not themselves
+     `!important`, an important declaration wins cleanly without having to
+     out-specify the hack with a chain of repeated class selectors. */
+  background: #000 !important;
+  color: #e8eaed !important;
+  font-family: ui-monospace, Menlo, Consolas, monospace !important;
+  font-size: 12.5px !important;
+  line-height: 1.5 !important;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 40px 16px 16px;
+  border-radius: 8px;
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.terminal-output::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 30px;
+  background-color: #101215;
+  border-bottom: 1px solid #23262b;
+  border-radius: 8px 8px 0 0;
+  background-image:
+    radial-gradient(circle 6px at 18px 15px, #ff5f57 100%, transparent 101%),
+    radial-gradient(circle 6px at 38px 15px, #febc2e 100%, transparent 101%),
+    radial-gradient(circle 6px at 58px 15px, #28c840 100%, transparent 101%);
+}
+
+/* Front Panel - a physical hardware visualization has no equivalent stock
+   Cloudscape component (same reasoning as .terminal-output above: new kind
+   of content, not an override of an existing one). Traced against several
+   real reference photos of this switch (kept at the repo root:
+   S4048-ON.webp, dell_S4048-ON_front_closeup_DSC4689.webp,
+   StorageReview-Dell-S4048-Ports.webp,
+   dell-emc-powerswitch-s4048-on-...-w-ears.webp) rather than guessed at: a
+   flat, wide 1U strip (not a tall block), ventilation grille top/bottom,
+   rack ears with screw holes, a DELL wordmark + icon cluster on the left,
+   Stack ID + SYS/FAN/PSU status positioned above the QSFP+ bank on the
+   right (not the left), rectangular (not square) port cages, 3 groups of
+   16 ports with visible gaps between them, a staggered 3x2 QSFP+ uplink
+   bank, and a single row of 4 small arrows between each port pair - left
+   two are Link (up arrow = top port, down arrow = bottom port), right two
+   are Activity - matching a close-up photo's "LNK 1▲▼2" silk-screening. */
+.switch-chassis {
+  display: flex;
+  align-items: stretch;
+  border-radius: 3px;
+  padding: 0;
+  position: relative;
+  /* 54 ports + chrome is wider than the page at common viewport widths -
+     scroll inside this box instead of spilling onto the page background
+     (confirmed via real measurement: at 1024px viewport width the port
+     grid overflowed 608px past the container with no wrap or scroll
+     affordance at all). A 1U switch really is this wide relative to its
+     height, so scrolling to see the far end - rather than shrinking
+     everything to fit one screen - is the accurate behavior, not a bug. */
+  max-width: 100%;
+  overflow-x: auto;
+  /* Ventilation grille (thin dark slats along the top/bottom edge) as a
+     background layer, not a pseudo-element: an earlier version used
+     ::before/::after flex items for this, which - being real flex
+     participants with width:100% inside this flex row - each consumed a
+     full container-width's worth of layout space and pushed every real
+     element out of the initially-visible scroll window, so the tab looked
+     completely blank until you scrolled. A background-image doesn't
+     participate in flex layout at all, and (since this element itself
+     scrolls) stays fixed within the box regardless of scroll position. */
+  background-image:
+    repeating-linear-gradient(90deg, #0a0b0d 0 3px, #2c3036 3px 6px),
+    repeating-linear-gradient(90deg, #0a0b0d 0 3px, #2c3036 3px 6px),
+    linear-gradient(180deg, #24292f 0%, #14171b 100%);
+  background-position: 0 0, 0 100%, 0 0;
+  background-size: 100% 3px, 100% 3px, 100% 100%;
+  background-repeat: repeat-x, repeat-x, no-repeat;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), inset 0 -1px 0 rgba(0, 0, 0, 0.4);
+}
+
+.switch-rack-ear {
+  flex: 0 0 auto;
+  width: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-evenly;
+  background: linear-gradient(180deg, #4a4f56 0%, #2b2e33 100%);
+  position: sticky;
+  z-index: 3;
+}
+.switch-rack-ear.left {
+  left: 0;
+  border-radius: 3px 0 0 3px;
+}
+.switch-rack-ear.right {
+  right: 0;
+  border-radius: 0 3px 3px 0;
+}
+.switch-rack-ear .screw {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, #3a3d42, #08090a 70%);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.switch-mgmt {
+  /* Vertical stack, not a horizontal row - narrow (matches how little
+     horizontal space the DELL logo/buttons take on the real unit, where
+     the port bank dominates almost the entire width), using the chassis's
+     natural height (set by the ports below, via align-items:center on
+     .switch-chassis - see below) rather than forcing the chassis taller. */
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 2px 6px;
+  position: sticky;
+  left: 16px;
+  z-index: 2;
+  background: linear-gradient(180deg, #24292f 0%, #14171b 100%);
+  border-right: 1px solid rgba(0, 0, 0, 0.5);
+}
+
+.switch-logo {
+  color: #e8eaed;
+  font-size: 12px;
+  font-weight: 800;
+  font-style: italic;
+  letter-spacing: 0.5px;
+}
+
+/* Every port group (the plain SFP+ bank and the QSFP+ bank) shares this
+   same header-slot/gap/port-stack structure, whether or not the slot has
+   anything in it - Stack ID + SYS/FAN/PSU status sit above the QSFP+ bank
+   on the right (matching the reference photos), and the SFP+ group gets
+   an empty slot of the same reserved height so its ports land at the same
+   vertical offset instead of drifting when the two groups are centered
+   independently (a real bug: centering an empty-header 57px-tall group
+   against a real-header 72px-tall group visibly misaligned their ports). */
+.switch-port-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.switch-port-group-header {
+  height: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.switch-stackid {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.switch-stackid-digit {
+  width: 14px;
+  height: 12px;
+  background: #0a0c0e;
+  border: 1px solid #000;
+  border-radius: 1px;
+  color: #3ecf3e;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 8px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-shadow: 0 0 4px #3ecf3e;
+}
+.switch-stackid span {
+  color: #7d8189;
+  font-size: 6px;
+}
+
+.switch-icon-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 2px;
+}
+.switch-icon-grid span {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #3d4147 0%, #24272b 100%);
+  border: 1px solid #0e0f11;
+  color: #9aa0a8;
+  font-size: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.switch-model-label {
+  color: #7d8189;
+  font-size: 6.5px;
+  letter-spacing: 0.4px;
+}
+
+.switch-ports {
+  /* Center, not flex-end: the QSFP+ group is taller than the plain SFP+
+     block (it has the Stack ID/status header above it), and bottom-aligning
+     against that taller sibling pushed the SFP+ ports down against the
+     chassis floor with dead space above them - "squashed near the
+     bottom". Centering keeps every port row level regardless of what sits
+     above the QSFP+ group. */
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  padding: 3px 14px;
+}
+
+.switch-port-block {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+/* Only a non-first group (i.e. the QSFP+ bank) gets the divider - the
+   adjacent-sibling combinator only ever matches later siblings, so there's
+   no need to separately reset a ":first-child" case. */
+.switch-port-group + .switch-port-group {
+  margin-left: 16px;
+  padding-left: 16px;
+  border-left: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.switch-port-columns {
+  display: flex;
+  align-items: center;
+}
+
+.switch-port-divider {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.18);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.switch-port-divider span {
+  background: #1b1e22;
+  color: #6a6e75;
+  font-size: 6px;
+  letter-spacing: 0.5px;
+  padding: 0 4px;
+  border-radius: 2px;
+}
+
+.switch-port-numrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 9px;
+  color: #9aa0a8;
+  font-size: 6px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* Four arrows in a single row between the top and bottom cage - left pair
+   is Link (up = top port, down = bottom port), right pair is Activity
+   (real traffic, see status_poller.py's _merge_activity) - matching a
+   close-up photo's "LNK 1▲▼2" silk-screening exactly. */
+.switch-port-midrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  height: 7px;
+}
+
+.switch-port-arrow {
+  width: 5px;
+  height: 4px;
+  background: #1b1d20;
+}
+.switch-port-arrow.up {
+  clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
+}
+.switch-port-arrow.down {
+  clip-path: polygon(50% 100%, 0% 0%, 100% 0%);
+}
+.switch-port-arrow.act {
+  margin-left: 2px;
+}
+
+/* Three distinct port states, matching the same distinction "show
+   interfaces description" makes that "show interfaces status" alone
+   can't: administratively shut down (intentional, not a fault - arrow
+   off) vs actually down (enabled but no link - red, worth noticing) vs up
+   (green). Colors are the exact hex values behind Cloudscape's own
+   success/error tokens, so state reads consistently with StatusIndicator
+   elsewhere in the app. */
+.switch-port-arrow.link[data-state="up"] {
+  background: #2bb534;
+  box-shadow: 0 0 2px 1px #2bb534;
+}
+.switch-port-arrow.link[data-state="down"] {
+  background: #db0000;
+  box-shadow: 0 0 2px 1px #db0000;
+}
+.switch-port-arrow.link[data-state="alarm"] {
+  background: #f2b100;
+  box-shadow: 0 0 2px 1px #f2b100;
+}
+
+/* Activity arrow - real traffic (nonzero packets/sec in either direction,
+   from the switch's own Rate info), not a fabricated blink. */
+.switch-port-arrow.act[data-active="true"] {
+  background: #f2b100;
+  box-shadow: 0 0 2px 1px #f2b100;
+}
+
+.switch-port-cage {
+  width: 26px;
+  height: 15px;
+  border-radius: 1px;
+  cursor: default;
+  /* the cage itself is always this same brushed-metal color regardless of
+     link state - only the little arrows between the cages change color,
+     same as a real switch faceplate. Wider than tall (not square), as on
+     the real unit. */
+  background: linear-gradient(180deg, #6b6f76 0%, #45484d 55%, #302f34 100%);
+  border: 1px solid #0e0f11;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.55);
+  position: relative;
+}
+
+/* The little trapezoid tab is the SFP+ cage's release-latch lever,
+   visible on every port in the reference photo - only rendered for the
+   "accurate" S4048-ON profile, not the generic fallback illustrations. */
+.switch-port-cage.accurate .switch-port-latch {
+  position: absolute;
+  bottom: 1px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 10px;
+  height: 2px;
+  background: #8a8f98;
+  clip-path: polygon(15% 0, 85% 0, 100% 100%, 0 100%);
+}

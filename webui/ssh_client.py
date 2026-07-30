@@ -6,6 +6,7 @@ same as a human at a terminal. This client logs in, escalates to privileged
 EXEC (`enable`), disables paging, and then lets the caller send arbitrary
 `show` commands and read the response back up to the next prompt.
 """
+import io
 import logging
 import re
 import socket
@@ -17,19 +18,36 @@ log = logging.getLogger("ssh_client")
 
 PROMPT_RE = re.compile(r"[\r\n]?\S+[>#]\s*$")
 
+_KEY_TYPES = [paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey]
+
 
 class SwitchSSHError(Exception):
     pass
 
 
+def load_private_key(pem_text, passphrase=None):
+    """Parse pasted PEM text into a paramiko key object, trying each
+    supported key type in turn. Raises SwitchSSHError if none of them can
+    read it (e.g. wrong passphrase, or not actually a private key)."""
+    last_err = None
+    for key_cls in _KEY_TYPES:
+        try:
+            return key_cls.from_private_key(io.StringIO(pem_text), password=passphrase)
+        except paramiko.SSHException as e:
+            last_err = e
+    raise SwitchSSHError(f"could not parse private key (tried RSA/Ed25519/ECDSA/DSS): {last_err}")
+
+
 class SwitchSSH:
-    def __init__(self, host, username, password, port=22, enable_password=None, timeout=10):
+    def __init__(self, host, username, password=None, port=22, enable_password=None, timeout=10, private_key=None, passphrase=None):
         self.host = host
         self.username = username
         self.password = password
         self.enable_password = enable_password or password
         self.port = port
         self.timeout = timeout
+        self.private_key = private_key  # pasted PEM text, or None to use password auth
+        self.passphrase = passphrase
         self._client = None
         self._chan = None
 
@@ -41,11 +59,10 @@ class SwitchSSH:
 
         Dell OS9 has a limited number of concurrent/rapid vty (SSH) login
         slots - hammering it with back-to-back new sessions (seen while load
-        testing this against the real switch, from the webui) can make a
-        connection attempt fail with things like "Error reading SSH protocol
-        banner" even though the switch is fine a moment later. One short
-        retry absorbs that without masking a genuinely down/unreachable
-        device.
+        testing this against the real switch) can make a connection attempt
+        fail with things like "Error reading SSH protocol banner" even
+        though the switch is fine a moment later. One short retry absorbs
+        that without masking a genuinely down/unreachable device.
         """
         last_err = None
         for attempt in range(1, retries + 1):
@@ -66,11 +83,13 @@ class SwitchSSH:
         self.close()
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        pkey = load_private_key(self.private_key, self.passphrase) if self.private_key else None
         client.connect(
             self.host,
             port=self.port,
             username=self.username,
-            password=self.password,
+            password=None if pkey else self.password,
+            pkey=pkey,
             look_for_keys=False,
             allow_agent=False,
             timeout=self.timeout,

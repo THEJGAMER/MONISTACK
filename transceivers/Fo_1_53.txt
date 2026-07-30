@@ -1,2 +1,0 @@
-Interface Name                 : fortyGigE 1/53
-Pluggable optics cannot be read or is not present

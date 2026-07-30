@@ -1,0 +1,21 @@
+[Unit]
+Description=Dell S4048 SSH-polled Prometheus exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=s4048-exporter
+Group=s4048-exporter
+EnvironmentFile=/etc/s4048-exporter/exporter.env
+ExecStart=__EXEC_START__
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

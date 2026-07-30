@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Installs the S4048 exporter into a venv on this host (LXC or otherwise)
+# and runs it as a systemd service. Run as root, from a checkout that still
+# has the ../exporter directory next to this script.
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Run as root (sudo $0)" >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXPORTER_SRC="$SCRIPT_DIR/../exporter"
+INSTALL_DIR=/opt/s4048-exporter
+CONFIG_DIR=/etc/s4048-exporter
+SERVICE_USER=s4048-exporter
+SERVICE_NAME=s4048-exporter
+
+if [[ ! -f "$EXPORTER_SRC/exporter.py" ]]; then
+  echo "Couldn't find $EXPORTER_SRC/exporter.py - run this from the packaging/ dir of the repo checkout" >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import venv" >/dev/null 2>&1; then
+  echo "==> Installing python3-venv"
+  apt-get update -qq
+  apt-get install -y -qq python3-venv python3-pip
+fi
+
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+  echo "==> Creating service user $SERVICE_USER"
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+fi
+
+echo "==> Installing app to $INSTALL_DIR"
+mkdir -p "$INSTALL_DIR/app"
+cp "$EXPORTER_SRC"/ssh_client.py "$EXPORTER_SRC"/parsers.py "$EXPORTER_SRC"/exporter.py "$EXPORTER_SRC"/requirements.txt "$INSTALL_DIR/app/"
+
+if [[ ! -d "$INSTALL_DIR/venv" ]]; then
+  echo "==> Creating venv"
+  python3 -m venv "$INSTALL_DIR/venv"
+fi
+"$INSTALL_DIR/venv/bin/pip" install --upgrade -q pip
+"$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/app/requirements.txt"
+
+echo "==> Writing config to $CONFIG_DIR"
+mkdir -p "$CONFIG_DIR"
+if [[ ! -f "$CONFIG_DIR/exporter.env" ]]; then
+  cp "$SCRIPT_DIR/exporter.env.example" "$CONFIG_DIR/exporter.env"
+  echo "    Wrote default config - EDIT $CONFIG_DIR/exporter.env with the real switch credentials before starting."
+fi
+chmod 600 "$CONFIG_DIR/exporter.env"
+chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$CONFIG_DIR"
+
+echo "==> Installing systemd unit"
+sed "s#__EXEC_START__#$INSTALL_DIR/venv/bin/python $INSTALL_DIR/app/exporter.py#" \
+  "$SCRIPT_DIR/s4048-exporter.service.template" > "/etc/systemd/system/$SERVICE_NAME.service"
+
+systemctl daemon-reload
+systemctl enable "$SERVICE_NAME"
+
+echo
+echo "Installed. Next steps:"
+echo "  1. Edit $CONFIG_DIR/exporter.env with the switch's real host/user/password"
+echo "  2. systemctl restart $SERVICE_NAME"
+echo "  3. journalctl -u $SERVICE_NAME -f     # watch logs"
+echo "  4. curl http://localhost:\$(grep EXPORTER_PORT $CONFIG_DIR/exporter.env | cut -d= -f2 || echo 9101)/metrics"

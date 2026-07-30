@@ -2,3 +2,6 @@
 .venv/
 __pycache__/
 *.pyc
+webui/frontend/node_modules/
+webui/frontend/dist/
+webui/data/

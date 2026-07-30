@@ -6,3 +6,11 @@ datasources:
     access: proxy
     url: http://prometheus:9090
     isDefault: true
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://192.168.0.145:3100
+    jsonData:
+      maxLines: 1000
