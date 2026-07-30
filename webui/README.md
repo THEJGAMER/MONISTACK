@@ -8,11 +8,17 @@ earlier pass tried to fake the look with plain HTML/CSS; no amount of
 color-matching got it right, because the fidelity comes from the real
 component behavior, not the palette). Runs at http://localhost:8080 (via
 the `webui` service in the top-level `docker-compose.yml`), protected by
-HTTP basic auth (`WEBUI_USER` / `WEBUI_PASS` in `.env`). Every command run
-also gets a best-effort one-line summary above the raw output.
+HTTP basic auth. Every command run also gets a best-effort one-line summary
+above the raw output.
 
-Three pages, switched via the left nav - **Console**, **Devices**, and
-**Saved Results**. Syslog and the front-panel visual used to be their own
+A brand new deployment (empty `webui-data` volume, no `.env` overrides)
+boots straight into a **setup wizard** instead of crashing on missing
+config: admin login, the Postgres connection string, and (optionally) a
+Loki URL, all editable later from the in-app **Settings** page. See
+"Deployment config" below.
+
+Four pages, switched via the left nav - **Console**, **Devices**,
+**Saved Results**, and **Settings**. Syslog and the front-panel visual used to be their own
 top-level pages; both are now tabs on the Console instead, scoped to
 whichever device is selected there, rather than a separate page you'd have
 to re-pick the device on.
@@ -83,10 +89,39 @@ the highest-value item in `ROADMAP.md` §0.2, since it's the one check that
 protects the core security property of this whole tool. (An earlier
 version of this README claimed the rule *was* test-enforced; it wasn't.)
 
+## Deployment config: the Settings page, not just `.env`
+
+`webui/settings.py` holds the handful of things that differ per
+deployment - admin login, the Postgres DSN, the Loki URL - as a small JSON
+file (`webui-data/settings.json`, `hash_password()`'d, never plaintext) on
+the same Docker volume that already held `devices_store.json`/
+`switchboard.db` pre-Postgres. It's read once at startup and again on every
+Settings-page save; `app.py`'s `_apply_settings()`/`_load_database()`
+validate a new Postgres DSN by actually connecting before committing any
+globals, so a typo'd save can't half-apply or drop the working connection.
+
+Precedence: `settings.json` wins if present. `WEBUI_USER`/`WEBUI_PASS`/
+`DATABASE_URL`/`LOKI_URL` in `.env` are only consulted to *seed* that file
+on the very first boot of a fresh volume (`settings.bootstrap_from_env()`)
+- handy for anyone who'd rather keep configuring per-deployment values the
+old docker-compose way instead of clicking through the wizard. Once
+`settings.json` exists, later `.env` edits have no effect; use the Settings
+page instead. If neither is present, the app boots anyway (`CONFIGURED =
+False`) and serves the setup wizard - unauthenticated `/api/setup` is the
+only way in at that point, and it locks itself out (403) the moment setup
+completes, so it can't be used to reconfigure a live deployment without a
+Settings-page login.
+
+If Postgres is unreachable using the *stored* settings (e.g. the box is
+down), the app still starts and login still works - `CONFIGURED` stays
+`True` but `DB_ERROR` is set and `require_auth_and_db` 503s anything that
+touches devices/results until it's fixed from the Settings page, which
+surfaces `DB_ERROR` directly.
+
 ## Storage: Postgres
 
 Devices added through the UI and every saved result live in Postgres
-(`DATABASE_URL` env var - see `.env.example`), replacing an earlier SQLite
+(configured via the Settings page - see above), replacing an earlier SQLite
 file on the `webui-data` Docker volume once the app outgrew "one file, one
 process" (see ROADMAP.md Phase 2). `db.py`'s `Database` class is still a
 thin wrapper with no ORM - one shared connection behind a lock, same

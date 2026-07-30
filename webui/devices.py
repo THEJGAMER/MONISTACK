@@ -1,6 +1,9 @@
+import logging
 import os
 
 import yaml
+
+log = logging.getLogger("webui")
 
 
 class DeviceConfigError(Exception):
@@ -99,6 +102,14 @@ class StaticDevice(Device):
         self._user_env = raw["user_env"]
         self._pass_env = raw["pass_env"]
         self._enable_pass_env = raw.get("enable_pass_env")
+
+    def is_configured(self):
+        """True once host/user/pass env vars are actually set. A
+        devices.yaml entry with unset env vars is normal on a fresh
+        deployment of a different site (the yaml itself is baked into the
+        image) - load_devices() skips it rather than letting the missing
+        var surface as a 500 the first time something touches .host."""
+        return bool(os.environ.get(self._host_env) and os.environ.get(self._user_env) and os.environ.get(self._pass_env))
 
     @property
     def host(self):
@@ -204,7 +215,17 @@ def _require_env(name, device_id):
 def load_static_devices(path):
     with open(path) as f:
         raw = yaml.safe_load(f)
-    return [StaticDevice(d) for d in raw["devices"]]
+    devices = []
+    for d in raw["devices"]:
+        device = StaticDevice(d)
+        if device.is_configured():
+            devices.append(device)
+        else:
+            log.warning(
+                "skipping static device %r - %s/%s/%s not all set in the environment",
+                device.id, d["host_env"], d["user_env"], d["pass_env"],
+            )
+    return devices
 
 
 def load_devices(static_path, store):

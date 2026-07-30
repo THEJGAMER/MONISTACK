@@ -16,6 +16,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import settings as settings_store
 from commands import COMMAND_TREES, find_command
 from db import Database
 from devices import DeviceConfigError, StoredDevice, load_devices
@@ -33,34 +34,57 @@ BASE_DIR = Path(__file__).parent
 DEVICES_PATH = os.environ.get("DEVICES_FILE", str(BASE_DIR / "devices.yaml"))
 LEGACY_STORE_PATH = os.environ.get("DEVICE_STORE_FILE", str(BASE_DIR / "data" / "devices_store.json"))
 LEGACY_SQLITE_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "data" / "switchboard.db"))
-LOKI_URL = os.environ.get("LOKI_URL", "http://192.168.0.145:3100")
 
-WEBUI_USER = os.environ.get("WEBUI_USER")
-WEBUI_PASS = os.environ.get("WEBUI_PASS")
-if not WEBUI_USER or not WEBUI_PASS:
-    raise RuntimeError("WEBUI_USER and WEBUI_PASS must be set - this tool runs commands against production network gear")
+# Deployment config (Postgres DSN, Loki URL, webui login) lives in a small
+# JSON file on the webui-data volume, editable from the in-app Settings
+# page - see settings.py for why this can't just live in Postgres too.
+# Falls back to env vars on a brand new volume so existing docker-compose
+# deployments keep working unchanged; if neither is present the app still
+# boots (rather than crashing) and serves a setup wizard instead of the
+# normal UI until someone configures it.
+WEBUI_USER = None
+WEBUI_PASS_HASH = None
+LOKI_URL = None
+DATABASE_URL = None
+CONFIGURED = False
+DB_ERROR = None
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL must be set - Switchboard's device store and saved results live in Postgres")
-
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
 
 
-def require_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    user_ok = secrets.compare_digest(credentials.username, WEBUI_USER)
-    pass_ok = secrets.compare_digest(credentials.password, WEBUI_PASS)
-    if not (user_ok and pass_ok):
+def _check_auth(credentials):
+    if not CONFIGURED:
+        raise HTTPException(status_code=503, detail="Switchboard is not configured yet")
+    if credentials is None or not secrets.compare_digest(credentials.username, WEBUI_USER) or not settings_store.verify_password(
+        credentials.password, WEBUI_PASS_HASH
+    ):
         raise HTTPException(status_code=401, detail="Invalid credentials", headers={"WWW-Authenticate": "Basic"})
+
+
+def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)):
+    _check_auth(credentials)
+    return credentials.username
+
+
+def require_auth_and_db(credentials: Optional[HTTPBasicCredentials] = Depends(security)):
+    _check_auth(credentials)
+    if STORE is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database unavailable ({DB_ERROR}). Fix the connection on the Settings page.",
+        )
     return credentials.username
 
 
 app = FastAPI(title="Switchboard")
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
-DB = Database(DATABASE_URL)
-STORE = DeviceStore(DB)
-RESULTS = ResultsStore(DB)
+DB = None
+STORE = None
+RESULTS = None
+DEVICES = []
+DEVICES_BY_ID = {}
+LOKI = None
 
 
 def _migrate_legacy_json_devices():
@@ -135,13 +159,6 @@ def _migrate_legacy_sqlite():
     legacy_conn.close()
 
 
-_migrate_legacy_json_devices()
-_migrate_legacy_sqlite()
-
-DEVICES = load_devices(DEVICES_PATH, STORE)
-LOKI = LokiClient(LOKI_URL)
-DEVICES_BY_ID = {d.id: d for d in DEVICES}
-
 # One persistent SSH session per device, reused across requests, rather than
 # a fresh login per click. Dell OS9 only has a handful of concurrent vty
 # (SSH) slots - opening/closing a new session per command reliably starved
@@ -150,7 +167,7 @@ DEVICES_BY_ID = {d.id: d for d in DEVICES}
 # session plus a couple of clicks were in flight). A lock per device
 # serializes command execution on that device's single shared session.
 _sessions: dict[str, SwitchSSH] = {}
-_session_locks: dict[str, threading.Lock] = {d.id: threading.Lock() for d in DEVICES}
+_session_locks: dict[str, threading.Lock] = {}
 _registry_lock = threading.Lock()
 
 
@@ -177,10 +194,79 @@ def _get_session(device):
 # Live status (up/down/alarm + data age), polled the same way the
 # Prometheus exporter does but as its own in-process background poller -
 # see status_poller.py for why this doesn't depend on the exporter
-# container or Prometheus being reachable.
+# container or Prometheus being reachable. Created once at import time;
+# _load_database() below (re)populates the devices it polls, including
+# on a Settings-page DSN change, without needing a new instance.
 STATUS = StatusPoller(get_session=_get_session, lock_for=lambda device_id: _session_locks[device_id])
-for _d in DEVICES:
-    STATUS.start(_d)
+
+
+def _load_database(dsn):
+    """Connects to Postgres, runs one-time legacy migrations, and (re)loads
+    devices + status polling from it. Raises on a bad DSN/unreachable host
+    so callers (setup wizard, Settings save) can report a clear error
+    without disturbing whatever was working before the attempt."""
+    global DB, STORE, RESULTS, DEVICES, DEVICES_BY_ID
+    new_db = Database(dsn)
+    new_store = DeviceStore(new_db)
+    new_results = ResultsStore(new_db)
+    DB, STORE, RESULTS = new_db, new_store, new_results
+
+    _migrate_legacy_json_devices()
+    _migrate_legacy_sqlite()
+
+    for device_id in list(_session_locks):
+        STATUS.stop(device_id)
+        switch = _sessions.pop(device_id, None)
+        if switch is not None:
+            switch.close()
+    _session_locks.clear()
+
+    DEVICES = load_devices(DEVICES_PATH, STORE)
+    DEVICES_BY_ID = {d.id: d for d in DEVICES}
+    for d in DEVICES:
+        _session_locks[d.id] = threading.Lock()
+        STATUS.start(d)
+
+
+def _apply_settings(settings_dict):
+    """Applies a full settings dict - called at startup (if settings are
+    already on disk or seedable from env vars) and whenever the setup
+    wizard or Settings page saves a new config. Raises on a bad Postgres
+    DSN; callers decide how to surface that (500 at boot vs. a 400 back to
+    the wizard/settings form)."""
+    global WEBUI_USER, WEBUI_PASS_HASH, LOKI_URL, DATABASE_URL, CONFIGURED, DB_ERROR, LOKI
+    # Validate the DSN before committing any globals, so a failed update
+    # (e.g. a typo'd Postgres URL) can't half-apply - login credentials
+    # and the previously-working DB connection are left untouched.
+    _load_database(settings_dict["database_url"])
+    WEBUI_USER = settings_dict["webui_user"]
+    WEBUI_PASS_HASH = settings_dict["webui_pass_hash"]
+    LOKI_URL = settings_dict.get("loki_url") or settings_store.DEFAULT_LOKI_URL
+    DATABASE_URL = settings_dict["database_url"]
+    LOKI = LokiClient(LOKI_URL)
+    CONFIGURED = True
+    DB_ERROR = None
+
+
+_initial_settings = settings_store.load()
+if _initial_settings is None:
+    _initial_settings = settings_store.bootstrap_from_env()
+    if _initial_settings is not None:
+        settings_store.save(_initial_settings)
+
+if _initial_settings is not None:
+    try:
+        _apply_settings(_initial_settings)
+    except Exception as e:
+        log.error("startup: could not connect using stored settings: %s", e)
+        WEBUI_USER = _initial_settings["webui_user"]
+        WEBUI_PASS_HASH = _initial_settings["webui_pass_hash"]
+        LOKI_URL = _initial_settings.get("loki_url") or settings_store.DEFAULT_LOKI_URL
+        DATABASE_URL = _initial_settings["database_url"]
+        CONFIGURED = True
+        DB_ERROR = str(e)
+else:
+    log.warning("Switchboard has no settings yet - visit the web UI to complete setup")
 
 
 def _slugify(name):
@@ -255,13 +341,90 @@ def _validate_device_request(req, existing=None):
         raise HTTPException(status_code=400, detail="port_channels needs a 2-value 'range'")
 
 
+class SetupRequest(BaseModel):
+    webui_user: str
+    webui_pass: str
+    database_url: str
+    loki_url: Optional[str] = None
+
+
+class SettingsUpdateRequest(BaseModel):
+    webui_user: str
+    webui_pass: Optional[str] = None  # blank = keep current
+    database_url: Optional[str] = None  # blank = keep current
+    loki_url: Optional[str] = None
+
+
+@app.get("/api/setup/status")
+def api_setup_status():
+    return {"configured": CONFIGURED, "db_error": DB_ERROR if CONFIGURED else None}
+
+
+@app.post("/api/setup")
+def api_setup(req: SetupRequest):
+    """First-run only - deliberately unauthenticated, since there's no
+    login yet to authenticate with, but locked out entirely once
+    CONFIGURED so it can't be used to reconfigure a running deployment
+    without a Settings-page login."""
+    if CONFIGURED:
+        raise HTTPException(status_code=403, detail="Switchboard is already configured")
+    if not req.webui_user.strip() or not req.webui_pass:
+        raise HTTPException(status_code=400, detail="a login username and password are required")
+    if not req.database_url.strip():
+        raise HTTPException(status_code=400, detail="a Postgres connection string is required")
+
+    new_settings = {
+        "webui_user": req.webui_user.strip(),
+        "webui_pass_hash": settings_store.hash_password(req.webui_pass),
+        "database_url": req.database_url.strip(),
+        "loki_url": (req.loki_url or "").strip() or settings_store.DEFAULT_LOKI_URL,
+    }
+    try:
+        _apply_settings(new_settings)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not connect to Postgres: {e}")
+    settings_store.save(new_settings)
+    log.info("initial setup completed (webui_user=%s)", new_settings["webui_user"])
+    return {"ok": True}
+
+
+@app.get("/api/settings")
+def api_get_settings(user: str = Depends(require_auth)):
+    return {
+        "webui_user": WEBUI_USER,
+        "database_url_display": settings_store.redact_dsn(DATABASE_URL) if DATABASE_URL else None,
+        "loki_url": LOKI_URL,
+        "db_error": DB_ERROR,
+    }
+
+
+@app.put("/api/settings")
+def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_auth)):
+    if not req.webui_user.strip():
+        raise HTTPException(status_code=400, detail="a login username is required")
+
+    new_settings = {
+        "webui_user": req.webui_user.strip(),
+        "webui_pass_hash": settings_store.hash_password(req.webui_pass) if req.webui_pass else WEBUI_PASS_HASH,
+        "database_url": (req.database_url or "").strip() or DATABASE_URL,
+        "loki_url": (req.loki_url or "").strip() or settings_store.DEFAULT_LOKI_URL,
+    }
+    try:
+        _apply_settings(new_settings)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not connect to Postgres: {e}")
+    settings_store.save(new_settings)
+    log.info("user=%s updated deployment settings", user)
+    return {"ok": True}
+
+
 @app.get("/api/devices")
-def api_devices(user: str = Depends(require_auth)):
+def api_devices(user: str = Depends(require_auth_and_db)):
     return [d.to_public_dict() for d in DEVICES]
 
 
 @app.post("/api/devices")
-def api_create_device(req: DeviceCreateRequest, user: str = Depends(require_auth)):
+def api_create_device(req: DeviceCreateRequest, user: str = Depends(require_auth_and_db)):
     _validate_device_request(req)
     with _registry_lock:
         device_id = _slugify(req.name)
@@ -292,7 +455,7 @@ def api_create_device(req: DeviceCreateRequest, user: str = Depends(require_auth
 
 
 @app.get("/api/devices/{device_id}/edit")
-def api_get_device_for_edit(device_id: str, user: str = Depends(require_auth)):
+def api_get_device_for_edit(device_id: str, user: str = Depends(require_auth_and_db)):
     """Everything the Edit form needs to repopulate itself - see
     `StoredDevice.to_edit_dict()` for exactly what is (and isn't)
     included. Static (devices.yaml) devices aren't editable through the
@@ -306,7 +469,7 @@ def api_get_device_for_edit(device_id: str, user: str = Depends(require_auth)):
 
 
 @app.put("/api/devices/{device_id}")
-def api_update_device(device_id: str, req: DeviceCreateRequest, user: str = Depends(require_auth)):
+def api_update_device(device_id: str, req: DeviceCreateRequest, user: str = Depends(require_auth_and_db)):
     device = DEVICES_BY_ID.get(device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -353,7 +516,7 @@ def api_update_device(device_id: str, req: DeviceCreateRequest, user: str = Depe
 
 
 @app.delete("/api/devices/{device_id}")
-def api_delete_device(device_id: str, user: str = Depends(require_auth)):
+def api_delete_device(device_id: str, user: str = Depends(require_auth_and_db)):
     device = DEVICES_BY_ID.get(device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -373,7 +536,7 @@ def api_delete_device(device_id: str, user: str = Depends(require_auth)):
 
 
 @app.get("/api/devices/{device_id}/status")
-def api_device_status(device_id: str, interfaces: bool = False, user: str = Depends(require_auth)):
+def api_device_status(device_id: str, interfaces: bool = False, user: str = Depends(require_auth_and_db)):
     device = DEVICES_BY_ID.get(device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -384,7 +547,7 @@ def api_device_status(device_id: str, interfaces: bool = False, user: str = Depe
 
 
 @app.post("/api/devices/{device_id}/status/refresh")
-def api_device_status_refresh(device_id: str, user: str = Depends(require_auth)):
+def api_device_status_refresh(device_id: str, user: str = Depends(require_auth_and_db)):
     """Forces an immediate status poll instead of waiting for the next
     background cycle - backs the "Refresh" button on the Switch Status
     tab."""
@@ -397,7 +560,7 @@ def api_device_status_refresh(device_id: str, user: str = Depends(require_auth))
 
 
 @app.post("/api/devices/test")
-def api_test_device(req: DeviceCreateRequest, user: str = Depends(require_auth)):
+def api_test_device(req: DeviceCreateRequest, user: str = Depends(require_auth_and_db)):
     """Try connecting with the given draft device details, without saving
     anything. Best-effort: a failure here doesn't block Save, since the
     login handshake this checks only has real support for `os9`/`junos`
@@ -434,7 +597,7 @@ def api_test_device(req: DeviceCreateRequest, user: str = Depends(require_auth))
 
 
 @app.get("/api/devices/{device_id}/values/{param_name}")
-def api_device_param_values(device_id: str, param_name: str, user: str = Depends(require_auth)):
+def api_device_param_values(device_id: str, param_name: str, user: str = Depends(require_auth_and_db)):
     device = DEVICES_BY_ID.get(device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -447,7 +610,7 @@ def api_commands(user: str = Depends(require_auth)):
 
 
 @app.post("/api/run")
-def api_run(req: RunRequest, user: str = Depends(require_auth)):
+def api_run(req: RunRequest, user: str = Depends(require_auth_and_db)):
     device = DEVICES_BY_ID.get(req.device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -502,7 +665,7 @@ class SaveResultRequest(BaseModel):
 
 
 @app.post("/api/results")
-def api_save_result(req: SaveResultRequest, user: str = Depends(require_auth)):
+def api_save_result(req: SaveResultRequest, user: str = Depends(require_auth_and_db)):
     device = DEVICES_BY_ID.get(req.device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -514,12 +677,12 @@ def api_save_result(req: SaveResultRequest, user: str = Depends(require_auth)):
 
 
 @app.get("/api/results")
-def api_list_results(device_id: Optional[str] = None, user: str = Depends(require_auth)):
+def api_list_results(device_id: Optional[str] = None, user: str = Depends(require_auth_and_db)):
     return RESULTS.list(device_id=device_id)
 
 
 @app.get("/api/results/{filename}")
-def api_get_result(filename: str, user: str = Depends(require_auth)):
+def api_get_result(filename: str, user: str = Depends(require_auth_and_db)):
     content = RESULTS.read(filename)
     if content is None:
         raise HTTPException(status_code=404, detail="unknown result")
@@ -527,7 +690,7 @@ def api_get_result(filename: str, user: str = Depends(require_auth)):
 
 
 @app.delete("/api/results/{filename}")
-def api_delete_result(filename: str, user: str = Depends(require_auth)):
+def api_delete_result(filename: str, user: str = Depends(require_auth_and_db)):
     if not RESULTS.delete(filename):
         raise HTTPException(status_code=404, detail="unknown result")
     return {"ok": True}
@@ -542,7 +705,7 @@ def api_syslog(
     category: Optional[str] = None,
     limit: int = 200,
     since_seconds: int = 3600,
-    user: str = Depends(require_auth),
+    user: str = Depends(require_auth_and_db),
 ):
     """Recent switch syslog, read straight from Loki - the same sink
     syslog/vector.yaml on the LXC already ships structured events to (see
@@ -622,7 +785,7 @@ def api_alarm_history(
     device_id: str,
     limit: int = 300,
     since_seconds: int = 604800,
-    user: str = Depends(require_auth),
+    user: str = Depends(require_auth_and_db),
 ):
     """Historical hardware alarms for this device, read from Loki.
 
@@ -705,5 +868,10 @@ app.mount("/static/assets", ImmutableCachedStaticFiles(directory=str(FRONTEND_DI
 
 
 @app.get("/")
-def index(user: str = Depends(require_auth)):
+def index(credentials: Optional[HTTPBasicCredentials] = Depends(security)):
+    # Unauthenticated (and un-cached) until setup is complete, so the SPA
+    # can boot and show the setup wizard - once CONFIGURED, this behaves
+    # exactly like the old always-authenticated index route.
+    if CONFIGURED:
+        _check_auth(credentials)
     return FileResponse(str(FRONTEND_DIST / "index.html"), headers={"Cache-Control": "no-cache"})

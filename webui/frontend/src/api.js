@@ -72,3 +72,23 @@ export const getSyslog = ({ deviceId, category, limit = 200 } = {}) => {
 };
 
 export const getAlarmHistory = (deviceId) => api(`/api/devices/${deviceId}/alarm-history`);
+
+// Unauthenticated - checked before login even applies, so the SPA can show
+// a setup wizard on a fresh deploy instead of a basic-auth prompt.
+export const getSetupStatus = () => api("/api/setup/status");
+
+export const submitSetup = (body) =>
+  api("/api/setup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+export const getSettings = () => api("/api/settings");
+
+export const updateSettings = (body) =>
+  api("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });

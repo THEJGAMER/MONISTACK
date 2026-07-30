@@ -9,7 +9,9 @@ import { applyMode, applyDensity, Mode, Density } from "@cloudscape-design/globa
 import ConsolePage from "./ConsolePage.jsx";
 import DevicesPage from "./DevicesPage.jsx";
 import ResultsPage from "./ResultsPage.jsx";
-import { getDevices, getCommands } from "./api.js";
+import SettingsPage from "./SettingsPage.jsx";
+import SetupWizard from "./SetupWizard.jsx";
+import { getDevices, getCommands, getSetupStatus } from "./api.js";
 
 let flashId = 0;
 
@@ -27,6 +29,7 @@ export default function App() {
   const [commandTree, setCommandTree] = useState([]);
   const [flashes, setFlashes] = useState([]);
   const [loaded, setLoaded] = useState(false);
+  const [configured, setConfigured] = useState(null); // null = still checking
 
   const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
   const [mode, setMode] = usePreference("switchboard-mode", prefersDark ? Mode.Dark : Mode.Light);
@@ -65,6 +68,21 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
+        const status = await getSetupStatus();
+        setConfigured(status.configured);
+      } catch (e) {
+        // Setup-status itself is unauthenticated and should never fail once
+        // the server is reachable at all - treat a failure here as "not
+        // configured yet" so the user at least sees something actionable.
+        setConfigured(false);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!configured) return;
+    (async () => {
+      try {
         const [devs, cmds] = await Promise.all([getDevices(), getCommands()]);
         setDevices(devs);
         setCommandTree(cmds);
@@ -74,10 +92,25 @@ export default function App() {
         setLoaded(true);
       }
     })();
-  }, [pushFlash]);
+  }, [configured, pushFlash]);
 
-  const page = activeHref === "#/devices" ? "devices" : activeHref === "#/results" ? "results" : "console";
-  const pageTitles = { console: "Console", devices: "Devices", results: "Saved Results" };
+  const page =
+    activeHref === "#/devices"
+      ? "devices"
+      : activeHref === "#/results"
+      ? "results"
+      : activeHref === "#/settings"
+      ? "settings"
+      : "console";
+  const pageTitles = { console: "Console", devices: "Devices", results: "Saved Results", settings: "Settings" };
+
+  if (configured === null) {
+    return null;
+  }
+
+  if (!configured) {
+    return <SetupWizard onConfigured={() => setConfigured(true)} />;
+  }
 
   return (
     <>
@@ -85,6 +118,16 @@ export default function App() {
         <TopNavigation
           identity={{ href: "#/console", title: "Switchboard", logo: undefined }}
           utilities={[
+            {
+              type: "button",
+              iconName: "settings",
+              text: "Settings",
+              href: "#/settings",
+              onClick: (e) => {
+                e.preventDefault();
+                setActiveHref("#/settings");
+              },
+            },
             {
               type: "button",
               text: density === Density.Compact ? "Comfortable density" : "Compact density",
@@ -113,6 +156,8 @@ export default function App() {
               { type: "link", text: "Console", href: "#/console" },
               { type: "link", text: "Devices", href: "#/devices" },
               { type: "link", text: "Saved Results", href: "#/results" },
+              { type: "divider" },
+              { type: "link", text: "Settings", href: "#/settings" },
             ]}
           />
         }
@@ -131,6 +176,8 @@ export default function App() {
             <DevicesPage devices={devices} refreshDevices={refreshDevices} pushFlash={pushFlash} />
           ) : page === "results" ? (
             <ResultsPage pushFlash={pushFlash} />
+          ) : page === "settings" ? (
+            <SettingsPage pushFlash={pushFlash} />
           ) : (
             <ConsolePage devices={devices} commandTree={commandTree} pushFlash={pushFlash} />
           ))
