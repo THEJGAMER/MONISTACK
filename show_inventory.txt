@@ -1,0 +1,23 @@
+System Type            : S4048-ON   
+System Mode            : 1.0       
+Software Version       : 9.14(1.14)
+
+Unit Type               Serial Number  Part Number  Rev  Piece Part ID            Rev  Svc Tag  Exprs Svc Code
+--------------------------------------------------------------------------------------------------------------
+* 1  S4048-ON-01-FE-72  NA             004JJR       A01  CN-004JJR-28298-73G-0030 A01  B5N3XC2  242 857 509 14
+  1  S4048-ON-PWR-AC-R  NA             00YNWT       A00  CN-00YNWT-28298-734-0271 A00  N/A      NA            
+  1  S4048-ON-PWR-AC-R  NA             0CC6XG       A00  CN-0CC6XG-28298-73G-0211 A00  N/A      NA            
+  1  S4048-ON-FAN-R     NA             03HC75       A00  CN-03HC75-28298-73G-0633 A00  N/A      NA            
+  1  S4048-ON-FAN-R     NA             03HC75       A00  CN-03HC75-28298-73G-0632 A00  N/A      NA            
+  1  S4048-ON-FAN-R     NA             03HC75       A00  CN-03HC75-28298-73G-0631 A00  N/A      NA            
+
+ * - Management Unit 
+
+ 
+Software Protocol Configured 
+--------------------------------------------------------------
+  LLDP 
+  NTP 
+  OSPF 
+  SNMP 
+ 

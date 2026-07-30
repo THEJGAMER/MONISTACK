@@ -1,0 +1,2 @@
+Interface Name                 : TenGigabitEthernet 1/34
+Pluggable optics cannot be read or is not present

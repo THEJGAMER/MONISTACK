@@ -1,0 +1,89 @@
+Interface Name                 : TenGigabitEthernet 1/44
+SFP+ is present
+SFP+ 44 Serial Base ID fields
+SFP+ 44 Id                               = 0x03
+SFP+ 44 Ext Id                           = 0x04
+SFP+ 44 Connector                        = 0x07
+SFP+ 44 Transceiver Code                 = 0x20 0x00 0x00 0x00 0x12 0x00 0x01 0x00 
+SFP+ 44 Encoding                         = 0x06
+SFP+ 44 BR Nominal                       = 0x67
+SFP+ 44 Length(SFM)    Km                = 0x0a
+SFP+ 44 Length(SFM)  100m                = 0x64
+SFP+ 44 Length(OM3)   10m                = 0x00
+SFP+ 44 Length(OM2)   10m                = 0x00
+SFP+ 44 Length(OM1)   10m                = 0x00
+SFP+ 44 Length(Copper-1m/AOC-1m/OM4-10m) = 0x00
+SFP+ 44 Vendor Rev                       = A   
+SFP+ 44 Laser Wavelength                 = 1310 nm
+SFP+ 44 CheckCodeBase                    = 0x82
+SFP+ 44 Serial Extended ID fields
+SFP+ 44 Options                          = 0x00 0x1a 
+SFP+ 44 BR max                           = 0
+SFP+ 44 BR min                           = 0
+SFP+ 44 Vendor SN                        = 2005082771      
+SFP+ 44 Datecode                         = 200527  
+SFP+ 44 CheckCodeExt                     = 0xa5
+SFP+ 44 Extended Transceiver Code        = 0x00
+
+SFP+ 44 Diagnostic Information
+===================================
+SFP+ 44 Rx Power measurement type        = Average
+===================================
+SFP+ 44 Temp High Alarm threshold        = 80.000C 
+SFP+ 44 Voltage High Alarm threshold     = 3.800V 
+SFP+ 44 Bias High Alarm threshold        = 80.000mA 
+SFP+ 44 TX Power High Alarm threshold    = 0.9999dBm 
+SFP+ 44 RX Power High Alarm threshold    = 0.9999dBm 
+SFP+ 44 Temp Low Alarm threshold         = -10.000C 
+SFP+ 44 Voltage Low Alarm threshold      = 2.800V 
+SFP+ 44 Bias Low Alarm threshold         = 5.000mA 
+SFP+ 44 TX Power Low Alarm threshold     = -7.0006dBm 
+SFP+ 44 RX Power Low Alarm threshold     = -17.0115dBm 
+===================================
+SFP+ 44 Temp High Warning threshold      = 75.000C 
+SFP+ 44 Voltage High Warning threshold   = 3.700V 
+SFP+ 44 Bias High Warning threshold      = 75.000mA 
+SFP+ 44 TX Power High Warning threshold  = 0.4999dBm 
+SFP+ 44 RX Power High Warning threshold  = 0.0000dBm 
+SFP+ 44 Temp Low Warning threshold       = -5.000C 
+SFP+ 44 Voltage Low Warning threshold    = 2.900V 
+SFP+ 44 Bias Low Warning threshold       = 6.000mA 
+SFP+ 44 TX Power Low Warning threshold   = -6.0015dBm 
+SFP+ 44 RX Power Low Warning threshold   = -16.0033dBm 
+===================================
+SFP+ 44 Temperature                      = 42.250C
+SFP+ 44 Voltage                          = 3.287V
+SFP+ 44 Tx Bias Current                  = 37.944mA
+SFP+ 44 Tx Power                         = -2.6217dBm
+SFP+ 44 Rx Power                         = -40.0000dBm
+===================================
+SFP+ 44 Data Ready state Bar             = False
+SFP+ 44 Rx LOS state                     = True
+SFP+ 44 Tx Fault state                   = False
+SFP+ 44 Rate Select state                = False
+SFP+ 44 RS state                         = False
+SFP+ 44 Tx Disable state                 = False
+===================================
+SFP+ 44 Temperature High Alarm Flag      = False
+SFP+ 44 Voltage High Alarm Flag          = False
+SFP+ 44 Tx Bias High Alarm Flag          = False
+SFP+ 44 Tx Power High Alarm Flag         = False
+SFP+ 44 Rx Power High Alarm Flag         = False
+SFP+ 44 Temperature Low Alarm Flag       = False
+SFP+ 44 Voltage Low Alarm Flag           = False
+SFP+ 44 Tx Bias Low Alarm Flag           = False
+SFP+ 44 Tx Power Low Alarm Flag          = False
+SFP+ 44 Rx Power Low Alarm Flag          = True
+===================================
+SFP+ 44 Temperature High Warning Flag    = False
+SFP+ 44 Voltage High Warning Flag        = False
+SFP+ 44 Tx Bias High Warning Flag        = False
+SFP+ 44 Tx Power High Warning Flag       = False
+SFP+ 44 Rx Power High Warning Flag       = False
+SFP+ 44 Temperature Low Warning Flag     = False
+SFP+ 44 Voltage Low Warning Flag         = False
+SFP+ 44 Tx Bias Low Warning Flag         = False
+SFP+ 44 Tx Power Low Warning Flag        = False
+SFP+ 44 Rx Power Low Warning Flag        = True
+
+10GBASE-LR

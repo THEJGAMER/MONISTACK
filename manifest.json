@@ -1,0 +1,568 @@
+{
+  "host": "192.168.4.106",
+  "platform": "os9",
+  "started": "2026-07-28T11:25:36",
+  "commands": [
+    {
+      "command": "show version",
+      "success": true,
+      "duration_s": 0.13,
+      "bytes": 677,
+      "error": null
+    },
+    {
+      "command": "show inventory",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 1149,
+      "error": null
+    },
+    {
+      "command": "show system",
+      "success": true,
+      "duration_s": 0.18,
+      "bytes": 1539,
+      "error": null
+    },
+    {
+      "command": "show interfaces status",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 3523,
+      "error": null
+    },
+    {
+      "command": "show interfaces description",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 3903,
+      "error": null
+    },
+    {
+      "command": "show running-config",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 50,
+      "error": null
+    },
+    {
+      "command": "show vlan",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 789,
+      "error": null
+    },
+    {
+      "command": "show mac address-table",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 54,
+      "error": null
+    },
+    {
+      "command": "show arp",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 2606,
+      "error": null
+    },
+    {
+      "command": "show ip route",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 1350,
+      "error": null
+    },
+    {
+      "command": "show spanning-tree brief",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 50,
+      "error": null
+    },
+    {
+      "command": "show lldp neighbors",
+      "success": true,
+      "duration_s": 0.11,
+      "bytes": 706,
+      "error": null
+    },
+    {
+      "command": "show environment",
+      "success": true,
+      "duration_s": 0.13,
+      "bytes": 1123,
+      "error": null
+    },
+    {
+      "command": "show processes cpu",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 5840,
+      "error": null
+    },
+    {
+      "command": "show memory",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 205,
+      "error": null
+    },
+    {
+      "command": "show clock",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 35,
+      "error": null
+    },
+    {
+      "command": "show sflow",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 355,
+      "error": null
+    },
+    {
+      "command": "show logging",
+      "success": true,
+      "duration_s": 0.21,
+      "bytes": 38238,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/1 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 105,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/2 transceiver",
+      "success": true,
+      "duration_s": 0.09,
+      "bytes": 105,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/3 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 105,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/4 transceiver",
+      "success": true,
+      "duration_s": 0.13,
+      "bytes": 105,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/5 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 105,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/6 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 105,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/7 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 105,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/8 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 105,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/9 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 105,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/10 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/11 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/12 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/13 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/14 transceiver",
+      "success": true,
+      "duration_s": 0.21,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/15 transceiver",
+      "success": true,
+      "duration_s": 0.09,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/16 transceiver",
+      "success": true,
+      "duration_s": 0.11,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/17 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/18 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/19 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/20 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/21 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/22 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/23 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/24 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/25 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/26 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/27 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/28 transceiver",
+      "success": true,
+      "duration_s": 0.11,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/29 transceiver",
+      "success": true,
+      "duration_s": 0.26,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/30 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/31 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/32 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/33 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/34 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/35 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/36 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 106,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/37 transceiver",
+      "success": true,
+      "duration_s": 0.31,
+      "bytes": 4190,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/38 transceiver",
+      "success": true,
+      "duration_s": 0.32,
+      "bytes": 4192,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/39 transceiver",
+      "success": true,
+      "duration_s": 0.33,
+      "bytes": 1297,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/40 transceiver",
+      "success": true,
+      "duration_s": 0.16,
+      "bytes": 1297,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/41 transceiver",
+      "success": true,
+      "duration_s": 0.36,
+      "bytes": 4180,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/42 transceiver",
+      "success": true,
+      "duration_s": 0.31,
+      "bytes": 4190,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/43 transceiver",
+      "success": true,
+      "duration_s": 0.28,
+      "bytes": 4188,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/44 transceiver",
+      "success": true,
+      "duration_s": 0.53,
+      "bytes": 4188,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/45 transceiver",
+      "success": true,
+      "duration_s": 0.28,
+      "bytes": 4188,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/46 transceiver",
+      "success": true,
+      "duration_s": 0.28,
+      "bytes": 4188,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/47 transceiver",
+      "success": true,
+      "duration_s": 0.16,
+      "bytes": 1291,
+      "error": null
+    },
+    {
+      "command": "show interfaces Te 1/48 transceiver",
+      "success": true,
+      "duration_s": 0.16,
+      "bytes": 1291,
+      "error": null
+    },
+    {
+      "command": "show interfaces Fo 1/49 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 97,
+      "error": null
+    },
+    {
+      "command": "show interfaces Fo 1/50 transceiver",
+      "success": true,
+      "duration_s": 0.13,
+      "bytes": 97,
+      "error": null
+    },
+    {
+      "command": "show interfaces Fo 1/51 transceiver",
+      "success": true,
+      "duration_s": 0.23,
+      "bytes": 97,
+      "error": null
+    },
+    {
+      "command": "show interfaces Fo 1/52 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 97,
+      "error": null
+    },
+    {
+      "command": "show interfaces Fo 1/53 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 97,
+      "error": null
+    },
+    {
+      "command": "show interfaces Fo 1/54 transceiver",
+      "success": true,
+      "duration_s": 0.08,
+      "bytes": 97,
+      "error": null
+    }
+  ],
+  "finished": "2026-07-28T11:25:47",
+  "ports_found": [
+    "Te 1/1",
+    "Te 1/2",
+    "Te 1/3",
+    "Te 1/4",
+    "Te 1/5",
+    "Te 1/6",
+    "Te 1/7",
+    "Te 1/8",
+    "Te 1/9",
+    "Te 1/10",
+    "Te 1/11",
+    "Te 1/12",
+    "Te 1/13",
+    "Te 1/14",
+    "Te 1/15",
+    "Te 1/16",
+    "Te 1/17",
+    "Te 1/18",
+    "Te 1/19",
+    "Te 1/20",
+    "Te 1/21",
+    "Te 1/22",
+    "Te 1/23",
+    "Te 1/24",
+    "Te 1/25",
+    "Te 1/26",
+    "Te 1/27",
+    "Te 1/28",
+    "Te 1/29",
+    "Te 1/30",
+    "Te 1/31",
+    "Te 1/32",
+    "Te 1/33",
+    "Te 1/34",
+    "Te 1/35",
+    "Te 1/36",
+    "Te 1/37",
+    "Te 1/38",
+    "Te 1/39",
+    "Te 1/40",
+    "Te 1/41",
+    "Te 1/42",
+    "Te 1/43",
+    "Te 1/44",
+    "Te 1/45",
+    "Te 1/46",
+    "Te 1/47",
+    "Te 1/48",
+    "Fo 1/49",
+    "Fo 1/50",
+    "Fo 1/51",
+    "Fo 1/52",
+    "Fo 1/53",
+    "Fo 1/54"
+  ]
+}

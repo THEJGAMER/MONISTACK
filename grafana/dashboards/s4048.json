@@ -1,0 +1,148 @@
+{
+  "title": "Dell S4048-ON (SSH polled)",
+  "uid": "s4048-ssh",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Poller health",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "targets": [{ "expr": "s4048_up", "legendFormat": "SSH poll ok" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "value": null, "color": "red" }, { "value": 1, "color": "green" }] }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "CPU utilization (overall)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "s4048_cpu_utilization_percent{core=\"overall\"}", "legendFormat": "{{window}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 } }
+    },
+    {
+      "id": 3,
+      "title": "Chassis / sensor temperatures",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "expr": "s4048_unit_temperature_celsius", "legendFormat": "unit {{unit}}" },
+        { "expr": "s4048_sensor_temperature_celsius", "legendFormat": "{{sensor}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "celsius" } }
+    },
+    {
+      "id": 4,
+      "title": "Control-plane memory used",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "s4048_memory_bytes{type=\"used\"}", "legendFormat": "used" },
+        { "expr": "s4048_memory_bytes{type=\"total\"}", "legendFormat": "total" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    },
+    {
+      "id": 5,
+      "title": "Fan speed (RPM)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "s4048_fan_speed_rpm", "legendFormat": "unit{{unit}} bay{{bay}} {{fan}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "rotrpm" } }
+    },
+    {
+      "id": 6,
+      "title": "PSU power draw",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "s4048_psu_power_watts", "legendFormat": "bay{{bay}} {{kind}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "watt" } }
+    },
+    {
+      "id": 7,
+      "title": "PSU / Fan status",
+      "type": "state-timeline",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        { "expr": "s4048_psu_status", "legendFormat": "psu bay{{bay}}" },
+        { "expr": "s4048_fan_status", "legendFormat": "fan bay{{bay}} {{fan}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Interface link status",
+      "type": "state-timeline",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 28 },
+      "targets": [
+        { "expr": "s4048_interface_up", "legendFormat": "{{port}} {{description}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Transceiver Tx/Rx power (dBm)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 38 },
+      "targets": [
+        { "expr": "s4048_transceiver_tx_power_dbm", "legendFormat": "{{port}} tx" },
+        { "expr": "s4048_transceiver_rx_power_dbm", "legendFormat": "{{port}} rx" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none" } }
+    },
+    {
+      "id": 10,
+      "title": "Transceiver temperature",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 38 },
+      "targets": [
+        { "expr": "s4048_transceiver_temperature_celsius", "legendFormat": "{{port}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "celsius" } }
+    },
+    {
+      "id": 11,
+      "title": "Transceiver alarms",
+      "type": "state-timeline",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 46 },
+      "targets": [
+        { "expr": "s4048_transceiver_alarm", "legendFormat": "{{port}} {{flag}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "ok", "color": "green" }, "1": { "text": "ALARM", "color": "red" } } }
+          ]
+        }
+      }
+    }
+  ]
+}

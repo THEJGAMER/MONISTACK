@@ -1,0 +1,15 @@
+
+Codes: * - Default VLAN, G - GVRP VLANs, R - Remote Port Mirroring VLANs, P - Primary, C - Community, I - Isolated
+       O - Openflow, Vx - Vxlan
+Q: U - Untagged, T - Tagged
+   x - Dot1x untagged, X - Dot1x tagged
+   o - OpenFlow untagged, O - OpenFlow tagged
+   G - GVRP tagged, M - Vlan-stack
+   i - Internal untagged, I - Internal tagged, v - VLT untagged, V - VLT tagged
+
+    NUM    Status    Description                     Q Ports
+*   1      Inactive                                  
+    20     Active    TRANSPORT                       U Po1(Te 1/47-1/48)
+                                                     U Po2(Te 1/39-1/40)
+                                                     U Po3(Te 1/41-1/42)
+                                                     U Te 1/33-1/38,1/43-1/46
