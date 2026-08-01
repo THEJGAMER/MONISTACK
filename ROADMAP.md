@@ -34,27 +34,61 @@ build on.
       the bare repo).
 
 ### 0.2 Test suite + CI
-- [ ] **There are no tests.** Note that `webui/README.md` currently claims
-      the read-only allowlist is "enforced by a test, not just convention"
-      — that claim is **false today** and should be made true (or removed).
-- [ ] **Allowlist safety test** (highest value, ~10 lines): assert every
-      `cmd` in `commands.py` starts with `show ` and that no entry contains
-      config-mode verbs. This is the single test that protects the core
-      security property of the whole tool.
-- [ ] **Parser tests** against the real captured outputs already used
-      during development: `parse_environment`, `parse_interfaces_status`,
-      `parse_interfaces_description`, `parse_transceiver` (optical vs
-      AOC vs DAC), `parse_interfaces_rates`, `parse_alarms`, `parse_cpu`,
-      `parse_memory`. Freeze real device output as fixtures so a parser
-      regression is caught without needing the switch.
-- [ ] **Param-injection test**: assert `/api/run` rejects a `params` value
-      outside the server-generated whitelist (this was verified by hand
-      during development; it should be a test).
-- [ ] **VRL transform tests** for `syslog/vector.yaml` — `vector vrl` can
-      run the transform against fixture events in CI (this is how the
-      alarm-severity logic was validated by hand; automate it).
-- [ ] CI (GitHub Actions or equivalent): run tests + `vector validate` +
-      a frontend build on every push.
+- [x] **There are no tests** (2026-08-01: now 28 of them). The
+      `webui/README.md` claim is fixed to describe what's actually
+      enforced, not aspirational text - see its "Why this shape" section.
+- [x] **Allowlist safety test** (2026-08-01,
+      `tests/test_commands_allowlist.py`) — every command on every
+      platform (Dell OS9, Junos, OPNsense) is asserted read-only: `show `
+      prefix for the two `show`-grammar CLIs, a known-read-only-tool
+      allowlist for OPNsense's shell commands (with `pfctl` specifically
+      required to be a `-s` subcommand), and a fixed list of config-mode/
+      state-changing verbs asserted absent everywhere. Also asserts
+      `show running-config` stays excluded and that `COMMAND_TREES` (what
+      `/api/run` actually dispatches through) matches the three trees
+      tested.
+- [x] **Parser tests** (2026-08-01, `tests/test_parsers.py`) — all 8
+      listed here, against real output frozen in `tests/fixtures/`,
+      captured live from the fleet's actual S4048 for this session (not
+      reused from memory/old captures) - including all three real
+      transceiver cases (Te 1/37 = genuine 10GBASE-LR optic with DOM, Te
+      1/39 = AOC, Te 1/47 = copper DAC, found live by checking every
+      Up port's transceiver type rather than guessing which ports would
+      have which). One wrong assumption caught immediately by running
+      against the real fixture: down ports still have a "Rate info"
+      block, just zeros - not absent, as the first draft of that test
+      assumed. **Coverage gap**: the topology/trending/OPNsense/Junos
+      parsers added elsewhere in this session (ROADMAP 3.4/3.5, OPNsense
+      support) have no fixture tests yet - not in this item's original
+      scope, but the same treatment would apply.
+- [x] **Param-injection test** (2026-08-01, `tests/test_api_run_params.py`)
+      — asserts `/api/run` rejects an out-of-whitelist `params` value with
+      400 *before* it can reach `_get_session`/SSH (proven with a session
+      stub that raises `AssertionError` if ever called on a rejected
+      request, not just checking the HTTP status), plus a companion test
+      that the identical request shape with a real, server-generated
+      value succeeds - confirming the rejection is really about the
+      value, not something else failing first. Runs against `app.py`
+      directly (dependency-overridden auth, monkeypatched device/session
+      globals) - no live Postgres or device needed.
+- [x] **VRL transform tests** (2026-08-01, `syslog/tests/test_vrl.py`) —
+      installed the real `vector` binary to verify this rather than guess
+      the CLI syntax (`vector vrl -p <program> -i <events.jsonl> -q -o`,
+      confirmed live: one JSON result per line on stdout, vector's own
+      log noise confined to stderr). Extracts the actual
+      `interpret_switch_event` VRL source straight out of `vector.yaml`
+      and runs it against real captured syslog messages - covers the
+      major-alarm, alarm-recovery, interface-link-down, and the
+      "cleared" vs "major alarm" text-ordering regression cases
+      documented in `vector.yaml`'s own comments. Skips cleanly if
+      `vector` isn't installed locally.
+- [x] CI (2026-08-01, `.github/workflows/ci.yml`) — three jobs on every
+      push/PR: `webui-tests` (pytest), `syslog-vrl` (installs Vector,
+      runs `vector validate --no-environment` + the VRL tests -
+      `--no-environment` skips the CI-irrelevant missing-`/var/lib/vector`
+      check while still catching real config/schema errors, confirmed
+      live with a deliberate typo before relying on it), and
+      `frontend-build` (`npm ci && npm run build`).
 
 ### 0.3 Data durability and growth
 - [ ] **Results grow unbounded.** Every `/api/run` auto-saves a row; the

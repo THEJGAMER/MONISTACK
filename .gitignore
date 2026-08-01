@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 webui/frontend/node_modules/
 webui/frontend/dist/
 webui/data/

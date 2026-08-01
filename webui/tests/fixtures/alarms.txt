@@ -1,0 +1,12 @@
+Alarm Type                                            Duration
+-------------------------------------------------------------------------------
+Controlling Bridge: 
+==================
+
+
+Minor Alarms
+	No minor alarms
+
+
+Major Alarms
+	No major alarms

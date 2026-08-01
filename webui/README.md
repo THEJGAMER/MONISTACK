@@ -82,12 +82,14 @@ This holds for every device regardless of how it was added.
 Deliberately excluded from the allowlist: `show running-config` and
 anything config-mode. This is a read-only observability tool; config-mode
 commands (or a command that can dump secrets like SNMP community strings)
-are out of scope on purpose. Every one of the 40 commands currently in
-`commands.py` starts with `show` - but note this is **convention, not yet
-enforced**: there is no automated test asserting it. Writing that test is
-the highest-value item in `ROADMAP.md` §0.2, since it's the one check that
-protects the core security property of this whole tool. (An earlier
-version of this README claimed the rule *was* test-enforced; it wasn't.)
+are out of scope on purpose. This **is** test-enforced (2026-08-01,
+`tests/test_commands_allowlist.py`): every Dell OS9/Junos command must
+literally start with `show `, every OPNsense command must start with a
+known-read-only tool (and `pfctl` specifically must be a `-s` subcommand,
+never `-f`/`-F`), and a fixed list of config-mode/state-changing verbs is
+asserted absent from every command string on every platform. (An earlier
+version of this README claimed the rule was already test-enforced before
+this test existed; it wasn't - see `ROADMAP.md` §0.2 for that history.)
 
 ## Deployment config: the Settings page, not just `.env`
 
@@ -608,6 +610,46 @@ reference `{name}` in the `cmd` string - but only do this if you can also
 generate a safe, exhaustive whitelist of valid values for it (the way
 `ports` and `port_channels` work today). Never add a command that takes
 free-text input. Optionally add a summarizer for it in `summarize.py`.
+
+## Testing
+
+```
+pip install -r webui/requirements-dev.txt
+cd webui && pytest
+```
+
+- `tests/test_commands_allowlist.py` - the highest-value test in the
+  suite (see "Why this shape" above): every command on every platform is
+  read-only.
+- `tests/test_parsers.py` - Dell OS9 parsers (`parse_environment`,
+  `parse_interfaces_status`/`_description`, `parse_transceiver` for all
+  three real cases - optical/AOC/DAC, `parse_interfaces_rates`/`_errors`,
+  `parse_alarms`, `parse_cpu`, `parse_memory`) against real command output
+  frozen in `tests/fixtures/` - captured live from the fleet's actual
+  S4048, never hand-written. Re-capture via SSH if a parser's expected
+  shape genuinely changes.
+- `tests/test_api_run_params.py` - the param-injection test: a `params`
+  value outside a device's server-generated whitelist is rejected by
+  `/api/run` before anything reaches `_get_session`/SSH (asserted with a
+  session stub that raises `AssertionError` if it's ever called for a
+  rejected request), not just eventually failing against the switch.
+
+Coverage gap, not yet caught up to this session's newer work: the
+topology/trending/OPNsense/Junos parsers added after this test suite's
+first pass have no fixture tests yet - same treatment (real captured
+output, frozen as a fixture) would apply, just not written yet.
+
+`syslog/tests/test_vrl.py` (run via `cd syslog && pytest`, needs the real
+`vector` binary - see CI below) tests `vector.yaml`'s
+`interpret_switch_event` VRL transform - alarm severity/category/
+link-state classification - by running the actual VRL source from the
+config file through `vector vrl`, against real captured syslog messages,
+not a second hand-written reimplementation of the same logic that could
+silently drift from it.
+
+CI (`.github/workflows/ci.yml`) runs the webui pytest suite, installs
+Vector and runs `vector validate --no-environment` + the VRL tests, and
+builds the frontend - on every push and PR.
 
 ## Verified
 

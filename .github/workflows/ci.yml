@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  webui-tests:
+    name: webui tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        working-directory: webui
+        run: pip install -r requirements-dev.txt
+      - name: Run tests
+        working-directory: webui
+        run: pytest -v
+
+  syslog-vrl:
+    name: syslog VRL transform tests + config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Vector
+        run: |
+          curl -sSL https://sh.vector.dev | bash -s -- -y
+          echo "$HOME/.vector/bin" >> "$GITHUB_PATH"
+      - name: Install test dependencies
+        run: pip install pytest pyyaml
+      - name: Validate vector.yaml
+        # --no-environment skips filesystem/health checks (e.g. the
+        # default /var/lib/vector data dir not existing in CI) while still
+        # catching real config/schema errors - confirmed live with a
+        # deliberate typo before relying on this flag.
+        run: vector validate --no-environment syslog/vector.yaml
+      - name: Run VRL transform tests
+        working-directory: syslog
+        run: pytest -v
+
+  frontend-build:
+    name: frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: webui/frontend/package-lock.json
+      - name: Install dependencies
+        working-directory: webui/frontend
+        run: npm ci
+      - name: Build
+        working-directory: webui/frontend
+        run: npm run build
