@@ -1,19 +1,33 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, Suspense, lazy } from "react";
 import AppLayout from "@cloudscape-design/components/app-layout";
 import TopNavigation from "@cloudscape-design/components/top-navigation";
 import SideNavigation from "@cloudscape-design/components/side-navigation";
 import BreadcrumbGroup from "@cloudscape-design/components/breadcrumb-group";
 import Flashbar from "@cloudscape-design/components/flashbar";
+import Spinner from "@cloudscape-design/components/spinner";
+import Box from "@cloudscape-design/components/box";
 import { applyMode, applyDensity, Mode, Density } from "@cloudscape-design/global-styles";
 
-import ConsolePage from "./ConsolePage.jsx";
-import DevicesPage from "./DevicesPage.jsx";
-import ResultsPage from "./ResultsPage.jsx";
-import SettingsPage from "./SettingsPage.jsx";
 import SetupWizard from "./SetupWizard.jsx";
-import TopologyPage from "./TopologyPage.jsx";
-import TrendsPage from "./TrendsPage.jsx";
 import { getDevices, getCommands, getSetupStatus } from "./api.js";
+
+// Each page is its own chunk - board-components (Console) and the
+// markdown/plotting bits (Topology/Trends) are the heaviest deps in the
+// bundle and most sessions only ever visit one or two of these pages.
+const ConsolePage = lazy(() => import("./ConsolePage.jsx"));
+const DevicesPage = lazy(() => import("./DevicesPage.jsx"));
+const ResultsPage = lazy(() => import("./ResultsPage.jsx"));
+const SettingsPage = lazy(() => import("./SettingsPage.jsx"));
+const TopologyPage = lazy(() => import("./TopologyPage.jsx"));
+const TrendsPage = lazy(() => import("./TrendsPage.jsx"));
+
+function PageFallback() {
+  return (
+    <Box textAlign="center" padding="xxl">
+      <Spinner size="large" />
+    </Box>
+  );
+}
 
 let flashId = 0;
 
@@ -198,32 +212,35 @@ export default function App() {
         }
         notifications={<Flashbar items={flashes} />}
         content={
-          loaded &&
-          (page === "devices" ? (
-            <DevicesPage
-              devices={devices}
-              refreshDevices={refreshDevices}
-              pushFlash={pushFlash}
-              prefill={devicePrefill}
-              onPrefillConsumed={() => setDevicePrefill(null)}
-            />
-          ) : page === "results" ? (
-            <ResultsPage pushFlash={pushFlash} />
-          ) : page === "settings" ? (
-            <SettingsPage pushFlash={pushFlash} />
-          ) : page === "topology" ? (
-            <TopologyPage pushFlash={pushFlash} onOpenConsole={openConsoleFor} onAddDevice={openAddDevice} />
-          ) : page === "trends" ? (
-            <TrendsPage devices={devices} pushFlash={pushFlash} />
-          ) : (
-            <ConsolePage
-              devices={devices}
-              commandTree={commandTree}
-              pushFlash={pushFlash}
-              preselectDeviceId={preselectDeviceId}
-              onPreselectConsumed={() => setPreselectDeviceId(null)}
-            />
-          ))
+          loaded && (
+            <Suspense fallback={<PageFallback />}>
+              {page === "devices" ? (
+                <DevicesPage
+                  devices={devices}
+                  refreshDevices={refreshDevices}
+                  pushFlash={pushFlash}
+                  prefill={devicePrefill}
+                  onPrefillConsumed={() => setDevicePrefill(null)}
+                />
+              ) : page === "results" ? (
+                <ResultsPage pushFlash={pushFlash} />
+              ) : page === "settings" ? (
+                <SettingsPage pushFlash={pushFlash} />
+              ) : page === "topology" ? (
+                <TopologyPage pushFlash={pushFlash} onOpenConsole={openConsoleFor} onAddDevice={openAddDevice} />
+              ) : page === "trends" ? (
+                <TrendsPage devices={devices} pushFlash={pushFlash} />
+              ) : (
+                <ConsolePage
+                  devices={devices}
+                  commandTree={commandTree}
+                  pushFlash={pushFlash}
+                  preselectDeviceId={preselectDeviceId}
+                  onPreselectConsumed={() => setPreselectDeviceId(null)}
+                />
+              )}
+            </Suspense>
+          )
         }
       />
     </>

@@ -78,7 +78,13 @@ export const saveResult = (body) =>
     body: JSON.stringify(body),
   });
 
-export const listResults = (deviceId) => api(deviceId ? `/api/results?device_id=${encodeURIComponent(deviceId)}` : "/api/results");
+// Server-side paginated - returns { items, total, page, page_size }.
+export const listResults = ({ deviceId, q, page = 1, pageSize = 10 } = {}) => {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  if (deviceId) params.set("device_id", deviceId);
+  if (q) params.set("q", q);
+  return api(`/api/results?${params.toString()}`);
+};
 export const getResult = (filename) => api(`/api/results/${filename}`);
 export const deleteResult = (filename) => api(`/api/results/${filename}`, { method: "DELETE" });
 

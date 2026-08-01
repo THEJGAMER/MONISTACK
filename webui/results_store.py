@@ -53,19 +53,30 @@ class ResultsStore:
         )
         return {"filename": filename, "generated_at": generated_at}
 
-    def list(self, device_id=None, limit=200):
+    def list(self, device_id=None, limit=200, offset=0, q=None):
+        """Returns (items, total). `total` reflects the full filtered set
+        (device_id/q applied) before limit/offset, so callers can drive
+        real server-side pagination instead of truncating at `limit` and
+        pretending that's everything - which is what this used to do."""
+        where = []
+        params = []
         if device_id is not None:
-            rows = self.db.query(
-                "SELECT filename, device_id, command, auto_saved, created_at, length(markdown) AS size "
-                "FROM results WHERE device_id = %s ORDER BY filename DESC LIMIT %s",
-                (device_id, limit),
-            )
-        else:
-            rows = self.db.query(
-                "SELECT filename, device_id, command, auto_saved, created_at, length(markdown) AS size "
-                "FROM results ORDER BY filename DESC LIMIT %s",
-                (limit,),
-            )
+            where.append("device_id = %s")
+            params.append(device_id)
+        if q:
+            where.append("(command ILIKE %s OR device_id ILIKE %s OR filename ILIKE %s)")
+            like = f"%{q}%"
+            params += [like, like, like]
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+        total_row = self.db.query_one(f"SELECT COUNT(*) AS n FROM results {where_sql}", tuple(params))
+        total = total_row["n"] if total_row else 0
+
+        rows = self.db.query(
+            f"SELECT filename, device_id, command, auto_saved, created_at, length(markdown) AS size "
+            f"FROM results {where_sql} ORDER BY filename DESC LIMIT %s OFFSET %s",
+            tuple(params) + (limit, offset),
+        )
         items = []
         for r in rows:
             items.append(
@@ -80,7 +91,7 @@ class ResultsStore:
                     ),
                 }
             )
-        return items
+        return items, total
 
     def read(self, filename):
         row = self.db.query_one("SELECT markdown FROM results WHERE filename = %s", (filename,))

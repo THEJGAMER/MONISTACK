@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import Table from "@cloudscape-design/components/table";
@@ -113,6 +113,12 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
   const [syslogLoading, setSyslogLoading] = useState(false);
   const [syslogCategory, setSyslogCategory] = useState("");
   const [syslogFilterText, setSyslogFilterText] = useState("");
+  const [syslogLimit, setSyslogLimit] = useState(200);
+  const [syslogHasMore, setSyslogHasMore] = useState(false);
+  const syslogLimitRef = useRef(200);
+  useEffect(() => {
+    syslogLimitRef.current = syslogLimit;
+  }, [syslogLimit]);
   const [statusWithInterfaces, setStatusWithInterfaces] = useState(null);
   const [profileId, setProfileId] = useState("generic-48");
   const [statusRefreshing, setStatusRefreshing] = useState(false);
@@ -204,21 +210,34 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
 
   async function refreshRecentResults(deviceId) {
     try {
-      setRecentResults(await listResults(deviceId));
+      const res = await listResults({ deviceId, pageSize: 100 });
+      setRecentResults(res.items);
     } catch {
       setRecentResults([]);
     }
   }
 
-  async function refreshSyslog(deviceId, category) {
+  async function refreshSyslog(deviceId, category, limit) {
     setSyslogLoading(true);
     try {
-      setSyslogEvents(await getSyslog({ deviceId, category: category || undefined, limit: 200 }));
+      const events = await getSyslog({ deviceId, category: category || undefined, limit });
+      setSyslogEvents(events);
+      // Loki's query is capped at `limit`, not offset-paginated - a full
+      // page back means there's probably more further back in the window,
+      // so surface a "Load more" affordance instead of silently capping
+      // at 200 rows forever.
+      setSyslogHasMore(events.length >= limit);
     } catch (e) {
       pushFlash("error", `Could not load syslog: ${e.message}`);
     } finally {
       setSyslogLoading(false);
     }
+  }
+
+  function loadMoreSyslog() {
+    const nextLimit = syslogLimit + 200;
+    setSyslogLimit(nextLimit);
+    refreshSyslog(selected.id, syslogCategory, nextLimit);
   }
 
   async function refreshAlarmHistory(deviceId) {
@@ -245,15 +264,16 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
       setAlarmHistory([]);
       return;
     }
+    setSyslogLimit(200);
     refreshStatus(selected.id);
     refreshFrontPanelStatus(selected.id);
     refreshRecentResults(selected.id);
-    refreshSyslog(selected.id, syslogCategory);
+    refreshSyslog(selected.id, syslogCategory, 200);
     refreshAlarmHistory(selected.id);
     const t = setInterval(() => {
       refreshStatus(selected.id);
       refreshFrontPanelStatus(selected.id);
-      refreshSyslog(selected.id, syslogCategory);
+      refreshSyslog(selected.id, syslogCategory, syslogLimitRef.current);
       refreshAlarmHistory(selected.id);
     }, 20000);
     return () => clearInterval(t);
@@ -608,7 +628,7 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
                       <Button
                         iconName="refresh"
                         loading={syslogLoading}
-                        onClick={() => refreshSyslog(selected.id, syslogCategory)}
+                        onClick={() => refreshSyslog(selected.id, syslogCategory, syslogLimit)}
                       >
                         Refresh
                       </Button>
@@ -640,6 +660,13 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
                       ]}
                       empty={<Box textAlign="center">No syslog events for this device in this window.</Box>}
                     />
+                    {syslogHasMore && (
+                      <Box textAlign="center">
+                        <Button loading={syslogLoading} onClick={loadMoreSyslog}>
+                          Load 200 more
+                        </Button>
+                      </Box>
+                    )}
                   </SpaceBetween>
                 ),
               },

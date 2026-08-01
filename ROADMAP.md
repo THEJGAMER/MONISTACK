@@ -178,15 +178,38 @@ build on.
       commands per device across the whole fleet, not just one device).
 
 ### 0.6 Frontend hygiene
-- [ ] Bundle is ~1.03 MB JS / ~1.14 MB CSS (Vite warns; grew from ~996 KB
-      after adding `@cloudscape-design/board-components` for the Console's
-      dynamic board). Code-split by route/panel so first paint isn't the
-      whole app.
-- [ ] Pagination is client-side (`useClientPagination`) — the API returns
-      everything and the browser slices it. Fine at 200 rows, wrong at
-      50k. Move to server-side pagination for results and syslog.
-- [ ] Add a favicon (currently a 404 on every page load — cosmetic, but
-      it's the only console error in the app and it masks real ones).
+- [x] **2026-08-01**: Code-split by route via `React.lazy`/`Suspense` in
+      `App.jsx` — Console/Devices/Results/Settings/Topology/Trends are now
+      separate chunks instead of one ~1.03 MB bundle, cutting first paint
+      to whichever page loads first. Verified with `npm run build`: no
+      more Vite chunk-size warning, largest chunk (Console, which pulls in
+      `@cloudscape-design/board-components`) is 360 KB; smaller pages
+      (Results, Settings) are a few KB each.
+- [x] **2026-08-01**: `/api/results` moved to real server-side pagination
+      (`page`/`page_size`/`q` params, `ResultsStore.list()` now does
+      `COUNT(*)` + `LIMIT`/`OFFSET` + `ILIKE` search instead of fetching a
+      flat `LIMIT 200` and slicing/filtering client-side, which silently
+      capped the table at 200 rows no matter how deep you paginated).
+      `ResultsPage.jsx` and Console's "Recent results" panel updated to
+      the new `{items, total, page, page_size}` response shape. Verified
+      live against the real Postgres-backed table (105 saved results):
+      11 real pages, `q=lacp` correctly returned all 4 matching rows
+      across the whole table (including one from the Junos device), not
+      just whatever happened to be in the first 200.
+      Syslog stayed on Loki's own `limit` param (real offset pagination
+      doesn't make sense against a time-ordered log stream) but no longer
+      hard-caps at 200 forever — added a "Load N more" button that bumps
+      the limit and re-fetches. Verified live: went from 200 rows (25
+      client-side pages) to 376 after one click against the real switch's
+      auth-heavy syslog stream, button correctly disappears once a fetch
+      comes back short (no more data in the window).
+      Devices table (small, bounded by physical fleet size) intentionally
+      left on client-side pagination — not worth the complexity at that
+      scale.
+- [x] **2026-08-01**: Added a favicon (inline SVG data URI in
+      `index.html` — a small blue switch/port icon, no extra asset or
+      build step needed). Verified live via Playwright: no more favicon
+      404, zero browser console errors on Console/Results pages.
 
 ### 0.7 Container and supply chain
 - [ ] Containers run as root; use a non-root user + read-only rootfs.

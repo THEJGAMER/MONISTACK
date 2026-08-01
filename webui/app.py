@@ -193,7 +193,8 @@ def _migrate_legacy_sqlite():
         if migrated:
             log.info("migrated %d device(s) from legacy %s into Postgres", migrated, LEGACY_SQLITE_PATH)
 
-    if not RESULTS.list(limit=1):
+    existing_results, _ = RESULTS.list(limit=1)
+    if not existing_results:
         rows = legacy_conn.execute(
             """SELECT filename, device_id, device_name, host, category_id, command_id, command, summary,
                       output, markdown, auto_saved, created_at
@@ -877,8 +878,17 @@ def api_save_result(req: SaveResultRequest, user: str = Depends(require_auth_and
 
 
 @app.get("/api/results")
-def api_list_results(device_id: Optional[str] = None, user: str = Depends(require_auth_and_db)):
-    return RESULTS.list(device_id=device_id)
+def api_list_results(
+    device_id: Optional[str] = None,
+    q: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 10,
+    user: str = Depends(require_auth_and_db),
+):
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    items, total = RESULTS.list(device_id=device_id, q=q, limit=page_size, offset=(page - 1) * page_size)
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 @app.get("/api/results/{filename}")

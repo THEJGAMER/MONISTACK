@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import Table from "@cloudscape-design/components/table";
@@ -12,18 +12,27 @@ import Modal from "@cloudscape-design/components/modal";
 
 import { listResults, getResult, deleteResult } from "./api.js";
 import MiniMarkdown from "./MiniMarkdown.jsx";
-import { useClientPagination } from "./useClientPagination.js";
+
+const PAGE_SIZE = 10;
 
 export default function ResultsPage({ pushFlash }) {
   const [results, setResults] = useState([]);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [filterText, setFilterText] = useState("");
+  const [currentPageIndex, setCurrentPageIndex] = useState(1);
   const [viewing, setViewing] = useState(null); // { filename, content }
 
-  async function refresh() {
+  // Server-side pagination + search - the results table is backed by
+  // Postgres and grows without bound (every command run auto-saves a
+  // row), so slicing a client-fetched array stops working once that
+  // table is bigger than one page load's worth of rows.
+  async function refresh(page, q) {
     setLoading(true);
     try {
-      setResults(await listResults());
+      const res = await listResults({ page, pageSize: PAGE_SIZE, q: q || undefined });
+      setResults(res.items);
+      setTotal(res.total);
     } catch (e) {
       pushFlash("error", `Could not load saved results: ${e.message}`);
     } finally {
@@ -32,8 +41,16 @@ export default function ResultsPage({ pushFlash }) {
   }
 
   useEffect(() => {
-    refresh();
-  }, []);
+    refresh(currentPageIndex, filterText);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPageIndex, filterText]);
+
+  // Reset to page 1 whenever the search text changes so the user isn't
+  // stranded on a page number that no longer exists for the new filter.
+  useEffect(() => {
+    setCurrentPageIndex(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterText]);
 
   async function handleView(filename) {
     try {
@@ -47,20 +64,14 @@ export default function ResultsPage({ pushFlash }) {
   async function handleDelete(filename) {
     try {
       await deleteResult(filename);
-      setResults((prev) => prev.filter((r) => r.filename !== filename));
       pushFlash("success", `Deleted ${filename}.`);
+      refresh(currentPageIndex, filterText);
     } catch (e) {
       pushFlash("error", `Could not delete ${filename}: ${e.message}`);
     }
   }
 
-  const filtered = useMemo(() => {
-    const q = filterText.toLowerCase();
-    if (!q) return results;
-    return results.filter((r) => (r.title || r.filename).toLowerCase().includes(q));
-  }, [results, filterText]);
-
-  const { pageItems, paginationProps } = useClientPagination(filtered, 10);
+  const pagesCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   return (
     <>
@@ -68,7 +79,7 @@ export default function ResultsPage({ pushFlash }) {
         header={
           <Header
             variant="h2"
-            description="Every command run is auto-saved here, backed by SQLite - not just what you explicitly saved."
+            description="Every command run is auto-saved here, backed by Postgres - not just what you explicitly saved."
           >
             Saved Results
           </Header>
@@ -77,7 +88,7 @@ export default function ResultsPage({ pushFlash }) {
         <Table
           variant="embedded"
           loading={loading}
-          items={pageItems}
+          items={results}
           filter={
             <TextFilter
               filteringText={filterText}
@@ -85,7 +96,13 @@ export default function ResultsPage({ pushFlash }) {
               filteringPlaceholder="Search results..."
             />
           }
-          pagination={<Pagination {...paginationProps} />}
+          pagination={
+            <Pagination
+              currentPageIndex={currentPageIndex}
+              pagesCount={pagesCount}
+              onChange={({ detail }) => setCurrentPageIndex(detail.currentPageIndex)}
+            />
+          }
           columnDefinitions={[
             { id: "title", header: "Result", cell: (r) => r.title || r.filename },
             { id: "saved_at", header: "Saved at", cell: (r) => r.saved_at },
