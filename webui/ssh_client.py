@@ -38,6 +38,8 @@ import time
 
 import paramiko
 
+import metrics
+
 log = logging.getLogger("ssh_client")
 
 PROMPT_RE = re.compile(r"[\r\n]?\S+[>#]\s*$")
@@ -107,6 +109,7 @@ class SwitchSSH:
         self._client = None
         self._chan = None
         self._prompt_re = PROMPT_RE  # overridden per-platform in _connect_once for platforms whose prompt doesn't fit this
+        self._ever_connected = False  # first connect() isn't a "reconnect" - see metrics.ssh_reconnect_total
 
     def connected(self):
         return self._chan is not None and not self._chan.closed
@@ -172,6 +175,10 @@ class SwitchSSH:
                 self._connect_opnsense()
             else:
                 self._connect_os9()
+
+            if self._ever_connected:
+                metrics.ssh_reconnect_total.labels(host=self.host).inc()
+            self._ever_connected = True
         finally:
             _connect_semaphore.release()
 

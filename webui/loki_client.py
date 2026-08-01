@@ -13,6 +13,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import metrics
+
 
 class LokiError(Exception):
     pass
@@ -58,17 +60,19 @@ class LokiClient:
         # and avoids surfacing "Loki unreachable" to the user for what was
         # actually just one dropped connection.
         last_err = None
-        for attempt in range(2):
-            try:
-                with urllib.request.urlopen(url, timeout=self.timeout) as resp:
-                    data = json.load(resp)
-                break
-            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
-                last_err = e
-                if attempt == 0:
-                    time.sleep(0.5)
-        else:
-            raise LokiError(str(last_err)) from last_err
+        with metrics.loki_query_duration_seconds.time():
+            for attempt in range(2):
+                try:
+                    with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+                        data = json.load(resp)
+                    break
+                except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+                    last_err = e
+                    if attempt == 0:
+                        time.sleep(0.5)
+            else:
+                metrics.loki_query_failure_total.inc()
+                raise LokiError(str(last_err)) from last_err
 
         events = []
         for stream in data.get("data", {}).get("result", []):

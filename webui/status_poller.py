@@ -29,6 +29,7 @@ import time
 from datetime import datetime, timezone
 
 import junos_parsers
+import metrics
 import opnsense_parsers
 import parsers
 import trending
@@ -283,12 +284,23 @@ class StatusPoller:
             self._stop.wait(self.interval)
 
     def _poll_once(self, device):
+        # Single instrumentation point for all three platform-specific
+        # pollers below, rather than duplicating timing/success tracking
+        # in each - they never raise (each has its own broad try/except
+        # that sets status.state = STATE_DOWN and returns), so success is
+        # read back from the resulting state rather than from a caught
+        # exception here.
+        start = time.monotonic()
         if device.platform == "junos":
             self._poll_once_junos(device)
         elif device.platform == "opnsense":
             self._poll_once_opnsense(device)
         else:
             self._poll_once_os9(device)
+        metrics.poll_duration_seconds.labels(device_id=device.id).observe(time.monotonic() - start)
+        status = self._status.get(device.id)
+        success = status is not None and status.state != STATE_DOWN
+        (metrics.poll_success_total if success else metrics.poll_failure_total).labels(device_id=device.id).inc()
 
     def _poll_once_opnsense(self, device):
         """OPNsense equivalent of _poll_once_os9/_poll_once_junos - same

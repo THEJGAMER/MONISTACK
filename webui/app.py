@@ -11,14 +11,17 @@ from pathlib import Path
 from typing import Optional
 
 import psycopg2
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
 import junos_parsers
+import logging_setup
+import metrics
 import opnsense_parsers
 import parsers
 import settings as settings_store
@@ -35,7 +38,7 @@ import topology
 import trending
 from topology_store import TopologyStore
 
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging_setup.configure_logging()
 log = logging.getLogger("webui")
 
 BASE_DIR = Path(__file__).parent
@@ -109,6 +112,30 @@ async def _db_error_handler(request: Request, exc: psycopg2.Error):
 async def _ssh_error_handler(request: Request, exc: SwitchSSHError):
     log.warning("unhandled SSH error on %s: %s", request.url.path, exc)
     return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+
+@app.middleware("http")
+async def _request_id_middleware(request: Request, call_next):
+    """Stamps every request with a correlation ID (ROADMAP 0.4's "trace a
+    command run end to end") - reuses an incoming `X-Request-ID` if the
+    caller already has one (useful behind a reverse proxy that generates
+    its own), otherwise mints a short one. Set into logging_setup's
+    contextvar so every log line this request touches - including
+    ssh_client.py's connect/run logging deep inside a synchronous route
+    handler - carries it with no extra plumbing (see that module's
+    docstring for why the propagation is real, not aspirational). Echoed
+    back as a response header so the frontend/caller can correlate too."""
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    token = logging_setup.request_id_var.set(request_id)
+    start = time.monotonic()
+    try:
+        response = await call_next(request)
+        duration_ms = (time.monotonic() - start) * 1000
+        response.headers["X-Request-ID"] = request_id
+        log.info("%s %s -> %d (%.1fms)", request.method, request.url.path, response.status_code, duration_ms)
+        return response
+    finally:
+        logging_setup.request_id_var.reset(token)
 
 DB = None
 STORE = None
@@ -408,6 +435,52 @@ class SettingsUpdateRequest(BaseModel):
 @app.get("/api/setup/status")
 def api_setup_status():
     return {"configured": CONFIGURED, "db_error": DB_ERROR if CONFIGURED else None}
+
+
+# Self-observability (ROADMAP 0.4) - unauthenticated like /api/setup/status
+# above, deliberately: an orchestrator's health probe and a Prometheus
+# scrape don't carry this app's basic-auth credentials (the exporter this
+# app sits next to isn't authenticated either - see
+# prometheus/prometheus.yml), and neither leaks anything sensitive (no
+# command output, no device credentials - device_id/host as metric labels
+# is the only fleet-identifying info in any of the three).
+@app.get("/healthz")
+def healthz():
+    """Liveness only - the process can accept and answer a request at all.
+    Deliberately checks nothing else: Postgres/Loki/a switch being down is
+    routine and already handled per-request elsewhere, not a reason for an
+    orchestrator to kill and restart this container (see /readyz for the
+    check that's actually about whether real traffic can be served)."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz():
+    """Readiness - can this instance actually serve authenticated traffic
+    right now? The one dependency every `require_auth_and_db` route needs
+    is Postgres reachability, checked with a trivial query rather than
+    trusted from whatever DB/STORE happened to be set at startup. Loki and
+    the switches aren't checked here - those already degrade gracefully
+    per-request (see the exception handlers above), and pulling this
+    instance out of rotation because one switch is unreachable would be
+    wrong; Postgres being down means nothing meaningful can be served."""
+    if not CONFIGURED or STORE is None or DB is None:
+        return JSONResponse(status_code=503, content={"status": "not configured"})
+    try:
+        DB.query_one("SELECT 1")
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"status": "database unavailable", "detail": str(e)})
+    return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics_endpoint():
+    """Prometheus scrape target for this app's own operational metrics
+    (see metrics.py) - poll success/failure/duration, SSH reconnects, Loki
+    query latency/failures, command run count/duration. A separate concern
+    from exporter/exporter.py's `s4048_*` metrics (that's the switch's own
+    hardware/interface state); this is Switchboard monitoring itself."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/api/setup")
@@ -752,6 +825,8 @@ def api_run(req: RunRequest, user: str = Depends(require_auth_and_db)):
 
     log.info("user=%s device=%s running: %s", user, device.id, cmd)
 
+    metrics.command_run_total.labels(device_id=device.id, platform=device.platform).inc()
+    start = time.monotonic()
     try:
         with _session_locks[device.id]:
             switch = _get_session(device)
@@ -760,6 +835,8 @@ def api_run(req: RunRequest, user: str = Depends(require_auth_and_db)):
         raise HTTPException(status_code=500, detail=str(e))
     except SwitchSSHError as e:
         raise HTTPException(status_code=502, detail=str(e))
+    finally:
+        metrics.command_run_duration_seconds.labels(device_id=device.id).observe(time.monotonic() - start)
 
     summary = summarize(device.platform, req.category_id, req.command_id, output)
 

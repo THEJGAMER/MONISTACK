@@ -68,14 +68,36 @@ build on.
       only — fine today, painful the first time a column changes).
 
 ### 0.4 Self-observability
-- [ ] `/healthz` and `/readyz` endpoints so an orchestrator can actually
-      tell if the app is alive vs. wedged.
-- [ ] Export the webui's *own* metrics: poll success/failure counts per
-      device, SSH reconnect count, poll duration, Loki query latency,
-      command run count/latency. It's a monitoring tool that currently
-      can't be monitored.
-- [ ] Structured (JSON) logging with a request/correlation ID, so a
-      command run can be traced end to end.
+- [x] `/healthz` and `/readyz` endpoints (2026-08-01) — unauthenticated
+      (an orchestrator's probe/a Prometheus scrape doesn't carry basic-auth
+      creds, same as `/api/setup/status` already was). `/healthz` is
+      liveness only (process can answer at all); `/readyz` actually checks
+      Postgres with `SELECT 1` rather than trusting whatever `DB`/`STORE`
+      were at startup. Wired into `webui/Dockerfile` as a `HEALTHCHECK`
+      (Python's own `urllib`, no new package). Loki/switch reachability
+      deliberately isn't part of either check - those already degrade
+      gracefully per-request, and killing this container over one
+      unreachable switch would be wrong.
+- [x] Export the webui's own metrics (2026-08-01) — new `metrics.py`
+      (`prometheus_client`, same library the exporter already uses) with
+      poll success/failure/duration per device, SSH reconnects per host,
+      Loki query latency/failures, and command run count/duration per
+      device, served at `/metrics` and added as a second Prometheus scrape
+      target (`prometheus/prometheus.yml`) alongside the exporter's own
+      `s4048` job. Verified live: all three real devices' poll metrics and
+      a real `/api/run` call's command metrics showed up correctly, and
+      the new `switchboard` Prometheus target came up healthy.
+- [x] Structured (JSON) logging with a request/correlation ID (2026-08-01)
+      — new `logging_setup.py`: a contextvar set once per request by a new
+      FastAPI middleware, read back by a logging filter so every log line
+      a request touches carries the same `request_id` with no parameter
+      threading required - confirmed live this reaches synchronous code
+      deep inside a route (`ssh_client.py`'s own logging) since Starlette/
+      anyio copy the calling context into the thread pool sync handlers
+      run on. Echoed back as an `X-Request-ID` response header too.
+      `LOG_FORMAT=json` (default) or `text` (human-readable, for local
+      debugging) via env var. **Note:** this changes `docker logs` output
+      from plain text to one JSON object per line.
 
 ### 0.5 Resilience and graceful degradation
 - [x] Audit behavior when Loki is unreachable, the switch is unreachable, or

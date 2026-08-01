@@ -5,3 +5,12 @@ scrape_configs:
   - job_name: s4048
     static_configs:
       - targets: ["s4048-exporter:9101"]
+
+  # Switchboard's own operational metrics (ROADMAP 0.4) - poll success/
+  # failure/duration, SSH reconnects, Loki query latency, command run
+  # count/duration. A separate concern from the s4048 job above, which is
+  # the switch's own hardware/interface state.
+  - job_name: switchboard
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["webui:8080"]
