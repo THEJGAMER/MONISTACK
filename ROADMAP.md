@@ -495,6 +495,54 @@ The gate on anyone other than you using this.
       outside (metrics/logs showing zero notify activity) unless you
       know to check nflog specifically.
 
+      **Update, same day**: rigorous cross-check against a real,
+      sustained flapping storm (9 genuine transitions in 44s on Te 1/47
+      and Te 1/48, from the same failing optic) surfaced one more real
+      bug: `check_via_syslog`'s fire/resolve was still gated on
+      `key not in self._alerting`. During rapid flapping, `check_once`'s
+      poll path could fire a false positive from a stale SSH-poll sample
+      (reading "down" at a moment the interface was genuinely up per
+      real-time syslog), which set `_alerting=True` with nothing real
+      backing it - so when the interface then had a genuine *new* down
+      transition, the syslog path saw "already alerting" and silently
+      swallowed it: a real event producing zero alert. Fixed by making
+      `check_via_syslog`'s fire/resolve unconditional - syslog is
+      authoritative ground truth for its own events, and re-posting is a
+      safe, idempotent refresh either way (same reasoning as the
+      heartbeat). Verified against the full 9-transition flapping
+      window: 9/9 real transitions correctly detected with no gaps, no
+      missed events, no orphaned alerts - Alertmanager's active-alert
+      set matched real hardware state exactly throughout.
+- [x] **2026-08-01**: `group_wait: 30s -> 0s` per user request, after
+      confirming detection itself was already fast (~3-4s) and the
+      remaining delay before a push went out was purely the batching
+      window. Validated with `amtool check-config` before deploying;
+      confirmed live via a synthetic alert that notifications still
+      succeed (`alertmanager_notifications_total` counters incremented)
+      under the new setting. Trade-off, documented inline in
+      `alertmanager.yml`: alerts firing in the same instant (e.g. a
+      whole switch failing trips several rules at once) now arrive as
+      separate pushes instead of one batched notification.
+- [x] **2026-08-01**: Added PagerDuty as a second notification receiver
+      alongside Pushover, for real incident acknowledgement (Pushover is
+      fire-and-forget, no ack/escalation concept) - both now fire from
+      the same `all-notifiers` receiver, alongside the existing
+      Switchboard webhook. Considered GoAlert (self-hosted, free, but no
+      native iOS app - web UI + Twilio SMS/calls only) and several
+      mobile-first alternatives (Zenduty, Squadcast, ilert, SIGNL4 -
+      none actually free for real use, only time-limited trials) before
+      landing on PagerDuty, which the user already had an account for.
+      Routing key is file-based (`routing_key_file`,
+      `alertmanager/secrets/pagerduty_routing_key`), same gitignored
+      treatment as the Pushover credentials. Verified two ways before
+      trusting it: (1) called PagerDuty's real Events API v2 directly
+      with the routing key (trigger then resolve) and got
+      `"status":"success"` both times; (2) fired a synthetic alert
+      through the real Alertmanager pipeline and confirmed
+      `alertmanager_notifications_total{integration="pagerduty"}`
+      incremented, proving the end-to-end route (not just the
+      credential) works.
+
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added
       a real Juniper EX3300-48P (root SSH, verified live), with its own

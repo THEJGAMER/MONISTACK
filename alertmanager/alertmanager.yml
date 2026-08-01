@@ -1,28 +1,36 @@
 # Alertmanager is deployed and wired to Prometheus (see
 # prometheus/prometheus.yml's `alerting:` block and prometheus/alerts.yml
-# for the actual alert rules). Notifications go to Pushover
-# (pushover.net) as a real push notification to iOS/Android, plus a copy
-# to Switchboard's own webhook receiver (POST /api/alertmanager/webhook)
-# so every notification is also logged/counted
+# for the actual alert rules). Every notification fans out to three
+# places: Pushover (pushover.net, a plain push to iOS/Android), PagerDuty
+# (real incident tracking with acknowledgement - the thing Pushover can't
+# do), and Switchboard's own webhook receiver (POST
+# /api/alertmanager/webhook) so every notification is also logged/counted
 # (switchboard_alertmanager_notifications_total) independent of whether
-# the push itself was delivered.
+# the other two actually delivered.
 #
-# Credentials are file-based (`user_key_file`/`token_file`), read from
-# alertmanager/secrets/ - a directory that's gitignored and bind-mounted
-# read-only into the container (see docker-compose.yml) - specifically so
-# the actual Pushover user key/API token never land in this committed
-# file or in git history. To finish setup: create a Pushover
-# "Application" at https://pushover.net/apps/build (this is what
-# generates the *API token*, separate from your personal *user key*,
-# which is already in alertmanager/secrets/pushover_user_key) and put the
-# token in alertmanager/secrets/pushover_token, then
-# `docker compose up -d alertmanager`.
+# Credentials are file-based (`user_key_file`/`token_file`/
+# `routing_key_file`), read from alertmanager/secrets/ - a directory
+# that's gitignored and bind-mounted read-only into the container (see
+# docker-compose.yml) - specifically so the actual Pushover/PagerDuty
+# credentials never land in this committed file or in git history.
+#
+# To finish Pushover setup: create an "Application" at
+# https://pushover.net/apps/build (generates the *API token*, separate
+# from your personal *user key*, already in
+# alertmanager/secrets/pushover_user_key) and put the token in
+# alertmanager/secrets/pushover_token.
+#
+# To finish PagerDuty setup: Service Directory -> your service ->
+# Integrations -> Add Integration -> Events API v2, copy the generated
+# Integration Key into alertmanager/secrets/pagerduty_routing_key.
+#
+# Either way, then `docker compose up -d alertmanager`.
 
 global:
   resolve_timeout: 5m
 
 route:
-  receiver: pushover
+  receiver: all-notifiers
   group_by: ["alertname", "port"]
   # 0s per user request (2026-08-01) - confirmed live that detection
   # itself was already fast (~3-4s via interface_alerting.py's syslog
@@ -36,13 +44,18 @@ route:
   repeat_interval: 4h
 
 receivers:
-  - name: pushover
+  - name: all-notifiers
     pushover_configs:
       - user_key_file: /etc/alertmanager/secrets/pushover_user_key
         token_file: /etc/alertmanager/secrets/pushover_token
         title: '{{ .CommonLabels.alertname }}'
         message: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ end }}'
         priority: '{{ if eq .CommonLabels.severity "critical" }}1{{ else }}0{{ end }}'
+        send_resolved: true
+    pagerduty_configs:
+      - routing_key_file: /etc/alertmanager/secrets/pagerduty_routing_key
+        description: '{{ .CommonLabels.alertname }}: {{ range .Alerts }}{{ .Annotations.summary }}{{ "; " }}{{ end }}'
+        severity: '{{ if eq .CommonLabels.severity "critical" }}critical{{ else }}warning{{ end }}'
         send_resolved: true
     webhook_configs:
       - url: "http://webui:8080/api/alertmanager/webhook"

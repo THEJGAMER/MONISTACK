@@ -232,19 +232,29 @@ class InterfaceAlertChecker:
             cfg = immediate_by_key.get(key)
             if cfg is None:
                 continue
+            # Deliberately unconditional on self._alerting here - confirmed
+            # live this matters during rapid flapping: check_once's poll
+            # path can fire on a stale SSH-poll sample that doesn't match
+            # real-time reality (a false positive during a fast up/down/
+            # up/down sequence), which sets _alerting=True with nothing
+            # real backing it. If a genuine new "down" then arrived here
+            # gated on "not already alerting", it would be silently
+            # swallowed - a real down event producing no alert at all,
+            # because bookkeeping from an unrelated false fire said
+            # "already handled". Syslog is authoritative ground truth for
+            # its own events; posting again is a safe, idempotent refresh
+            # to Alertmanager either way (same reasoning as the heartbeat).
+            now = time.monotonic()
             if link_state == "down":
-                if key not in self._alerting:
-                    now = time.monotonic()
-                    self._down_since[key] = now
-                    self._fire(cfg, alertmanager, device_name_for, 0)
-                    self._alerting.add(key)
-                    self._last_posted[key] = now
+                self._down_since[key] = now
+                self._fire(cfg, alertmanager, device_name_for, 0)
+                self._alerting.add(key)
+                self._last_posted[key] = now
             else:
                 self._down_since.pop(key, None)
-                if key in self._alerting:
-                    self._resolve(cfg, alertmanager, device_name_for)
-                    self._alerting.discard(key)
-                    self._last_posted.pop(key, None)
+                self._resolve(cfg, alertmanager, device_name_for)
+                self._alerting.discard(key)
+                self._last_posted.pop(key, None)
         self._last_syslog_ts_ns = newest_seen
 
     def _fire(self, cfg, alertmanager, device_name_for, down_for, log_it=True):
