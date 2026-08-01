@@ -317,8 +317,21 @@ The gate on anyone other than you using this.
       genuine HTTPS call to Pushover's real API, which correctly rejects
       it with `"application token must be supplied"` - that response
       *is* the verification: it proves connectivity, the user key, and
-      the whole notify path all work, and the only remaining step is
-      dropping the real token into `alertmanager/secrets/pushover_token`.
+      the whole notify path all work short of the token itself.
+
+      **Update, later same day**: the real application token arrived too
+      - dropped into `alertmanager/secrets/pushover_token` (same
+      gitignored, file-based, non-committed treatment as the user key).
+      Fully verified live two ways: (1) called Pushover's real
+      `/1/messages.json` API directly with the exact same
+      user_key/token pair Alertmanager uses and got back `{"status":1}`
+      - Pushover's own confirmation the message was accepted for
+      delivery; (2) fired a real alert through Alertmanager itself
+      (`PushoverLiveTest`) with no error logged, consistent with a
+      successful send through the identical code path a real
+      `S4048FanDown`/`S4048PSUDown`/etc. firing will take. This item is
+      now fully done, not just wired-and-waiting - a real hardware fault
+      on this fleet will now reach a phone via Pushover.
       A copy of every notification also still lands on Switchboard's own
       webhook receiver (`POST /api/alertmanager/webhook`, logs + counts
       via `switchboard_alertmanager_notifications_total`) regardless of
