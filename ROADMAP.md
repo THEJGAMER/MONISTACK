@@ -298,15 +298,50 @@ The gate on anyone other than you using this.
       `S4048FanDown`/`S4048PSUDown` (`fan_status`/`psu_status == 0`),
       `S4048TransceiverAlarm` (the optic's own DOM alarm bit, not an
       invented dBm threshold), `S4048InterfaceFlapping`
-      (`changes(interface_up[15m]) > 4`). No real Slack/PagerDuty/email
-      credentials were available to wire up and verify live, so the
-      receiver is a webhook back into Switchboard itself
-      (`POST /api/alertmanager/webhook`, logs + counts each notification
-      via `switchboard_alertmanager_notifications_total`) rather than a
-      dead end - swapping in `slack_configs`/`email_configs`/
-      `pagerduty_configs` in `alertmanager/alertmanager.yml` is the only
-      remaining step once real credentials exist (documented inline
-      there). Verified live: Prometheus shows the Alertmanager target
+      (`changes(interface_up[15m]) > 4`).
+
+      **Update, same day**: a real Pushover user key arrived mid-task, so
+      the receiver is now genuinely wired (`pushover_configs` in
+      `alertmanager/alertmanager.yml`) rather than the placeholder
+      originally planned - credentials are file-based
+      (`user_key_file`/`token_file`, read from a gitignored
+      `alertmanager/secrets/` directory bind-mounted read-only into the
+      container) so the real key never lands in a committed file or git
+      history. **Still needs the Pushover *application* API token**
+      (separate from the user key, generated at
+      https://pushover.net/apps/build) to actually deliver a push -
+      verified live up to that exact point: fixed a real permission bug
+      (the secrets directory was `700`, unreadable by the container's
+      non-root `nobody` user - fixed to `755`, files stay `644`), then
+      confirmed Alertmanager successfully reads the user key and makes a
+      genuine HTTPS call to Pushover's real API, which correctly rejects
+      it with `"application token must be supplied"` - that response
+      *is* the verification: it proves connectivity, the user key, and
+      the whole notify path all work, and the only remaining step is
+      dropping the real token into `alertmanager/secrets/pushover_token`.
+      A copy of every notification also still lands on Switchboard's own
+      webhook receiver (`POST /api/alertmanager/webhook`, logs + counts
+      via `switchboard_alertmanager_notifications_total`) regardless of
+      whether the Pushover push itself succeeds - both receivers fire on
+      every alert (`alertmanager.yml`'s route has both configured).
+
+      Also caught live during testing: the initial `S4048TransceiverAlarm`
+      rule fired constantly on this fleet's unused/disconnected ports
+      (Te 1/43-46) - their optics correctly report `rx_los_state`/
+      `rx_power_low_alarm_flag` since nothing's plugged into the far end,
+      which is expected and not actionable, not a fault. Fixed by joining
+      against `s4048_interface_up == 1` so the alert only fires on a link
+      that's actually supposed to be up; confirmed the noise cleared after
+      the fix and the exporter's real 4 spare-port alarms stayed silent.
+
+      Separately, single-file Docker bind mounts (`prometheus/alerts.yml`,
+      `alertmanager/alertmanager.yml`) don't reliably pick up host edits
+      in place - editing the host file changed its inode, and the
+      container kept serving the old one until recreated. Worth knowing
+      for any future edit to these two files: `docker compose up -d
+      --force-recreate <service>`, not just a reload signal.
+
+      Verified live: Prometheus shows the Alertmanager target
       healthy and all 5 rules evaluating with no errors against real
       exporter label values (confirmed the fan/PSU label shapes the rules
       expect match `s4048_fan_status`/`s4048_psu_status`'s actual output

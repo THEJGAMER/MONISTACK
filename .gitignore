@@ -6,3 +6,4 @@ __pycache__/
 webui/frontend/node_modules/
 webui/frontend/dist/
 webui/data/
+alertmanager/secrets/

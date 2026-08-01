@@ -1,34 +1,42 @@
 # Alertmanager is deployed and wired to Prometheus (see
 # prometheus/prometheus.yml's `alerting:` block and prometheus/alerts.yml
-# for the actual alert rules), but the receiver below is a deliberate
-# placeholder: no real Slack/PagerDuty/email destination has been
-# configured yet (no credentials were available to wire up and verify
-# live - see ROADMAP.md 3.2). `webhook_configs` pointed at a route that
-# doesn't exist yet is honest about that: alerts fire and are queryable
-# via Alertmanager's own API/UI (and Switchboard's Maintenance page,
-# which proxies that API), they just don't reach a human outside this
-# stack until a real receiver replaces this one.
+# for the actual alert rules). Notifications go to Pushover
+# (pushover.net) as a real push notification to iOS/Android, plus a copy
+# to Switchboard's own webhook receiver (POST /api/alertmanager/webhook)
+# so every notification is also logged/counted
+# (switchboard_alertmanager_notifications_total) independent of whether
+# the push itself was delivered.
 #
-# To wire up a real channel:
-# - Slack: replace `webhook_configs` with `slack_configs` and an
-#   `api_url` (Slack incoming webhook URL), or set `slack_api_url` under
-#   `global:` and use `channel:` per receiver.
-# - Email: add `smtp_smarthost`/`smtp_from`/`smtp_auth_*` under `global:`
-#   and use `email_configs` with a `to:` address.
-# - PagerDuty: `pagerduty_configs` with a service integration key.
+# Credentials are file-based (`user_key_file`/`token_file`), read from
+# alertmanager/secrets/ - a directory that's gitignored and bind-mounted
+# read-only into the container (see docker-compose.yml) - specifically so
+# the actual Pushover user key/API token never land in this committed
+# file or in git history. To finish setup: create a Pushover
+# "Application" at https://pushover.net/apps/build (this is what
+# generates the *API token*, separate from your personal *user key*,
+# which is already in alertmanager/secrets/pushover_user_key) and put the
+# token in alertmanager/secrets/pushover_token, then
+# `docker compose up -d alertmanager`.
 
 global:
   resolve_timeout: 5m
 
 route:
-  receiver: placeholder
+  receiver: pushover
   group_by: ["alertname", "port"]
   group_wait: 30s
   group_interval: 5m
   repeat_interval: 4h
 
 receivers:
-  - name: placeholder
+  - name: pushover
+    pushover_configs:
+      - user_key_file: /etc/alertmanager/secrets/pushover_user_key
+        token_file: /etc/alertmanager/secrets/pushover_token
+        title: '{{ .CommonLabels.alertname }}'
+        message: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ end }}'
+        priority: '{{ if eq .CommonLabels.severity "critical" }}1{{ else }}0{{ end }}'
+        send_resolved: true
     webhook_configs:
       - url: "http://webui:8080/api/alertmanager/webhook"
         send_resolved: true

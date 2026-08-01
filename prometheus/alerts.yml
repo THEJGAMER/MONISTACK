@@ -31,14 +31,21 @@ groups:
           summary: "PSU {{ $labels.unit }}/{{ $labels.bay }} down"
           description: "show environment reports this power supply as down - if the other PSU is also degraded this is a single point of failure."
 
+      # Joined against s4048_interface_up rather than a bare
+      # `transceiver_alarm == 1`: confirmed live that unused/disconnected
+      # ports (link Down, no far end) constantly report rx_los_state and
+      # rx_power_low_alarm_flag - real DOM readings, but expected and not
+      # actionable on a port nothing's plugged into. Only alerting when
+      # the interface is actually supposed to be up turns this from
+      # permanent noise on this fleet's spare ports into a real signal.
       - alert: S4048TransceiverAlarm
-        expr: s4048_transceiver_alarm == 1
+        expr: s4048_transceiver_alarm == 1 and on(port) s4048_interface_up == 1
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "Transceiver alarm on {{ $labels.port }} ({{ $labels.flag }})"
-          description: "The optic's own DOM alarm bit is set (show interfaces transceiver) - Rx/Tx power, temperature, voltage, or bias current is outside the vendor's programmed threshold for this specific optic."
+          description: "The optic's own DOM alarm bit is set (show interfaces transceiver) on a link that's currently up - Rx/Tx power, temperature, voltage, or bias current is outside the vendor's programmed threshold for this specific optic."
 
       # Flap detection: `changes()` counts every 0<->1 transition the
       # gauge made in the window, not just "is it down right now" - a
