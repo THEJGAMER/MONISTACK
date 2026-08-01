@@ -81,8 +81,17 @@ def parse_environment(text):
             }
         )
 
+    # Type is `AC`/`DC` when the PSU is up, but confirmed live: a PSU that's
+    # down or removed reports Type `UNKNOWN` instead - the device stops
+    # being able to identify it, but the row is still there. An earlier
+    # version of this regex only matched AC|DC, which silently dropped the
+    # one PSU row that actually matters (the failed one) from `out["psus"]`
+    # entirely - in the exporter this meant Prometheus's psu_status gauge
+    # just went stale at its last "up" value forever instead of ever
+    # reflecting the fault, so the S4048PSUDown alert never fired despite
+    # a real, ongoing failure.
     for m in re.finditer(
-        r"^\s*(\d+)\s+(\d+)\s+(up|down)\s+(AC|DC)\s+(up|down)\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+",
+        r"^\s*(\d+)\s+(\d+)\s+(up|down)\s+(AC|DC|UNKNOWN)\s+(up|down)\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+",
         text,
         re.MULTILINE,
     ):

@@ -58,8 +58,16 @@ def parse_environment(text):
             }
         )
 
+    # Type is `AC`/`DC` when the PSU is up, but confirmed live: a PSU
+    # that's down or removed reports Type `UNKNOWN` instead - the row is
+    # still there, the device just can't identify it anymore. Matching
+    # only AC|DC here silently dropped exactly the PSU row that matters
+    # (the failed one) from `out["psus"]`, which meant `s4048_psu_status`
+    # just went stale at its last "up" value forever instead of ever
+    # reflecting the fault - a real PSU failure on this fleet never
+    # triggered S4048PSUDown because of this.
     for m in re.finditer(
-        r"^\s*(\d+)\s+(\d+)\s+(up|down)\s+(AC|DC)\s+(up|down)\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+",
+        r"^\s*(\d+)\s+(\d+)\s+(up|down)\s+(AC|DC|UNKNOWN)\s+(up|down)\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+",
         text,
         re.MULTILINE,
     ):

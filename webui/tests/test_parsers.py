@@ -29,6 +29,22 @@ def test_parse_environment():
     assert env["units"][0]["voltage_ok"] is True
 
 
+def test_parse_environment_psu_down_reports_type_unknown():
+    """Regression test for a real bug: a PSU that's down/removed reports
+    Type `UNKNOWN` instead of `AC`/`DC` - a fixture captured live from a
+    real PSU 2 failure on the S4048. The regex used to only match
+    AC|DC, which silently dropped this row entirely (so `s4048_psu_status`
+    in the exporter went stale instead of ever reflecting the fault, and
+    S4048PSUDown never fired despite a real ongoing failure)."""
+    env = parsers.parse_environment(load_fixture("environment_psu_down.txt"))
+    assert len(env["psus"]) == 2
+    down = next(p for p in env["psus"] if p["bay"] == "2")
+    assert down["status"] == "down"
+    assert down["type"] == "UNKNOWN"
+    assert down["fan_status"] == "down"
+    assert down["power_watts"] == 0
+
+
 def test_parse_interfaces_status():
     rows = parsers.parse_interfaces_status(load_fixture("interfaces_status.txt"))
     assert len(rows) == 54

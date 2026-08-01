@@ -1,0 +1,29 @@
+--  Fan  Status  --
+Unit Bay   TrayStatus  Fan1    Speed   Fan2    Speed   
+------------------------------------------------------------------------------------
+ 1    1     up          up      9929    up      9929    
+ 1    2     up          up      10031   up      10134   
+ 1    3     up          up      10134   up      10031   
+
+Speed in RPM
+
+
+--  Power Supplies  --
+Unit   Bay   Status   Type   FanStatus  FanSpeed      Power  AvgPower  AvgPowerStartTime
+-----------------------------------------------------------------------------------------
+  1     1    up     AC          up        10768       98      59    07/26/2026-20:34 
+  1     2    down   UNKNOWN     down      0           0       0     N/A 
+
+
+-- Unit Environment Status  --
+Unit  Status        Temp   Voltage             
+---------------------------------------------------------------------------
+* 1   online        36C    ok
+
+ * Management Unit 
+
+
+--  Thermal Sensor Readings (deg C)  --
+Unit     CPU      MAC      NIC      AMB      BCM
+-------------------------------------------------
+  1       32       36       30       28       50 
