@@ -97,13 +97,16 @@ class InterfaceAlertChecker:
         self._alerting = set()  # (device_id, port) currently alerting
         self._last_posted = {}  # (device_id, port) -> monotonic time of last fire/heartbeat POST
         self._last_syslog_ts_ns = 0  # dedup cursor for check_via_syslog
+        self._last_seen_poll_at = {}  # (device_id, port) -> last status_poller "last_polled" considered
 
     def check_once(self, configs, get_port_state, device_name_for, alertmanager):
         """Owns delayed-mode timing end to end (its down_since tracking is
         what "stayed down for N seconds" means) - both fire and resolve.
 
         For immediate mode, this is deliberately fire-only, never resolve
-        - resolving stays check_via_syslog's exclusive job. Confirmed live
+        - resolving is check_via_syslog's job (and reconcile_via_poll's,
+        for the missed-syslog-event case - see that method's docstring
+        for why *it* can safely resolve where this can't). Confirmed live
         why both halves of that split matter: (1) without any role here,
         a port already down before a webui restart (no *new* syslog
         transition to react to - check_via_syslog only sees fresh events)
@@ -133,6 +136,7 @@ class InterfaceAlertChecker:
                     self._resolve(cfg, alertmanager, device_name_for)
                     self._alerting.discard(key)
                     self._last_posted.pop(key, None)
+                    self._last_seen_poll_at.pop(key, None)
                 continue
 
             state = get_port_state(cfg["device_id"], cfg["port"])
@@ -144,6 +148,7 @@ class InterfaceAlertChecker:
                     self._fire(cfg, alertmanager, device_name_for, now - self._down_since[key])
                     self._alerting.add(key)
                     self._last_posted[key] = now
+                    self._last_seen_poll_at.pop(key, None)
                 elif is_down and key in self._alerting:
                     self._maybe_heartbeat(key, cfg, alertmanager, device_name_for, now)
                 elif not is_down:
@@ -196,8 +201,10 @@ class InterfaceAlertChecker:
         behind the real device event instead of check_once's ~30s poll
         bound. Delayed-mode configs are deliberately left to check_once,
         whose sustained down_since tracking is what "stayed down for
-        N seconds" actually means; check_once also remains the fallback
-        for immediate mode if Loki itself is unreachable.
+        N seconds" actually means; check_once remains the fire-only
+        fallback for immediate mode if Loki itself is unreachable, and
+        reconcile_via_poll is the resolve-side fallback for a missed
+        syslog "up" event specifically.
 
         `_last_syslog_ts_ns` is a monotonically-advancing cursor so the
         same already-processed event (log lines don't disappear from the
@@ -250,12 +257,60 @@ class InterfaceAlertChecker:
                 self._fire(cfg, alertmanager, device_name_for, 0)
                 self._alerting.add(key)
                 self._last_posted[key] = now
+                self._last_seen_poll_at.pop(key, None)
             else:
                 self._down_since.pop(key, None)
                 self._resolve(cfg, alertmanager, device_name_for)
                 self._alerting.discard(key)
                 self._last_posted.pop(key, None)
+                self._last_seen_poll_at.pop(key, None)
         self._last_syslog_ts_ns = newest_seen
+
+    def reconcile_via_poll(self, configs, get_state_and_polled_at, device_name_for, alertmanager):
+        """Safety net for currently-alerting immediate-mode ports, run on
+        a tight ~5s loop (see app.py): if a *fresh* status-poller SSH poll
+        (status_poller.py's own independent 30s cycle) shows the port
+        genuinely up, resolves the alert. Exists specifically for what
+        check_via_syslog can't cover on its own - a missed/dropped syslog
+        "up" event (Vector hiccup, a Loki ingestion gap) would otherwise
+        leave an alert stuck firing forever, since resolve is normally
+        syslog's exclusive job for immediate mode (see check_once's
+        docstring for why a bare "trust whatever's polled" design was
+        removed in the first place: a *stale* read can falsely resolve a
+        real ongoing outage).
+
+        The safety here is in what counts as "fresh": each config's
+        last-considered `last_polled` timestamp is tracked, and a resolve
+        only fires when the observed `last_polled` has actually advanced
+        past what was last seen *and* now reads "up". A snapshot from
+        before the alert even started can never trigger this - it's only
+        ever comparing against poll results that landed after the alert
+        began (the `_last_seen_poll_at` entry for a key is cleared every
+        time that key starts a fresh alerting episode, in both check_once
+        and check_via_syslog) - so this doesn't reopen the original
+        stale-read hazard, it only reacts to genuinely new information."""
+        for cfg in configs:
+            if not cfg["enabled"] or cfg["mode"] != "immediate":
+                continue
+            key = (cfg["device_id"], cfg["port"])
+            if key not in self._alerting:
+                continue
+            state, polled_at = get_state_and_polled_at(cfg["device_id"], cfg["port"])
+            if polled_at is None or state is None:
+                continue
+            if self._last_seen_poll_at.get(key) == polled_at:
+                continue  # same snapshot as last check - nothing new learned
+            self._last_seen_poll_at[key] = polled_at
+            if state != "down":
+                log.info(
+                    "interface alert reconciled via poll (missed syslog up?): %s/%s",
+                    cfg["device_id"], cfg["port"],
+                )
+                self._resolve(cfg, alertmanager, device_name_for)
+                self._alerting.discard(key)
+                self._down_since.pop(key, None)
+                self._last_posted.pop(key, None)
+                self._last_seen_poll_at.pop(key, None)
 
     def _fire(self, cfg, alertmanager, device_name_for, down_for, log_it=True):
         starts_at = datetime.now(timezone.utc).isoformat()

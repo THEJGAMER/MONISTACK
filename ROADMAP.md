@@ -541,7 +541,40 @@ The gate on anyone other than you using this.
       through the real Alertmanager pipeline and confirmed
       `alertmanager_notifications_total{integration="pagerduty"}`
       incremented, proving the end-to-end route (not just the
-      credential) works.
+      credential) works. Separately confirmed (same day, user asked
+      explicitly): `send_resolved: true` on the PagerDuty receiver means
+      a resolved Switchboard alert automatically closes the matching
+      PagerDuty incident - verified via the identical dedup_key
+      mechanism both directly against PagerDuty's Events API v2
+      (trigger then resolve, both `"status":"success"`) and through the
+      real Alertmanager pipeline (the pagerduty notification counter
+      incremented once for the fire and again for the resolve). No
+      changes needed - this was already correct from how the receiver
+      was originally configured.
+- [x] **2026-08-01**: Reconciliation safety net for a missed syslog "up"
+      event, per user request - a dropped/delayed Vector->Loki delivery
+      would otherwise leave an immediate-mode alert stuck firing forever,
+      since resolve was exclusively check_via_syslog's job (deliberately,
+      to avoid the earlier stale-poll-read hazard). New
+      `reconcile_via_poll()` runs every 5s against only the
+      currently-alerting immediate-mode ports, and resolves one if the
+      status poller's own SSH-polled state has gone back up - but only
+      when that reading comes from a *fresh* poll it hasn't already
+      considered (tracked via status_poller's own `last_polled`
+      timestamp), never a repeated/stale snapshot. This is what keeps it
+      safe where a bare "let the poll loop resolve too" design wasn't:
+      a stale read from before the alert even started can never trigger
+      it, since `_last_seen_poll_at` is cleared every time a key starts a
+      fresh alerting episode - it only ever reacts to poll results that
+      landed *after* the alert began. Verified with an isolated test
+      against the real `InterfaceAlertChecker` class simulating the
+      exact scenario (down, same stale snapshot repeated, then a
+      genuinely new snapshot showing up): correctly ignored the repeat,
+      correctly resolved on the new one. Watched 3 minutes of live
+      production traffic afterward with no errors from the new
+      background thread (no real flap occurred in that window to
+      exercise the resolve path itself, but confirms no regression to
+      normal operation).
 
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added

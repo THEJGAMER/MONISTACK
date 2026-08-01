@@ -357,6 +357,21 @@ def _port_state_for(device_id, port):
     return None
 
 
+def _port_state_and_polled_at_for(device_id, port):
+    """Like _port_state_for, but also returns the status poller's own
+    `last_polled` timestamp - interface_alerting.py's reconcile_via_poll
+    needs this to tell a genuinely fresh SSH poll apart from re-reading
+    the same cached snapshot it already considered."""
+    status = STATUS.get(device_id, include_interfaces=True)
+    if status is None:
+        return None, None
+    polled_at = status.get("last_polled")
+    for iface in status.get("interfaces", []):
+        if iface.get("port") == port:
+            return iface.get("port_state"), polled_at
+    return None, polled_at
+
+
 def _device_name_for(device_id):
     device = DEVICES_BY_ID.get(device_id)
     return device.name if device else device_id
@@ -409,6 +424,32 @@ def _interface_alert_syslog_loop():
 
 
 threading.Thread(target=_interface_alert_syslog_loop, daemon=True, name="interface-alert-syslog-checker").start()
+
+
+# Reconciliation for currently-alerting immediate-mode ports (ROADMAP
+# 3.2, user request 2026-08-01) - every 5s, checks whether a still-firing
+# alert's real polled state has since gone back up, in case the syslog
+# "up" event that would normally resolve it got missed (Vector hiccup,
+# Loki ingestion gap). See interface_alerting.py's reconcile_via_poll for
+# why this is safe against the stale-read hazard that ruled out a
+# simpler "just let check_once resolve too" design.
+def _interface_alert_reconcile_loop():
+    while True:
+        time.sleep(5)
+        if DB is None or INTERFACE_ALERT_RULES is None:
+            continue
+        try:
+            configs = INTERFACE_ALERT_RULES.list()
+        except Exception:
+            log.exception("interface alert config lookup failed (reconcile path)")
+            continue
+        try:
+            INTERFACE_ALERT_CHECKER.reconcile_via_poll(configs, _port_state_and_polled_at_for, _device_name_for, ALERTMANAGER)
+        except Exception:
+            log.exception("interface alert reconcile check failed")
+
+
+threading.Thread(target=_interface_alert_reconcile_loop, daemon=True, name="interface-alert-reconciler").start()
 
 
 def _load_database(dsn):
