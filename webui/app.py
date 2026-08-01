@@ -38,6 +38,7 @@ from results_store import ResultsStore
 from scheduler import ScheduleStore
 import alert_rules
 import compliance
+import interface_alerting
 from ssh_client import SwitchSSH, SwitchSSHError
 from status_poller import StatusPoller
 from store import DeviceStore
@@ -165,6 +166,11 @@ RESULTS = None
 TOPOLOGY_STORE = None
 SCHEDULES = None
 ALERT_RULES = None
+INTERFACE_ALERT_RULES = None
+# Not reset on DB reconfigure like the stores above - it's just in-memory
+# down-tracking state (see InterfaceAlertChecker's docstring), no reason
+# to lose it because Settings saved a new Postgres DSN.
+INTERFACE_ALERT_CHECKER = interface_alerting.InterfaceAlertChecker()
 DEVICES = []
 DEVICES_BY_ID = {}
 LOKI = None
@@ -341,20 +347,85 @@ def _schedule_loop():
 threading.Thread(target=_schedule_loop, daemon=True, name="schedule-runner").start()
 
 
+def _port_state_for(device_id, port):
+    status = STATUS.get(device_id, include_interfaces=True)
+    if status is None:
+        return None
+    for iface in status.get("interfaces", []):
+        if iface.get("port") == port:
+            return iface.get("port_state")
+    return None
+
+
+def _device_name_for(device_id):
+    device = DEVICES_BY_ID.get(device_id)
+    return device.name if device else device_id
+
+
+# Per-interface down-alerting (ROADMAP 3.2's Interfaces tab, see
+# interface_alerting.py) - same 30s cadence as the status poller's fast
+# poll, since it's reading that same already-polled state rather than
+# doing its own SSH.
+def _interface_alert_loop():
+    while True:
+        time.sleep(30)
+        if DB is None or INTERFACE_ALERT_RULES is None:
+            continue
+        try:
+            configs = INTERFACE_ALERT_RULES.list()
+        except Exception:
+            log.exception("interface alert config lookup failed")
+            continue
+        try:
+            INTERFACE_ALERT_CHECKER.check_once(configs, _port_state_for, _device_name_for, ALERTMANAGER)
+        except Exception:
+            log.exception("interface alert check failed")
+
+
+threading.Thread(target=_interface_alert_loop, daemon=True, name="interface-alert-checker").start()
+
+
+# Fast path for "immediate" mode - a 30s-bounded SSH poll cycle isn't
+# what a human means by "alert me immediately" (confirmed live: the
+# switch's own syslog reports a link-down transition within ~1-2s, real
+# users noticed the ~10-30s gap between that and this alerting). Vector
+# already ships that same event to Loki in real time (syslog/vector.yaml),
+# so this polls Loki - a single cheap HTTP query, not an SSH round trip -
+# on a much tighter interval instead of waiting on the device poll cycle.
+def _interface_alert_syslog_loop():
+    while True:
+        time.sleep(3)
+        if DB is None or INTERFACE_ALERT_RULES is None or LOKI is None:
+            continue
+        try:
+            configs = INTERFACE_ALERT_RULES.list()
+        except Exception:
+            log.exception("interface alert config lookup failed (syslog path)")
+            continue
+        try:
+            INTERFACE_ALERT_CHECKER.check_via_syslog(configs, LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
+        except Exception:
+            log.exception("interface alert syslog check failed")
+
+
+threading.Thread(target=_interface_alert_syslog_loop, daemon=True, name="interface-alert-syslog-checker").start()
+
+
 def _load_database(dsn):
     """Connects to Postgres, runs one-time legacy migrations, and (re)loads
     devices + status polling from it. Raises on a bad DSN/unreachable host
     so callers (setup wizard, Settings save) can report a clear error
     without disturbing whatever was working before the attempt."""
-    global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, DEVICES, DEVICES_BY_ID
+    global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES, DEVICES, DEVICES_BY_ID
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
     new_topology_store = TopologyStore(new_db)
     new_schedules = ScheduleStore(new_db)
     new_alert_rules = alert_rules.AlertRuleStore(new_db)
-    DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES = (
-        new_db, new_store, new_results, new_topology_store, new_schedules, new_alert_rules
+    new_interface_alert_rules = interface_alerting.InterfaceAlertConfigStore(new_db)
+    DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES = (
+        new_db, new_store, new_results, new_topology_store, new_schedules, new_alert_rules, new_interface_alert_rules
     )
 
     _migrate_legacy_json_devices()
@@ -1448,20 +1519,54 @@ def api_delete_silence(silence_id: str, user: str = Depends(require_auth_and_db)
 async def api_alertmanager_webhook(request: Request):
     """Receiver for Alertmanager's webhook notifications (see
     alertmanager/alertmanager.yml) - unauthenticated like /healthz, since
-    Alertmanager doesn't send this app's basic-auth credentials and this
-    is the only receiver configured. Doesn't do anything with the alert
-    beyond logging + counting it: there's no real downstream (Slack/email/
-    PagerDuty) wired up yet, so this exists to make "did an alert actually
-    fire and reach a receiver" observable (via logs and
-    switchboard_alertmanager_notifications_total) rather than a silent
-    dead end."""
+    Alertmanager doesn't send this app's basic-auth credentials. Every
+    notification here also gets a copy sent to Pushover (a second,
+    separate receiver on the same route), and is persisted to the
+    `alert_history` table (see /api/alert-history) - this one receiver
+    covers both Prometheus-rule alerts and interface_alerting.py's
+    directly-posted per-interface alerts, since both go through
+    Alertmanager the same way."""
     payload = await request.json()
+    now = datetime.now(timezone.utc).isoformat()
     for alert in payload.get("alerts", []):
-        name = alert.get("labels", {}).get("alertname", "unknown")
+        labels = alert.get("labels", {})
+        name = labels.get("alertname", "unknown")
         status = alert.get("status", "unknown")
+        severity = labels.get("severity")
+        summary = alert.get("annotations", {}).get("summary", "")
         metrics.alertmanager_notifications_total.labels(alertname=name, status=status).inc()
-        log.info("alertmanager: %s %s - %s", status, name, alert.get("annotations", {}).get("summary", ""))
+        log.info("alertmanager: %s %s - %s", status, name, summary)
+        if DB is not None:
+            try:
+                DB.execute(
+                    "INSERT INTO alert_history (alertname, status, severity, summary, labels, received_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (name, status, severity, summary, json.dumps(labels), now),
+                )
+            except Exception:
+                log.exception("could not record alert history for %s", name)
     return {"ok": True}
+
+
+@app.get("/api/alert-history")
+def api_get_alert_history(limit: int = 200, user: str = Depends(require_auth_and_db)):
+    limit = max(1, min(limit, 1000))
+    rows = DB.query(
+        "SELECT alertname, status, severity, summary, labels, received_at FROM alert_history "
+        "ORDER BY received_at DESC LIMIT %s",
+        (limit,),
+    )
+    return [
+        {
+            "alertname": r["alertname"],
+            "status": r["status"],
+            "severity": r["severity"],
+            "summary": r["summary"],
+            "labels": json.loads(r["labels"]),
+            "received_at": r["received_at"],
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/alert-rules")
@@ -1493,6 +1598,64 @@ def api_update_alert_rule(name: str, req: AlertRuleUpdateRequest, user: str = De
         raise HTTPException(status_code=502, detail=f"Rule saved, but Prometheus reload failed: {e}")
 
     log.info("user=%s updated alert rule %s: severity=%s enabled=%s", user, name, req.severity, req.enabled)
+    return updated
+
+
+@app.get("/api/interface-alerts")
+def api_list_interface_alerts(device_id: str, user: str = Depends(require_auth_and_db)):
+    """Every port this device can address (device.valid_values_for("port")
+    - same list the Console's param dropdowns use), merged with any saved
+    alert config and current live state, so the UI can show a full port
+    list with sane "not configured yet" defaults rather than only the
+    ports someone already opted in."""
+    device = DEVICES_BY_ID.get(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    configs_by_port = {c["port"]: c for c in INTERFACE_ALERT_RULES.list(device_id=device_id)}
+    ports = device.valid_values_for("port")
+    result = []
+    for port in ports:
+        cfg = configs_by_port.get(port)
+        result.append({
+            "device_id": device_id,
+            "port": port,
+            "enabled": cfg["enabled"] if cfg else False,
+            "mode": cfg["mode"] if cfg else "immediate",
+            "delay_seconds": cfg["delay_seconds"] if cfg else 60,
+            "severity": cfg["severity"] if cfg else "warning",
+            "current_state": _port_state_for(device_id, port),
+        })
+    return result
+
+
+class InterfaceAlertUpdateRequest(BaseModel):
+    # Real port names (e.g. "Te 1/47") contain a "/" - a path segment
+    # can't safely carry that (confirmed live: even URL-encoded as %2F,
+    # FastAPI's default {port} path converter doesn't match it and
+    # returns a 404), so `port` travels in the body instead of the URL,
+    # unlike every other single-resource PUT/DELETE in this app.
+    port: str
+    enabled: bool
+    mode: str = "immediate"
+    delay_seconds: int = 60
+    severity: str = "warning"
+
+
+@app.put("/api/interface-alerts/{device_id}")
+def api_update_interface_alert(device_id: str, req: InterfaceAlertUpdateRequest, user: str = Depends(require_auth_and_db)):
+    device = DEVICES_BY_ID.get(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    if req.port not in device.valid_values_for("port"):
+        raise HTTPException(status_code=400, detail="unknown port for this device")
+    try:
+        updated = INTERFACE_ALERT_RULES.upsert(
+            device_id, req.port, req.enabled, req.mode, req.delay_seconds, severity=req.severity
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    log.info("user=%s set interface alert %s/%s: enabled=%s mode=%s delay=%ds",
+              user, device_id, req.port, req.enabled, req.mode, req.delay_seconds)
     return updated
 
 

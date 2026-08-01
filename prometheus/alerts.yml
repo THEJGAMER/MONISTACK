@@ -16,7 +16,7 @@ groups:
   - alert: S4048FanDown
     expr: s4048_fan_status == 0
     labels:
-      severity: warning
+      severity: critical
     annotations:
       summary: Fan {{ $labels.fan }} down (unit {{ $labels.unit }}, bay {{ $labels.bay
         }})
@@ -25,7 +25,7 @@ groups:
   - alert: S4048InterfaceFlapping
     expr: changes(s4048_interface_up[15m]) > 4
     labels:
-      severity: warning
+      severity: critical
     annotations:
       summary: '{{ $labels.port }} ({{ $labels.description }}) is flapping'
       description: This interface's link state changed more than 4 times in the last
@@ -42,7 +42,7 @@ groups:
   - alert: S4048TransceiverAlarm
     expr: s4048_transceiver_alarm == 1 and on(port) s4048_interface_up == 1
     labels:
-      severity: warning
+      severity: critical
     annotations:
       summary: Transceiver alarm on {{ $labels.port }} ({{ $labels.flag }})
       description: The optic's own DOM alarm bit is set (show interfaces transceiver)

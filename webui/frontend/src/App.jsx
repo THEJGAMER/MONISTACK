@@ -258,7 +258,7 @@ export default function App() {
               ) : page === "compliance" ? (
                 <CompliancePage pushFlash={pushFlash} />
               ) : page === "alerts" ? (
-                <AlertsPage pushFlash={pushFlash} />
+                <AlertsPage devices={devices} pushFlash={pushFlash} />
               ) : (
                 <ConsolePage
                   devices={devices}

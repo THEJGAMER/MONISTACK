@@ -62,3 +62,14 @@ class AlertmanagerClient:
         # really is inconsistent about this between the collection and
         # single-resource routes.
         self._request("DELETE", f"/api/v2/silence/{urllib.parse.quote(silence_id)}")
+
+    def post_alerts(self, alerts):
+        """Pushes alerts directly into Alertmanager (POST /api/v2/alerts) -
+        used by interface_alerting.py's per-port down-alerting, which
+        isn't expressed as a Prometheus rule (see that module's docstring
+        for why). `alerts` is a list of {labels, annotations, startsAt,
+        endsAt?} dicts - omitting endsAt keeps an alert active; posting the
+        same labels again with endsAt in the past resolves it, same
+        mechanism used to manually resolve a test alert during the
+        original alerting work."""
+        self._request("POST", "/api/v2/alerts", alerts)

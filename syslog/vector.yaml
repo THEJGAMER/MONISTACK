@@ -102,12 +102,24 @@ transforms:
         .interface = if_type_str + " " + if_num_str
       }
 
-      .link_state = null
       detail_lower = downcase(detail_str)
-      if contains(detail_lower, "is down") || contains(detail_lower, "changed state to down") || contains(detail_lower, "link down") || contains(detail_lower, "down mode") {
-        .link_state = "down"
-      } else if contains(detail_lower, "is up") || contains(detail_lower, "changed state to up") || contains(detail_lower, "link up") {
-        .link_state = "up"
+
+      # Confirmed live: the real message is "Changed interface state to
+      # down: Te 1/47" - "changed state to down" (missing "interface")
+      # never matched it, so .link_state/.link_event were always null/
+      # false for genuine link transitions. Worse, the old "is down"/
+      # "is up" substrings matched unrelated hardware messages instead
+      # (e.g. "Power supply 2 in unit 1 is up"), so this used to report
+      # PSU/fan events as "link events" while missing every real one.
+      # Scoping to event_category == "interface" (computed above) fixes
+      # both: only interface-facility messages can set link_state now.
+      .link_state = null
+      if .event_category == "interface" {
+        if contains(detail_lower, "changed interface state to down") || contains(detail_lower, "link down") {
+          .link_state = "down"
+        } else if contains(detail_lower, "changed interface state to up") || contains(detail_lower, "link up") {
+          .link_state = "up"
+        }
       }
       .link_event = .link_state != null
 

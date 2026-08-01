@@ -406,6 +406,63 @@ The gate on anyone other than you using this.
       Prometheus's loaded rule set, not just this table's `enabled`
       column; (4) re-enabled it and reverted the test severity change
       back to the original, tested values.
+- [x] **2026-08-01**: Interfaces tab - opt specific ports into down-
+      alerting (most ports are unused and shouldn't alert), per-port
+      severity and "immediate vs. after a delay" mode
+      (`interface_alert_rules` table, `interface_alerting.py`). Alerts
+      post directly to Alertmanager's `/api/v2/alerts` rather than being
+      expressed as PromQL - a dynamic per-port rule set isn't a good fit
+      for a static rules file. Caught and fixed two real bugs while
+      testing this live against the S4048's genuinely-degraded Po1 (Te
+      1/47 kicked out by a non-qualified-optics fault, confirmed via
+      real LACP output): (1) real port names contain "/" (e.g.
+      "Te 1/47"), which a FastAPI path segment can't carry even
+      URL-encoded - `port` moved into the request body; (2) disabling a
+      currently-firing port's alert never resolved it in Alertmanager
+      (a disabled config was simply never checked again) - fixed so
+      disabling always resolves first.
+- [x] **2026-08-01**: History tab - every notification Alertmanager's
+      webhook receiver gets is now persisted to a new `alert_history`
+      table (Alertmanager's own API only shows currently-active alerts,
+      not history). Also added per-interface-alert severity
+      (warning/critical, same Pushover-priority effect as the Rules
+      tab).
+- [x] **2026-08-01**: Interface-down detection was poll-bound (up to the
+      ~30s status-poller cycle plus this feature's own 30s check
+      interval) - not what "alert me immediately" means when the same
+      transition already appears in Loki within a second or two via
+      syslog. Added a second, much tighter loop (`check_via_syslog()`,
+      every 3s) that reads the interface link-state events Vector
+      already ships to Loki in real time, used for `mode="immediate"`
+      configs; the original 30s poll-based loop still owns delayed-mode
+      timing and serves as the reconciliation/fallback path if Loki is
+      unreachable.
+
+      This surfaced a real, previously-invisible bug in
+      `syslog/vector.yaml` while verifying against live data: the real
+      message is *"Changed **interface** state to down: Te 1/47"*, but
+      the VRL only checked for the substring *"changed state to down"*
+      (missing "interface") - so `.link_state`/`.link_event` had never
+      matched a real link transition. Worse, a separate substring
+      ("is down"/"is up") was accidentally matching unrelated PSU/fan
+      hardware messages instead, so this field was reporting the wrong
+      events entirely, not just missing the right ones. Fixed and
+      confirmed against real captured text via `vector vrl`; also fixed
+      `syslog/tests/test_vrl.py`'s own test case for this, which had
+      been asserting against a fabricated message with the same missing
+      word - which is exactly how the bug passed CI unnoticed.
+
+      **Not yet deployed**: `syslog/vector.yaml` runs on a separate LXC
+      (192.168.0.144), not in this docker-compose stack, and this
+      session has no SSH credentials to it. The fix is committed,
+      locally validated (`vector validate`, `vector vrl` against real
+      captured text) and test-covered, but needs the documented manual
+      redeploy (`syslog/README.md`'s "Redeploying after an edit") before
+      the new fast path actually detects anything - until then it's a
+      safe no-op (confirmed live: it correctly finds zero real matches
+      against the still-old deployed VRL rather than misfiring on the
+      still-present PSU/fan false-positive matches, since those carry no
+      `.interface` value and get skipped).
 
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added

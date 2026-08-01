@@ -12,14 +12,21 @@ import FormField from "@cloudscape-design/components/form-field";
 import Tabs from "@cloudscape-design/components/tabs";
 import Toggle from "@cloudscape-design/components/toggle";
 import ExpandableSection from "@cloudscape-design/components/expandable-section";
+import Pagination from "@cloudscape-design/components/pagination";
+import TextFilter from "@cloudscape-design/components/text-filter";
+
+import { useClientPagination } from "./useClientPagination.js";
 
 import {
   createSilence,
   deleteSilence,
+  getAlertHistory,
   getAlerts,
   listAlertRules,
+  listInterfaceAlerts,
   listSilences,
   updateAlertRule,
+  updateInterfaceAlert,
 } from "./api.js";
 
 const DURATION_OPTIONS = [
@@ -35,6 +42,11 @@ const SEVERITY_OPTIONS = [
   { label: "critical", value: "critical" },
 ];
 
+const MODE_OPTIONS = [
+  { label: "Immediately", value: "immediate" },
+  { label: "After a delay (recheck, then alarm)", value: "delayed" },
+];
+
 function severityType(sev) {
   if (sev === "critical") return "error";
   if (sev === "warning") return "warning";
@@ -45,6 +57,13 @@ function alertStateType(state) {
   if (state === "suppressed") return "stopped";
   if (state === "active") return "error";
   return "pending";
+}
+
+function portStateType(state) {
+  if (state === "up") return "success";
+  if (state === "down") return "error";
+  if (state === "admin_down") return "stopped";
+  return "info";
 }
 
 function ActiveAlertsTab({ alerts, loading }) {
@@ -191,6 +210,220 @@ function MaintenanceWindowsTab({ silences, loading, pushFlash, refresh }) {
   );
 }
 
+function InterfacesTab({ devices, pushFlash }) {
+  const [deviceId, setDeviceId] = useState(devices[0]?.id || null);
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [savingKey, setSavingKey] = useState(null);
+
+  const deviceOptions = devices.map((d) => ({ label: d.name, value: d.id }));
+
+  async function refresh(id) {
+    if (!id) return;
+    setLoading(true);
+    try {
+      setRows(await listInterfaceAlerts(id));
+    } catch (e) {
+      pushFlash("error", `Could not load interface alerts: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh(deviceId);
+    const t = setInterval(() => refresh(deviceId), 30000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deviceId]);
+
+  async function handleUpdate(row, patch) {
+    const key = row.port;
+    setSavingKey(key);
+    try {
+      const body = { enabled: row.enabled, mode: row.mode, delay_seconds: row.delay_seconds, severity: row.severity, ...patch };
+      const updated = await updateInterfaceAlert(deviceId, row.port, body);
+      setRows((prev) => prev.map((r) => (r.port === row.port ? { ...r, ...updated } : r)));
+    } catch (e) {
+      pushFlash("error", `Could not update ${row.port}: ${e.message}`);
+      refresh(deviceId);
+    } finally {
+      setSavingKey(null);
+    }
+  }
+
+  return (
+    <Container
+      header={
+        <Header
+          variant="h2"
+          description="Opt specific interfaces into down-alerting - most ports are unused and shouldn't alert. Alarms post directly to Alertmanager, so they go through the same Pushover/silence pipeline as everything else."
+        >
+          Interface alerts
+        </Header>
+      }
+    >
+      <SpaceBetween size="m">
+        <Select
+          placeholder="Device"
+          selectedOption={deviceOptions.find((o) => o.value === deviceId) || null}
+          onChange={({ detail }) => setDeviceId(detail.selectedOption.value)}
+          options={deviceOptions}
+        />
+        <Table
+          variant="embedded"
+          loading={loading}
+          items={rows}
+          columnDefinitions={[
+            { id: "port", header: "Interface", cell: (r) => r.port },
+            {
+              id: "state",
+              header: "Current state",
+              cell: (r) => <StatusIndicator type={portStateType(r.current_state)}>{r.current_state || "unknown"}</StatusIndicator>,
+            },
+            {
+              id: "enabled",
+              header: "Alert on down",
+              cell: (r) => (
+                <Toggle
+                  checked={r.enabled}
+                  disabled={savingKey === r.port}
+                  onChange={({ detail }) => handleUpdate(r, { enabled: detail.checked })}
+                />
+              ),
+            },
+            {
+              id: "severity",
+              header: "Severity / priority",
+              cell: (r) => (
+                <Select
+                  selectedOption={SEVERITY_OPTIONS.find((o) => o.value === r.severity)}
+                  onChange={({ detail }) => handleUpdate(r, { severity: detail.selectedOption.value })}
+                  options={SEVERITY_OPTIONS}
+                  disabled={!r.enabled || savingKey === r.port}
+                  expandToViewport
+                />
+              ),
+            },
+            {
+              id: "mode",
+              header: "When",
+              cell: (r) => (
+                <Select
+                  selectedOption={MODE_OPTIONS.find((o) => o.value === r.mode)}
+                  onChange={({ detail }) => handleUpdate(r, { mode: detail.selectedOption.value })}
+                  options={MODE_OPTIONS}
+                  disabled={!r.enabled || savingKey === r.port}
+                  expandToViewport
+                />
+              ),
+            },
+            {
+              id: "delay",
+              header: "Delay (s)",
+              cell: (r) =>
+                r.mode === "delayed" ? (
+                  <Input
+                    type="number"
+                    value={String(r.delay_seconds)}
+                    disabled={!r.enabled || savingKey === r.port}
+                    onChange={({ detail }) => setRows((prev) => prev.map((x) => (x.port === r.port ? { ...x, delay_seconds: detail.value } : x)))}
+                    onBlur={() => handleUpdate(r, { delay_seconds: parseInt(r.delay_seconds, 10) || 60 })}
+                  />
+                ) : (
+                  "-"
+                ),
+            },
+          ]}
+          empty={<Box textAlign="center">{deviceId ? "No interfaces configured for this device." : "Select a device."}</Box>}
+        />
+      </SpaceBetween>
+    </Container>
+  );
+}
+
+function HistoryTab({ pushFlash }) {
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filterText, setFilterText] = useState("");
+  const [limit, setLimit] = useState(200);
+
+  async function refresh(l) {
+    setLoading(true);
+    try {
+      setHistory(await getAlertHistory(l));
+    } catch (e) {
+      pushFlash("error", `Could not load alert history: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh(limit);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [limit]);
+
+  const filtered = history.filter((h) => {
+    const q = filterText.toLowerCase();
+    if (!q) return true;
+    return h.alertname.toLowerCase().includes(q) || (h.summary || "").toLowerCase().includes(q);
+  });
+  const { pageItems, paginationProps } = useClientPagination(filtered, 10);
+
+  return (
+    <Container
+      header={
+        <Header
+          variant="h2"
+          description="Every notification Alertmanager has sent this app's webhook receiver, firing and resolved - covers both Prometheus-rule alerts and per-interface alerts. Alertmanager's own API only shows currently-active alerts; this survives after they resolve."
+        >
+          Alert history
+        </Header>
+      }
+    >
+      <SpaceBetween size="m">
+        <Table
+          variant="embedded"
+          loading={loading}
+          items={pageItems}
+          filter={
+            <TextFilter
+              filteringText={filterText}
+              onChange={({ detail }) => setFilterText(detail.filteringText)}
+              filteringPlaceholder="Search alert name or summary..."
+            />
+          }
+          pagination={<Pagination {...paginationProps} />}
+          columnDefinitions={[
+            { id: "time", header: "Time", cell: (h) => new Date(h.received_at).toLocaleString() },
+            { id: "name", header: "Alert", cell: (h) => h.alertname },
+            {
+              id: "severity",
+              header: "Severity",
+              cell: (h) => <StatusIndicator type={severityType(h.severity)}>{h.severity || "-"}</StatusIndicator>,
+            },
+            {
+              id: "status",
+              header: "Status",
+              cell: (h) => <StatusIndicator type={h.status === "firing" ? "error" : "success"}>{h.status}</StatusIndicator>,
+            },
+            { id: "summary", header: "Summary", cell: (h) => h.summary || "-" },
+          ]}
+          empty={<Box textAlign="center">No alert history yet.</Box>}
+        />
+        {history.length >= limit && (
+          <Box textAlign="center">
+            <Button loading={loading} onClick={() => setLimit(limit + 200)}>
+              Load 200 more
+            </Button>
+          </Box>
+        )}
+      </SpaceBetween>
+    </Container>
+  );
+}
+
 function RulesTab({ pushFlash }) {
   const [rules, setRules] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -303,7 +536,7 @@ function RulesTab({ pushFlash }) {
   );
 }
 
-export default function AlertsPage({ pushFlash }) {
+export default function AlertsPage({ devices, pushFlash }) {
   const [alerts, setAlerts] = useState([]);
   const [silences, setSilences] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -350,6 +583,12 @@ export default function AlertsPage({ pushFlash }) {
             content: <MaintenanceWindowsTab silences={silences} loading={loading} pushFlash={pushFlash} refresh={refresh} />,
           },
           { id: "rules", label: "Rules", content: <RulesTab pushFlash={pushFlash} /> },
+          {
+            id: "interfaces",
+            label: "Interfaces",
+            content: <InterfacesTab devices={devices || []} pushFlash={pushFlash} />,
+          },
+          { id: "history", label: "History", content: <HistoryTab pushFlash={pushFlash} /> },
         ]}
       />
     </SpaceBetween>

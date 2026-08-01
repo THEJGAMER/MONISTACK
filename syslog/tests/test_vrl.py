@@ -49,10 +49,16 @@ TEST_CASES = [
         },
     ),
     (
+        # Real captured message (via the webui's live syslog view during
+        # an actual PSU-2-induced port flap on Te 1/47) - the original
+        # version of this test used a fabricated "changed state to down"
+        # (missing "interface") that happened to match the old, buggy
+        # regex, which masked that regex never matching the real message
+        # format ("changed *interface* state to down") for months.
         "interface_link_down",
-        "%IFM-6-IFDOWN: Interface TenGigabitEthernet 1/37, changed state to down",
+        "%IFMGR-5-OSTATE_DN: Changed interface state to down: Te 1/47",
         {
-            "facility": "IFM", "event_category": "interface", "interface": "TenGigabitEthernet 1/37",
+            "facility": "IFMGR", "event_category": "interface", "interface": "Te 1/47",
             "link_state": "down", "alarm_severity": None, "alarm_active": None,
         },
     ),

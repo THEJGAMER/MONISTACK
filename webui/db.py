@@ -104,6 +104,53 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     enabled INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
 );
+
+-- Per-interface down-alerting config (ROADMAP 3.2's Interfaces tab) -
+-- unlike prometheus/alerts.yml's fleet-wide rules, this is genuinely
+-- per-(device,port): which specific interfaces should alert at all (most
+-- ports are legitimately unused/down and shouldn't), and whether a
+-- down transition alerts immediately or only after staying down for
+-- `delay_seconds` (checked, not just slept - see interface_alerting.py).
+-- Evaluated by a Switchboard-side loop (reusing status_poller.py's
+-- already-polled interface state, no extra SSH) that posts straight to
+-- Alertmanager's /api/v2/alerts, rather than being expressed as
+-- PromQL - a dynamic per-port rule set isn't something Prometheus rule
+-- files are a good fit for.
+CREATE TABLE IF NOT EXISTS interface_alert_rules (
+    device_id TEXT NOT NULL,
+    port TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    mode TEXT NOT NULL DEFAULT 'immediate',
+    delay_seconds INTEGER NOT NULL DEFAULT 60,
+    severity TEXT NOT NULL DEFAULT 'warning',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (device_id, port)
+);
+-- severity was added after interface_alert_rules already shipped - this
+-- table predates it on any deployment that ran the earlier migration, so
+-- CREATE TABLE IF NOT EXISTS above is a no-op there and this catches it up.
+ALTER TABLE interface_alert_rules ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'warning';
+
+-- Alert history (ROADMAP 3.2's History tab) - every notification
+-- Alertmanager sends its webhook receiver (app.py's
+-- /api/alertmanager/webhook) gets persisted here, covering both
+-- Prometheus-rule-based alerts (prometheus/alerts.yml) and the
+-- directly-posted per-interface alerts (interface_alerting.py) - both
+-- route through the same Alertmanager receiver, so this one table is a
+-- complete history regardless of which of the two alerting paths raised
+-- it. Alertmanager's own /api/v2/alerts only shows currently-active (or
+-- very recently resolved) alerts, not history - this is what makes past
+-- alerts queryable after they've resolved and aged out there.
+CREATE TABLE IF NOT EXISTS alert_history (
+    id BIGSERIAL PRIMARY KEY,
+    alertname TEXT NOT NULL,
+    status TEXT NOT NULL,
+    severity TEXT,
+    summary TEXT,
+    labels TEXT NOT NULL,
+    received_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_history_received ON alert_history(received_at DESC);
 """
 
 

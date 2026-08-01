@@ -179,6 +179,20 @@ export const updateAlertRule = (name, body) =>
     body: JSON.stringify(body),
   });
 
+export const listInterfaceAlerts = (deviceId) => api(`/api/interface-alerts?device_id=${encodeURIComponent(deviceId)}`);
+// `port` travels in the body, not the URL - real port names like
+// "Te 1/47" contain a "/" that a path segment can't safely carry (see
+// app.py's InterfaceAlertUpdateRequest for the live-confirmed 404 this
+// avoids).
+export const updateInterfaceAlert = (deviceId, port, body) =>
+  api(`/api/interface-alerts/${encodeURIComponent(deviceId)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ port, ...body }),
+  });
+
+export const getAlertHistory = (limit = 200) => api(`/api/alert-history?limit=${limit}`);
+
 export const getSettings = () => api("/api/settings");
 
 export const updateSettings = (body) =>
