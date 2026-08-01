@@ -62,6 +62,29 @@ CREATE TABLE IF NOT EXISTS metric_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_metric_samples_lookup
     ON metric_samples(device_id, metric, port, recorded_at);
+
+-- Scheduled/recurring command runs (ROADMAP 3.6). Output feeds the same
+-- `results` table above (auto_saved=1) rather than a separate log, so
+-- scheduled config-backup/compliance-style runs show up in Saved Results
+-- and Console's "Recent results" the same way any other run does.
+CREATE TABLE IF NOT EXISTS schedules (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    category_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    params TEXT,
+    interval_minutes INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run_at TEXT,
+    last_error TEXT,
+    next_run_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS compliance_config (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+);
 """
 
 

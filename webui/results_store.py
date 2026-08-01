@@ -97,6 +97,15 @@ class ResultsStore:
         row = self.db.query_one("SELECT markdown FROM results WHERE filename = %s", (filename,))
         return row["markdown"] if row else None
 
+    def get_row(self, filename):
+        """Full row, for CSV/JSON export - `read()` above only returns the
+        rendered Markdown, which isn't useful as structured export data."""
+        return self.db.query_one(
+            "SELECT filename, device_id, device_name, host, category_id, command_id, command, summary, "
+            "output, auto_saved, created_at FROM results WHERE filename = %s",
+            (filename,),
+        )
+
     def delete(self, filename):
         cur = self.db.execute("DELETE FROM results WHERE filename = %s", (filename,))
         return cur.rowcount > 0

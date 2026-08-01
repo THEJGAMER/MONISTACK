@@ -1,3 +1,6 @@
+import concurrent.futures
+import csv
+import io
 import json
 import logging
 import os
@@ -13,7 +16,7 @@ from typing import Optional
 import psycopg2
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -30,6 +33,8 @@ from db import Database
 from devices import DeviceConfigError, StoredDevice, load_devices
 from loki_client import LokiClient, LokiError
 from results_store import ResultsStore
+from scheduler import ScheduleStore
+import compliance
 from ssh_client import SwitchSSH, SwitchSSHError
 from status_poller import StatusPoller
 from store import DeviceStore
@@ -141,6 +146,7 @@ DB = None
 STORE = None
 RESULTS = None
 TOPOLOGY_STORE = None
+SCHEDULES = None
 DEVICES = []
 DEVICES_BY_ID = {}
 LOKI = None
@@ -277,17 +283,58 @@ def _trend_pruner_loop():
 threading.Thread(target=_trend_pruner_loop, daemon=True, name="trend-pruner").start()
 
 
+# Scheduled/recurring runs (ROADMAP 3.6) - a lightweight poll loop rather
+# than pulling in a scheduler dependency (cron semantics aren't needed,
+# just "every N minutes"). 30s resolution is plenty for the shortest
+# sensible interval (config-backup/compliance runs, not sub-minute
+# polling - status_poller.py already owns that). A schedule pointed at an
+# unreachable device or a command that doesn't exist on that platform
+# records last_error and reschedules for next interval rather than
+# blocking the rest of the queue - the same per-device isolation bulk-run
+# gives via ThreadPoolExecutor, just sequential here since scheduled runs
+# aren't latency-sensitive.
+def _schedule_loop():
+    while True:
+        time.sleep(30)
+        if DB is None or SCHEDULES is None:
+            continue
+        try:
+            due = SCHEDULES.due()
+        except Exception:
+            log.exception("schedule lookup failed")
+            continue
+        for sched in due:
+            device = DEVICES_BY_ID.get(sched["device_id"])
+            error = None
+            if device is None:
+                error = f"device {sched['device_id']!r} no longer exists"
+            else:
+                try:
+                    _run_and_save(device, sched["category_id"], sched["command_id"], sched["params"], "scheduler")
+                except Exception as e:
+                    error = str(e)
+                    log.warning("scheduled run %s failed: %s", sched["id"], error)
+            try:
+                SCHEDULES.mark_run(sched["id"], sched["interval_minutes"], error=error)
+            except Exception:
+                log.exception("could not record schedule run for %s", sched["id"])
+
+
+threading.Thread(target=_schedule_loop, daemon=True, name="schedule-runner").start()
+
+
 def _load_database(dsn):
     """Connects to Postgres, runs one-time legacy migrations, and (re)loads
     devices + status polling from it. Raises on a bad DSN/unreachable host
     so callers (setup wizard, Settings save) can report a clear error
     without disturbing whatever was working before the attempt."""
-    global DB, STORE, RESULTS, TOPOLOGY_STORE, DEVICES, DEVICES_BY_ID
+    global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, DEVICES, DEVICES_BY_ID
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
     new_topology_store = TopologyStore(new_db)
-    DB, STORE, RESULTS, TOPOLOGY_STORE = new_db, new_store, new_results, new_topology_store
+    new_schedules = ScheduleStore(new_db)
+    DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES = new_db, new_store, new_results, new_topology_store, new_schedules
 
     _migrate_legacy_json_devices()
     _migrate_legacy_sqlite()
@@ -806,24 +853,57 @@ def api_commands(user: str = Depends(require_auth)):
     return COMMAND_TREES
 
 
-@app.post("/api/run")
-def api_run(req: RunRequest, user: str = Depends(require_auth_and_db)):
-    device = DEVICES_BY_ID.get(req.device_id)
-    if device is None:
-        raise HTTPException(status_code=404, detail="unknown device")
+class CommandLookupError(Exception):
+    """Unknown category/command, or a bad/missing param value - a client
+    error (400/404), not a device/transport failure. Kept as its own
+    exception rather than raising HTTPException directly from
+    `_resolve_command`/`_run_and_save` so bulk-run and the scheduler (which
+    run against many devices and need to record a per-device error instead
+    of aborting the whole request) can catch it the same way they catch
+    SwitchSSHError, without FastAPI's HTTPException short-circuiting the
+    loop they're in. Carries `status_code` so /api/run can still surface
+    the same 404-vs-400 distinction it always has (unknown command vs. bad
+    param) while bulk-run/the scheduler, which don't need that nuance,
+    can catch it uniformly."""
 
-    spec = find_command(req.category_id, req.command_id, device.platform)
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _resolve_command(device, category_id, command_id, params):
+    spec = find_command(category_id, command_id, device.platform)
     if spec is None:
-        raise HTTPException(status_code=404, detail="unknown command")
-
+        raise CommandLookupError(f"unknown command {category_id}/{command_id} for platform {device.platform}", 404)
     cmd = spec["cmd"]
     if "param" in spec:
         param_name = spec["param"]
-        value = (req.params or {}).get(param_name)
+        value = (params or {}).get(param_name)
         if value not in device.valid_values_for(param_name):
-            raise HTTPException(status_code=400, detail=f"invalid or missing {param_name!r}")
+            raise CommandLookupError(f"invalid or missing {param_name!r}", 400)
         cmd = cmd.format(**{param_name: value})
+    return cmd
 
+
+def _run_raw(device, category_id, command_id, params):
+    """Like `_run_and_save` but skips the auto-save - used by compliance
+    checks, which run several commands per device on every sweep and
+    would otherwise flood Saved Results with entries nobody asked to
+    keep."""
+    cmd = _resolve_command(device, category_id, command_id, params)
+    with _session_locks[device.id]:
+        switch = _get_session(device)
+        return switch.run(cmd)
+
+
+def _run_and_save(device, category_id, command_id, params, user, auto_saved=True):
+    """Shared by /api/run, bulk-run, and the scheduler - resolves the
+    allowlisted command, runs it over the device's locked SSH session, and
+    auto-saves the result the same way every code path expects. Raises
+    CommandLookupError/SwitchSSHError/DeviceConfigError; callers decide
+    whether to turn that into an HTTP error (single-device) or a per-device
+    error entry (bulk/scheduled)."""
+    cmd = _resolve_command(device, category_id, command_id, params)
     log.info("user=%s device=%s running: %s", user, device.id, cmd)
 
     metrics.command_run_total.labels(device_id=device.id, platform=device.platform).inc()
@@ -832,28 +912,76 @@ def api_run(req: RunRequest, user: str = Depends(require_auth_and_db)):
         with _session_locks[device.id]:
             switch = _get_session(device)
             output = switch.run(cmd)
+    finally:
+        metrics.command_run_duration_seconds.labels(device_id=device.id).observe(time.monotonic() - start)
+
+    summary = summarize(device.platform, category_id, command_id, output)
+    saved = RESULTS.save(
+        device.id, device.name, device.host, category_id, command_id, cmd, summary, output, auto_saved=auto_saved
+    )
+    return {"command": cmd, "output": output, "summary": summary, "saved_as": saved["filename"]}
+
+
+@app.post("/api/run")
+def api_run(req: RunRequest, user: str = Depends(require_auth_and_db)):
+    device = DEVICES_BY_ID.get(req.device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+
+    try:
+        result = _run_and_save(device, req.category_id, req.command_id, req.params, user)
+    except CommandLookupError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except DeviceConfigError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except SwitchSSHError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    finally:
-        metrics.command_run_duration_seconds.labels(device_id=device.id).observe(time.monotonic() - start)
 
-    summary = summarize(device.platform, req.category_id, req.command_id, output)
+    return {"device": device.id, **result}
 
-    # Every run is auto-saved - no separate "Save result" click needed.
-    # (Kept the manual POST below too, for scripted/API use.)
-    saved = RESULTS.save(
-        device.id, device.name, device.host, req.category_id, req.command_id, cmd, summary, output, auto_saved=True
-    )
 
-    return {
-        "device": device.id,
-        "command": cmd,
-        "output": output,
-        "summary": summary,
-        "saved_as": saved["filename"],
-    }
+class BulkRunRequest(BaseModel):
+    device_ids: list[str]
+    category_id: str
+    command_id: str
+    params: Optional[dict] = None
+
+
+@app.post("/api/bulk-run")
+def api_bulk_run(req: BulkRunRequest, user: str = Depends(require_auth_and_db)):
+    """Runs the same allowlisted command across several devices at once
+    (ROADMAP 3.6 "bulk operations"), for a collated view of e.g. "show
+    version" across the whole fleet in one shot. One device's failure
+    (offline, or the command doesn't exist on that device's platform)
+    never aborts the others - each gets its own result/error entry.
+    Devices run in parallel, bounded by the same worker count as the
+    global SSH connect semaphore (ssh_client.py) so this can't blow past
+    the concurrency limit that already exists for a single device's
+    reconnects."""
+    if not req.device_ids:
+        raise HTTPException(status_code=400, detail="device_ids must be non-empty")
+    devices = []
+    for device_id in req.device_ids:
+        device = DEVICES_BY_ID.get(device_id)
+        if device is None:
+            raise HTTPException(status_code=404, detail=f"unknown device {device_id!r}")
+        devices.append(device)
+
+    def run_one(device):
+        try:
+            result = _run_and_save(device, req.category_id, req.command_id, req.params, user)
+            return {"device_id": device.id, "device_name": device.name, "error": None, **result}
+        except CommandLookupError as e:
+            return {"device_id": device.id, "device_name": device.name, "error": str(e)}
+        except DeviceConfigError as e:
+            return {"device_id": device.id, "device_name": device.name, "error": str(e)}
+        except SwitchSSHError as e:
+            return {"device_id": device.id, "device_name": device.name, "error": str(e)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="bulk-run") as pool:
+        results = list(pool.map(run_one, devices))
+
+    return {"results": results}
 
 
 class SaveResultRequest(BaseModel):
@@ -897,6 +1025,175 @@ def api_get_result(filename: str, user: str = Depends(require_auth_and_db)):
     if content is None:
         raise HTTPException(status_code=404, detail="unknown result")
     return {"filename": filename, "content": content}
+
+
+_TABULAR_SPLIT_RE = re.compile(r" {2,}|\t")
+
+
+def _output_to_csv_rows(output):
+    """Best-effort structure for CSV export of a raw `show` command's text
+    output. Real Dell/Junos/OPNsense output is column-aligned with runs of
+    2+ spaces between fields (confirmed against every fixture in
+    tests/fixtures/) - split on that and use the first split line's column
+    count as the expected width. Lines that don't match (banners, footers,
+    wrapped continuation lines) fall back to a single padded column rather
+    than being dropped, so nothing from the original output silently goes
+    missing in the export."""
+    lines = [ln for ln in output.splitlines() if ln.strip()]
+    if not lines:
+        return [["output"]]
+    split_lines = [_TABULAR_SPLIT_RE.split(ln.strip()) for ln in lines]
+    widths = [len(cols) for cols in split_lines]
+    common_width = max(set(widths), key=widths.count) if widths else 1
+    if common_width <= 1:
+        return [["line"]] + [[ln] for ln in lines]
+    rows = [[f"col{i + 1}" for i in range(common_width)]]
+    for cols in split_lines:
+        if len(cols) == common_width:
+            rows.append(cols)
+        else:
+            padded = cols + [""] * (common_width - len(cols))
+            rows.append(padded[:common_width])
+    return rows
+
+
+@app.get("/api/results/{filename}/export")
+def api_export_result(filename: str, format: str = "json", user: str = Depends(require_auth_and_db)):
+    row = RESULTS.get_row(filename)
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown result")
+    if format not in ("json", "csv"):
+        raise HTTPException(status_code=400, detail="format must be 'json' or 'csv'")
+
+    if format == "json":
+        body = json.dumps(dict(row), indent=2, default=str)
+        return Response(
+            content=body,
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}.json"'},
+        )
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["device_id", "device_name", "host", "command", "summary", "created_at"])
+    writer.writerow([row["device_id"], row["device_name"], row["host"], row["command"], row["summary"] or "", row["created_at"]])
+    writer.writerow([])
+    for csv_row in _output_to_csv_rows(row["output"]):
+        writer.writerow(csv_row)
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}.csv"'},
+    )
+
+
+class ScheduleCreateRequest(BaseModel):
+    device_id: str
+    category_id: str
+    command_id: str
+    params: Optional[dict] = None
+    interval_minutes: int
+
+
+class ScheduleUpdateRequest(BaseModel):
+    enabled: Optional[bool] = None
+    interval_minutes: Optional[int] = None
+
+
+@app.get("/api/schedules")
+def api_list_schedules(user: str = Depends(require_auth_and_db)):
+    return SCHEDULES.list()
+
+
+@app.post("/api/schedules")
+def api_create_schedule(req: ScheduleCreateRequest, user: str = Depends(require_auth_and_db)):
+    device = DEVICES_BY_ID.get(req.device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    if find_command(req.category_id, req.command_id, device.platform) is None:
+        raise HTTPException(status_code=400, detail="unknown command for this device's platform")
+    if req.interval_minutes < 5:
+        raise HTTPException(status_code=400, detail="interval_minutes must be at least 5")
+    schedule = SCHEDULES.create(req.device_id, req.category_id, req.command_id, req.params, req.interval_minutes)
+    log.info("user=%s created schedule %s (device=%s every %dm)", user, schedule["id"], req.device_id, req.interval_minutes)
+    return schedule
+
+
+@app.put("/api/schedules/{schedule_id}")
+def api_update_schedule(schedule_id: str, req: ScheduleUpdateRequest, user: str = Depends(require_auth_and_db)):
+    if SCHEDULES.get(schedule_id) is None:
+        raise HTTPException(status_code=404, detail="unknown schedule")
+    if req.interval_minutes is not None and req.interval_minutes < 5:
+        raise HTTPException(status_code=400, detail="interval_minutes must be at least 5")
+    return SCHEDULES.update(schedule_id, enabled=req.enabled, interval_minutes=req.interval_minutes)
+
+
+@app.delete("/api/schedules/{schedule_id}")
+def api_delete_schedule(schedule_id: str, user: str = Depends(require_auth_and_db)):
+    if not SCHEDULES.delete(schedule_id):
+        raise HTTPException(status_code=404, detail="unknown schedule")
+    return {"ok": True}
+
+
+@app.post("/api/schedules/{schedule_id}/run")
+def api_run_schedule_now(schedule_id: str, user: str = Depends(require_auth_and_db)):
+    sched = SCHEDULES.get(schedule_id)
+    if sched is None:
+        raise HTTPException(status_code=404, detail="unknown schedule")
+    device = DEVICES_BY_ID.get(sched["device_id"])
+    if device is None:
+        raise HTTPException(status_code=404, detail="device no longer exists")
+    error = None
+    try:
+        result = _run_and_save(device, sched["category_id"], sched["command_id"], sched["params"], user)
+    except (CommandLookupError, DeviceConfigError, SwitchSSHError) as e:
+        error = str(e)
+        result = None
+    SCHEDULES.mark_run(schedule_id, sched["interval_minutes"], error=error)
+    if error:
+        raise HTTPException(status_code=502, detail=error)
+    return result
+
+
+def _load_compliance_config():
+    row = DB.query_one("SELECT data FROM compliance_config WHERE id = 'default'")
+    return json.loads(row["data"]) if row else {"expected_vlans": []}
+
+
+class ComplianceConfigRequest(BaseModel):
+    expected_vlans: list[int]
+
+
+@app.get("/api/compliance/config")
+def api_get_compliance_config(user: str = Depends(require_auth_and_db)):
+    return _load_compliance_config()
+
+
+@app.put("/api/compliance/config")
+def api_update_compliance_config(req: ComplianceConfigRequest, user: str = Depends(require_auth_and_db)):
+    data = json.dumps({"expected_vlans": req.expected_vlans})
+    DB.execute(
+        "INSERT INTO compliance_config (id, data) VALUES ('default', %s) "
+        "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+        (data,),
+    )
+    return _load_compliance_config()
+
+
+@app.get("/api/compliance")
+def api_run_compliance(user: str = Depends(require_auth_and_db)):
+    """Runs every compliance check (see compliance.py) against every
+    configured device, live - not cached, since a stale "compliant" result
+    would defeat the point. Small fleets (this app's whole reason for
+    existing) make that cheap enough to do synchronously on request."""
+    config = _load_compliance_config()
+    findings = compliance.run_checks(DEVICES, config.get("expected_vlans") or [], _run_raw)
+    summary = {
+        "pass": sum(1 for f in findings if f["status"] == "pass"),
+        "fail": sum(1 for f in findings if f["status"] == "fail"),
+        "skip": sum(1 for f in findings if f["status"] == "skip"),
+    }
+    return {"findings": findings, "summary": summary}
 
 
 @app.delete("/api/results/{filename}")

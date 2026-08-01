@@ -87,6 +87,32 @@ export const listResults = ({ deviceId, q, page = 1, pageSize = 10 } = {}) => {
 };
 export const getResult = (filename) => api(`/api/results/${filename}`);
 export const deleteResult = (filename) => api(`/api/results/${filename}`, { method: "DELETE" });
+export const exportResultUrl = (filename, format) => `/api/results/${encodeURIComponent(filename)}/export?format=${format}`;
+
+// Runs the same allowlisted command across several devices in parallel -
+// each gets its own result/error entry, one device failing doesn't abort
+// the rest. Timeout matches getTopology's since this is also several
+// sequential SSH round trips per device, just fanned out across devices
+// instead of within one.
+export const bulkRun = (body) =>
+  api(
+    "/api/bulk-run",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    180_000
+  );
+
+export const listSchedules = () => api("/api/schedules");
+export const createSchedule = (body) =>
+  api("/api/schedules", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+export const updateSchedule = (id, body) =>
+  api(`/api/schedules/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+export const deleteSchedule = (id) => api(`/api/schedules/${id}`, { method: "DELETE" });
+export const runScheduleNow = (id) => api(`/api/schedules/${id}/run`, { method: "POST" });
+
+export const getCompliance = () => api("/api/compliance", undefined, 180_000);
+export const getComplianceConfig = () => api("/api/compliance/config");
+export const updateComplianceConfig = (body) =>
+  api("/api/compliance/config", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 export const getDeviceStatus = (deviceId, { interfaces = false } = {}) =>
   api(`/api/devices/${deviceId}/status${interfaces ? "?interfaces=true" : ""}`);

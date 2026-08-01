@@ -9,8 +9,9 @@ import Box from "@cloudscape-design/components/box";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Modal from "@cloudscape-design/components/modal";
+import ButtonDropdown from "@cloudscape-design/components/button-dropdown";
 
-import { listResults, getResult, deleteResult } from "./api.js";
+import { listResults, getResult, deleteResult, exportResultUrl } from "./api.js";
 import MiniMarkdown from "./MiniMarkdown.jsx";
 
 const PAGE_SIZE = 10;
@@ -120,6 +121,17 @@ export default function ResultsPage({ pushFlash }) {
                   <Button variant="inline-link" onClick={() => handleView(r.filename)}>
                     View
                   </Button>
+                  <ButtonDropdown
+                    variant="inline-icon"
+                    ariaLabel={`Export ${r.filename}`}
+                    items={[
+                      { id: "json", text: "Export JSON" },
+                      { id: "csv", text: "Export CSV" },
+                    ]}
+                    onItemClick={({ detail }) => {
+                      window.location.href = exportResultUrl(r.filename, detail.id);
+                    }}
+                  />
                   <Button variant="inline-link" onClick={() => handleDelete(r.filename)}>
                     Delete
                   </Button>

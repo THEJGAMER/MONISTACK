@@ -470,13 +470,47 @@ The gate on anyone other than you using this.
       `ae1` bundle (both members up, correctly not flagged).
 
 ### 3.6 Operational workflow
-- [ ] **Bulk operations** — run a command across N devices, with a
-      collated diff-style result view.
-- [ ] **Scheduled/recurring runs** with saved output (feeds config backup
-      and compliance).
-- [ ] Compliance checks — assert fleet-wide invariants (NTP configured,
-      expected VLANs present, no unexpected admin-down uplinks).
-- [ ] Export results as CSV/JSON, not just Markdown.
+- [x] **2026-08-01**: **Bulk operations** — new `/api/bulk-run` runs one
+      allowlisted command across N devices in parallel (bounded
+      `ThreadPoolExecutor`, one device's failure/platform mismatch never
+      aborts the others), new Bulk Run page: multi-select devices, pick a
+      command, see a collated table of per-device pass/fail against a
+      "baseline" (the first successful result), with an expandable
+      LCS line-diff (`diff.js`, no external dep) per device. Verified live
+      across the real Dell S4048 + Juniper EX3300: correctly showed the
+      Dell as baseline and a real red/green line diff against the Junos
+      `show version` output.
+- [x] **2026-08-01**: **Scheduled/recurring runs** — new `schedules`
+      Postgres table (`scheduler.py`), a `_schedule_loop` background
+      thread (same pattern as the trend pruner) polling every 30s for due
+      schedules and running them through the same `_run_and_save()` path
+      `/api/run` uses, so scheduled output auto-saves to Saved Results
+      like any other run. Full CRUD + "run now" at `/api/schedules`, new
+      Schedules page. Verified live two ways: manual "run now" against
+      the real S4048, and a schedule inserted with a past `next_run_at`
+      that the background thread picked up and ran on its own within one
+      30s tick (`last_run_at` populated with no manual trigger).
+- [x] **2026-08-01**: **Compliance checks** — `compliance.py` runs three
+      checks live (not cached) against every device: NTP synchronized,
+      expected VLANs present (admin-configurable list, `compliance_config`
+      table), and LAG/uplink health (`show lacp ...`, reusing the existing
+      command tree). Each check is platform-aware and reports `skip`
+      rather than a fake result where the fleet has no fitting command yet
+      (e.g. no Junos NTP command exists in the tree today). New
+      `/api/compliance` + Compliance page. Verified live against the real
+      3-device fleet: correctly flagged Po4-8 as "not configured" (not a
+      failure) after discovering the configurable port-channel range is
+      deliberately wider than what's cabled, correctly passed the 3 real
+      port-channels, and correctly failed a deliberately-added bogus
+      expected VLAN (999) while passing real ones.
+- [x] **2026-08-01**: Export results as CSV/JSON via
+      `/api/results/{filename}/export?format=`. JSON is the full row;
+      CSV best-effort splits column-aligned `show` output on runs of 2+
+      spaces (confirmed against real fixture output) with a single-column
+      fallback for anything that doesn't split cleanly, so nothing from
+      the original output is silently dropped. Added Export buttons to
+      Saved Results. Verified live: downloaded and inspected both formats
+      for a real saved Junos `show version` result.
 
 ---
 
