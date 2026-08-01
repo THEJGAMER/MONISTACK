@@ -452,17 +452,48 @@ The gate on anyone other than you using this.
       been asserting against a fabricated message with the same missing
       word - which is exactly how the bug passed CI unnoticed.
 
-      **Not yet deployed**: `syslog/vector.yaml` runs on a separate LXC
-      (192.168.0.144), not in this docker-compose stack, and this
-      session has no SSH credentials to it. The fix is committed,
-      locally validated (`vector validate`, `vector vrl` against real
-      captured text) and test-covered, but needs the documented manual
-      redeploy (`syslog/README.md`'s "Redeploying after an edit") before
-      the new fast path actually detects anything - until then it's a
-      safe no-op (confirmed live: it correctly finds zero real matches
-      against the still-old deployed VRL rather than misfiring on the
-      still-present PSU/fan false-positive matches, since those carry no
-      `.interface` value and get skipped).
+      **Update, same day**: deployed to the Vector LXC (192.168.0.144) -
+      the user supplied SSH access this session lacked initially.
+      Followed `syslog/README.md`'s process exactly: uploaded as a
+      candidate, `vector validate`d on the real host, backed up the live
+      config, swapped in, restarted, confirmed `systemctl is-active` and
+      that Vector kept forwarding real traffic normally. A real Te 1/47
+      flap minutes later confirmed the fix works end to end in
+      production: Loki now correctly tags it `link_state="down"`,
+      `link_event=true` (previously always null/false for a genuine
+      transition).
+
+      That same real flap surfaced two more bugs in the fast path itself,
+      both fixed and deployed the same day: (1) a race between the new
+      3s syslog-driven checker and the existing 30s poll-based one - the
+      syslog path correctly fired 3s after the real event, then the poll
+      path's next tick sampled the status-poller cache mid-transition,
+      read a stale "up", and incorrectly resolved the alert the syslog
+      path had just raised, which then re-fired - looked like "took a
+      minute" for what was actually a 3s detection. Fixed by giving each
+      mode exactly one owner for its fire/resolve lifecycle: syslog owns
+      resolve for immediate mode, poll owns fire+resolve for delayed
+      mode, and poll gets a fire-only (never resolve) role for immediate
+      mode too so a port already down before a webui restart doesn't go
+      permanently unalerted (no *new* transition for the syslog path to
+      react to). (2) Directly-posted alerts (unlike Prometheus-rule
+      alerts, which Prometheus itself continuously re-sends every
+      evaluation cycle) only got sent once on the transition, so an
+      Alertmanager restart mid-outage would silently lose the alert with
+      nothing to prompt a resend. Added a 120s heartbeat re-post for any
+      still-firing alert, safely under Alertmanager's 5m resolve_timeout.
+
+      Also chased down what looked like a stuck Alertmanager dispatcher
+      (zero notify attempts logged for 8+ minutes, survived two full
+      container recreations) before finding the real explanation via
+      Alertmanager's own persisted `nflog`: it wasn't stuck - `strings`
+      on the nflog file showed a prior successful pushover notification
+      already recorded for that exact alert, so `repeat_interval: 4h`
+      was correctly suppressing a duplicate push for an alert that
+      hadn't meaningfully changed. Expected dedup behavior, not a bug -
+      worth documenting since it looks identical to a hang from the
+      outside (metrics/logs showing zero notify activity) unless you
+      know to check nflog specifically.
 
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added

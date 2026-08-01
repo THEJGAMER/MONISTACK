@@ -81,44 +81,109 @@ class InterfaceAlertChecker:
     next tick, which is simpler and just as correct as trying to recover
     "how long has this been down" from before a restart."""
 
+    # Alertmanager's resolve_timeout (global, alertmanager.yml) is 5m - an
+    # alert that's never refreshed just quietly expires there even though
+    # the underlying condition never cleared. Prometheus-rule alerts don't
+    # have this problem because Prometheus re-sends its whole currently-
+    # firing set every evaluation cycle; a directly-posted alert (this
+    # module) only gets sent once on the transition unless something
+    # re-affirms it. HEARTBEAT_SECONDS is that re-affirmation - comfortably
+    # under resolve_timeout, and cheap (posting the same labels again is a
+    # no-op refresh to Alertmanager, not a duplicate notification).
+    HEARTBEAT_SECONDS = 120
+
     def __init__(self):
         self._down_since = {}  # (device_id, port) -> monotonic timestamp
         self._alerting = set()  # (device_id, port) currently alerting
+        self._last_posted = {}  # (device_id, port) -> monotonic time of last fire/heartbeat POST
         self._last_syslog_ts_ns = 0  # dedup cursor for check_via_syslog
 
     def check_once(self, configs, get_port_state, device_name_for, alertmanager):
+        """Owns delayed-mode timing end to end (its down_since tracking is
+        what "stayed down for N seconds" means) - both fire and resolve.
+
+        For immediate mode, this is deliberately fire-only, never resolve
+        - resolving stays check_via_syslog's exclusive job. Confirmed live
+        why both halves of that split matter: (1) without any role here,
+        a port already down before a webui restart (no *new* syslog
+        transition to react to - check_via_syslog only sees fresh events)
+        would silently never alert at all; (2) but letting this loop also
+        resolve is what caused a real race in the first place -
+        check_via_syslog correctly fired 3s after a genuine down event,
+        then this loop's next ~30s SSH poll sampled the status poller's
+        own cache mid-transition, read a stale "up", and incorrectly
+        resolved the alert the syslog path had just raised, which then
+        re-fired on the next syslog tick (looked like "took a minute" for
+        what was actually a 3s real detection). Firing here is safe to
+        duplicate (already_alerting guards it) and safe to be occasionally
+        premature (worst case: alerts a real transient blip a syslog
+        "up" will resolve moments later) - resolving here was the actual
+        hazard, since a stale-read false resolve silently un-alerts a
+        real ongoing outage."""
         now = time.monotonic()
         for cfg in configs:
             key = (cfg["device_id"], cfg["port"])
             if not cfg["enabled"]:
-                # Disabling a port mid-alert must still resolve it -
-                # otherwise it's stuck firing in Alertmanager forever,
-                # since a disabled config is never checked again to
-                # notice the interface recovered.
+                # Disabling a port mid-alert must still resolve it right
+                # away, regardless of mode - the fast path only resolves
+                # on a real "up" syslog event, which disabling doesn't
+                # wait for.
                 self._down_since.pop(key, None)
                 if key in self._alerting:
                     self._resolve(cfg, alertmanager, device_name_for)
                     self._alerting.discard(key)
+                    self._last_posted.pop(key, None)
                 continue
+
             state = get_port_state(cfg["device_id"], cfg["port"])
             is_down = state == "down"  # "admin_down" is intentional, never alerted
+
+            if cfg["mode"] == "immediate":
+                if is_down and key not in self._alerting:
+                    self._down_since.setdefault(key, now)
+                    self._fire(cfg, alertmanager, device_name_for, now - self._down_since[key])
+                    self._alerting.add(key)
+                    self._last_posted[key] = now
+                elif is_down and key in self._alerting:
+                    self._maybe_heartbeat(key, cfg, alertmanager, device_name_for, now)
+                elif not is_down:
+                    self._down_since.pop(key, None)
+                continue  # resolve is check_via_syslog's job alone
 
             if not is_down:
                 self._down_since.pop(key, None)
                 if key in self._alerting:
                     self._resolve(cfg, alertmanager, device_name_for)
                     self._alerting.discard(key)
+                    self._last_posted.pop(key, None)
                 continue
 
             if key not in self._down_since:
                 self._down_since[key] = now
             down_for = now - self._down_since[key]
 
-            already_alerting = key in self._alerting
-            should_alert = cfg["mode"] == "immediate" or down_for >= cfg["delay_seconds"]
-            if should_alert and not already_alerting:
-                self._fire(cfg, alertmanager, device_name_for, down_for)
-                self._alerting.add(key)
+            if down_for >= cfg["delay_seconds"]:
+                if key not in self._alerting:
+                    self._fire(cfg, alertmanager, device_name_for, down_for)
+                    self._alerting.add(key)
+                    self._last_posted[key] = now
+                else:
+                    self._maybe_heartbeat(key, cfg, alertmanager, device_name_for, now)
+
+    def _maybe_heartbeat(self, key, cfg, alertmanager, device_name_for, now):
+        """Re-POSTs an already-firing alert's labels periodically, purely
+        to refresh Alertmanager's resolve_timeout clock - confirmed live
+        this matters: an Alertmanager restart (or anything that drops its
+        in-memory alert store) silently loses a directly-posted alert with
+        no way for it to ask for a resend, unlike Prometheus-rule alerts,
+        which Prometheus itself continuously re-sends every evaluation
+        cycle regardless of Alertmanager's state. Deliberately quiet - no
+        "fired" log line - this is upkeep, not a new event."""
+        last = self._last_posted.get(key, 0)
+        if now - last >= self.HEARTBEAT_SECONDS:
+            down_for = now - self._down_since.get(key, now)
+            self._fire(cfg, alertmanager, device_name_for, down_for, log_it=False)
+            self._last_posted[key] = now
 
     def check_via_syslog(self, configs, loki_client, devices_by_id, alertmanager, device_name_for, lookback_seconds=20):
         """Near-real-time detection for `mode="immediate"` configs, using
@@ -169,17 +234,20 @@ class InterfaceAlertChecker:
                 continue
             if link_state == "down":
                 if key not in self._alerting:
-                    self._down_since[key] = time.monotonic()
+                    now = time.monotonic()
+                    self._down_since[key] = now
                     self._fire(cfg, alertmanager, device_name_for, 0)
                     self._alerting.add(key)
+                    self._last_posted[key] = now
             else:
                 self._down_since.pop(key, None)
                 if key in self._alerting:
                     self._resolve(cfg, alertmanager, device_name_for)
                     self._alerting.discard(key)
+                    self._last_posted.pop(key, None)
         self._last_syslog_ts_ns = newest_seen
 
-    def _fire(self, cfg, alertmanager, device_name_for, down_for):
+    def _fire(self, cfg, alertmanager, device_name_for, down_for, log_it=True):
         starts_at = datetime.now(timezone.utc).isoformat()
         try:
             alertmanager.post_alerts([{
@@ -198,7 +266,8 @@ class InterfaceAlertChecker:
                 },
                 "startsAt": starts_at,
             }])
-            log.info("interface alert fired: %s/%s (mode=%s)", cfg["device_id"], cfg["port"], cfg["mode"])
+            if log_it:
+                log.info("interface alert fired: %s/%s (mode=%s)", cfg["device_id"], cfg["port"], cfg["mode"])
         except Exception:
             log.exception("could not post interface-down alert for %s/%s", cfg["device_id"], cfg["port"])
 
