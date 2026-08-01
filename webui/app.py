@@ -36,6 +36,7 @@ from devices import DeviceConfigError, StoredDevice, load_devices
 from loki_client import LokiClient, LokiError
 from results_store import ResultsStore
 from scheduler import ScheduleStore
+import alert_rules
 import compliance
 from ssh_client import SwitchSSH, SwitchSSHError
 from status_poller import StatusPoller
@@ -60,6 +61,12 @@ LEGACY_SQLITE_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "data" / "switchbo
 # gets.
 ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "http://alertmanager:9093")
 ALERTMANAGER = AlertmanagerClient(ALERTMANAGER_URL)
+
+# Where the Rules tab writes the generated alert rules file, and where it
+# asks Prometheus to reload from - see docker-compose.yml for both the
+# writable bind mount at this exact path and --web.enable-lifecycle.
+ALERT_RULES_FILE = os.environ.get("ALERT_RULES_FILE", str(BASE_DIR / "data" / "prometheus-alerts.yml"))
+PROMETHEUS_RELOAD_URL = os.environ.get("PROMETHEUS_RELOAD_URL", "http://prometheus:9090/-/reload")
 
 # Deployment config (Postgres DSN, Loki URL, webui login) lives in a small
 # JSON file on the webui-data volume, editable from the in-app Settings
@@ -157,6 +164,7 @@ STORE = None
 RESULTS = None
 TOPOLOGY_STORE = None
 SCHEDULES = None
+ALERT_RULES = None
 DEVICES = []
 DEVICES_BY_ID = {}
 LOKI = None
@@ -338,13 +346,16 @@ def _load_database(dsn):
     devices + status polling from it. Raises on a bad DSN/unreachable host
     so callers (setup wizard, Settings save) can report a clear error
     without disturbing whatever was working before the attempt."""
-    global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, DEVICES, DEVICES_BY_ID
+    global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, DEVICES, DEVICES_BY_ID
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
     new_topology_store = TopologyStore(new_db)
     new_schedules = ScheduleStore(new_db)
-    DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES = new_db, new_store, new_results, new_topology_store, new_schedules
+    new_alert_rules = alert_rules.AlertRuleStore(new_db)
+    DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES = (
+        new_db, new_store, new_results, new_topology_store, new_schedules, new_alert_rules
+    )
 
     _migrate_legacy_json_devices()
     _migrate_legacy_sqlite()
@@ -1451,6 +1462,38 @@ async def api_alertmanager_webhook(request: Request):
         metrics.alertmanager_notifications_total.labels(alertname=name, status=status).inc()
         log.info("alertmanager: %s %s - %s", status, name, alert.get("annotations", {}).get("summary", ""))
     return {"ok": True}
+
+
+@app.get("/api/alert-rules")
+def api_list_alert_rules(user: str = Depends(require_auth_and_db)):
+    return ALERT_RULES.list()
+
+
+class AlertRuleUpdateRequest(BaseModel):
+    severity: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+@app.put("/api/alert-rules/{name}")
+def api_update_alert_rule(name: str, req: AlertRuleUpdateRequest, user: str = Depends(require_auth_and_db)):
+    try:
+        updated = ALERT_RULES.update(name, severity=req.severity, enabled=req.enabled)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if updated is None:
+        raise HTTPException(status_code=404, detail="unknown rule")
+
+    try:
+        alert_rules.write_and_reload(ALERT_RULES.list(), ALERT_RULES_FILE, PROMETHEUS_RELOAD_URL)
+    except Exception as e:
+        # The DB write already committed - the rule change is real and
+        # will apply next time anything reloads Prometheus - but the user
+        # needs to know live reload itself didn't happen, not get a
+        # falsely reassuring 200.
+        raise HTTPException(status_code=502, detail=f"Rule saved, but Prometheus reload failed: {e}")
+
+    log.info("user=%s updated alert rule %s: severity=%s enabled=%s", user, name, req.severity, req.enabled)
+    return updated
 
 
 _LLDP_COMMAND = {"os9": "show lldp neighbors detail", "junos": "show lldp neighbors"}

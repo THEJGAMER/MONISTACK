@@ -171,6 +171,14 @@ export const createSilence = (body) =>
   api("/api/silences", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 export const deleteSilence = (id) => api(`/api/silences/${encodeURIComponent(id)}`, { method: "DELETE" });
 
+export const listAlertRules = () => api("/api/alert-rules");
+export const updateAlertRule = (name, body) =>
+  api(`/api/alert-rules/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
 export const getSettings = () => api("/api/settings");
 
 export const updateSettings = (body) =>

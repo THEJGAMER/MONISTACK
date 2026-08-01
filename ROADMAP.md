@@ -377,6 +377,35 @@ The gate on anyone other than you using this.
       notifications, they don't track ownership. Would need a
       Switchboard-side table keyed on alert fingerprint if this becomes a
       real need.
+- [x] **2026-08-01**: Rules tab on the Alerts page for managing rule
+      severity/priority and enable-disable, without hand-editing YAML or
+      recreating containers. Scoped deliberately: PromQL
+      expressions/thresholds are NOT editable from the UI (no pre-flight
+      validation before Prometheus would reject a bad rules file at
+      reload time) - only `severity` (which drives Pushover priority via
+      the existing template) and `enabled`.
+
+      Architecture: the 5 alert rules moved from a hand-maintained
+      `prometheus/alerts.yml` to a Postgres-backed `alert_rules` table
+      (`alert_rules.py`), seeded once from the exact rules already
+      verified live in the earlier 3.2 work. `prometheus/alerts.yml` is
+      now a *generated* file, rewritten in place (no rename - see the
+      bind-mount note below) on every save. Prometheus gained
+      `--web.enable-lifecycle` (docker-compose.yml) so a save calls its
+      real `/-/reload` HTTP endpoint instead of needing the container
+      recreated.
+
+      Verified live end to end, including the two failure modes that
+      actually matter: (1) validated the generator's output with
+      Prometheus's own `promtool check rules` before ever wiring it in;
+      (2) changed a real rule's severity through the actual browser UI,
+      confirmed via `docker logs prometheus` that `/-/reload` fired at
+      the same timestamp and the rule's live label changed - no
+      container recreate needed, unlike the earlier hand-edit case; (3)
+      disabled a rule and confirmed it actually disappeared from
+      Prometheus's loaded rule set, not just this table's `enabled`
+      column; (4) re-enabled it and reverted the test severity change
+      back to the original, tested values.
 
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added

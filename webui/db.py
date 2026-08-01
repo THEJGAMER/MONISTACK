@@ -85,6 +85,25 @@ CREATE TABLE IF NOT EXISTS compliance_config (
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL
 );
+
+-- Prometheus alert rule definitions (ROADMAP 3.2's Rules tab) - Postgres
+-- is the source of truth; prometheus/alerts.yml is a generated file
+-- (see alert_rules.py) kept only because Prometheus itself needs an
+-- actual file on disk to load rules from. `expr`/`for_seconds` are
+-- seeded from the rules verified live in the original alerting work and
+-- deliberately NOT editable from the UI (a PromQL typo has no
+-- pre-flight validation) - only `severity` (drives Pushover priority
+-- via alertmanager.yml's template) and `enabled` are.
+CREATE TABLE IF NOT EXISTS alert_rules (
+    name TEXT PRIMARY KEY,
+    expr TEXT NOT NULL,
+    for_seconds INTEGER NOT NULL DEFAULT 0,
+    severity TEXT NOT NULL,
+    summary_template TEXT NOT NULL,
+    description_template TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL
+);
 """
 
 
