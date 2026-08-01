@@ -24,7 +24,14 @@ global:
 route:
   receiver: pushover
   group_by: ["alertname", "port"]
-  group_wait: 30s
+  # 0s per user request (2026-08-01) - confirmed live that detection
+  # itself was already fast (~3-4s via interface_alerting.py's syslog
+  # path or Prometheus's own scrape/evaluate cycle), and the previous
+  # 30s group_wait was purely a batching window before the first push
+  # for a new alert group went out. Trade-off: simultaneous alerts (e.g.
+  # a whole switch failing triggers several rules at once) now arrive as
+  # separate pushes instead of one batched one.
+  group_wait: 0s
   group_interval: 5m
   repeat_interval: 4h
 
