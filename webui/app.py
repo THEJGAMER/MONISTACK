@@ -1291,7 +1291,17 @@ class ImmutableCachedStaticFiles(StaticFiles):
         return response
 
 
-app.mount("/static/assets", ImmutableCachedStaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+# The Docker image always builds the frontend before the backend starts
+# (see Dockerfile), so this directory exists in every real deployment -
+# but importing this module shouldn't *require* that (backend-only tools,
+# and the test suite's TestClient-based tests, have no reason to run
+# `npm run build` first). Mounting on a missing directory raises
+# immediately at import time otherwise, which is a needless coupling
+# between two logically separate concerns.
+if (FRONTEND_DIST / "assets").is_dir():
+    app.mount("/static/assets", ImmutableCachedStaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+else:
+    log.warning("frontend/dist/assets not found - run `npm run build` in webui/frontend/; static assets won't be served")
 
 
 @app.get("/")
