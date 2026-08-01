@@ -165,6 +165,12 @@ export const submitSetup = (body) =>
     body: JSON.stringify(body),
   });
 
+export const getAlerts = () => api("/api/alerts");
+export const listSilences = () => api("/api/silences");
+export const createSilence = (body) =>
+  api("/api/silences", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+export const deleteSilence = (id) => api(`/api/silences/${encodeURIComponent(id)}`, { method: "DELETE" });
+
 export const getSettings = () => api("/api/settings");
 
 export const updateSettings = (body) =>

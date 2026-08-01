@@ -287,10 +287,48 @@ The gate on anyone other than you using this.
       scrub or encrypt at rest rather than continuing to avoid it.
 
 ### 3.2 Alerting
-- [ ] Wire alarms, link flaps, PSU/fan faults, and optic degradation to
-      Alertmanager (already in the stack) → Slack/PagerDuty/email.
-- [ ] Maintenance windows / alert suppression.
-- [ ] Alarm acknowledgement and assignment.
+- [x] **2026-08-01**: Wire alarms, link flaps, PSU/fan faults, and optic
+      degradation to Alertmanager → a real channel. Correction to this
+      item as originally written: Alertmanager was **not** already in the
+      stack (checked docker-compose.yml/prometheus/ before starting - only
+      Prometheus/Grafana/exporter/webui existed) - added it as a new
+      service (`prom/alertmanager:v0.27.0`, `alertmanager/`). New
+      `prometheus/alerts.yml` rule group (`s4048-hardware`) evaluates the
+      exporter's real `s4048_*` metrics: `S4048DeviceDown` (poll failing),
+      `S4048FanDown`/`S4048PSUDown` (`fan_status`/`psu_status == 0`),
+      `S4048TransceiverAlarm` (the optic's own DOM alarm bit, not an
+      invented dBm threshold), `S4048InterfaceFlapping`
+      (`changes(interface_up[15m]) > 4`). No real Slack/PagerDuty/email
+      credentials were available to wire up and verify live, so the
+      receiver is a webhook back into Switchboard itself
+      (`POST /api/alertmanager/webhook`, logs + counts each notification
+      via `switchboard_alertmanager_notifications_total`) rather than a
+      dead end - swapping in `slack_configs`/`email_configs`/
+      `pagerduty_configs` in `alertmanager/alertmanager.yml` is the only
+      remaining step once real credentials exist (documented inline
+      there). Verified live: Prometheus shows the Alertmanager target
+      healthy and all 5 rules evaluating with no errors against real
+      exporter label values (confirmed the fan/PSU label shapes the rules
+      expect match `s4048_fan_status`/`s4048_psu_status`'s actual output
+      exactly); manually POSTed a synthetic webhook payload and confirmed
+      the counter incremented.
+- [x] **2026-08-01**: Maintenance windows / alert suppression - new
+      Alerts page proxies Alertmanager's real silence API
+      (`alertmanager_client.py`, `/api/silences`) rather than
+      reimplementing suppression logic. Verified live end-to-end via the
+      actual browser UI: created a silence, confirmed it matched
+      Alertmanager's own `/api/v2/silences` response byte-for-byte (not
+      just a 200 from Switchboard's side), expired it, confirmed gone.
+      Caught and fixed a real bug this way: Alertmanager's delete
+      endpoint is singular `/api/v2/silence/{id}`, not the plural
+      `/api/v2/silences/{id}` every other silence route uses - the first
+      live delete attempt 404'd against the real service.
+- [ ] Alarm acknowledgement and assignment - deliberately not built this
+      pass (see 2026-08-01 discussion): Alertmanager has no concept of
+      "who's handling this" natively, and silences (above) only suppress
+      notifications, they don't track ownership. Would need a
+      Switchboard-side table keyed on alert fingerprint if this becomes a
+      real need.
 
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added

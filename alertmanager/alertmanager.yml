@@ -1,0 +1,34 @@
+# Alertmanager is deployed and wired to Prometheus (see
+# prometheus/prometheus.yml's `alerting:` block and prometheus/alerts.yml
+# for the actual alert rules), but the receiver below is a deliberate
+# placeholder: no real Slack/PagerDuty/email destination has been
+# configured yet (no credentials were available to wire up and verify
+# live - see ROADMAP.md 3.2). `webhook_configs` pointed at a route that
+# doesn't exist yet is honest about that: alerts fire and are queryable
+# via Alertmanager's own API/UI (and Switchboard's Maintenance page,
+# which proxies that API), they just don't reach a human outside this
+# stack until a real receiver replaces this one.
+#
+# To wire up a real channel:
+# - Slack: replace `webhook_configs` with `slack_configs` and an
+#   `api_url` (Slack incoming webhook URL), or set `slack_api_url` under
+#   `global:` and use `channel:` per receiver.
+# - Email: add `smtp_smarthost`/`smtp_from`/`smtp_auth_*` under `global:`
+#   and use `email_configs` with a `to:` address.
+# - PagerDuty: `pagerduty_configs` with a service integration key.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: placeholder
+  group_by: ["alertname", "port"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: placeholder
+    webhook_configs:
+      - url: "http://webui:8080/api/alertmanager/webhook"
+        send_resolved: true

@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 import os
 import re
 import secrets
@@ -23,6 +24,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
 import junos_parsers
+from alertmanager_client import AlertmanagerClient, AlertmanagerError
 import logging_setup
 import metrics
 import opnsense_parsers
@@ -50,6 +52,14 @@ BASE_DIR = Path(__file__).parent
 DEVICES_PATH = os.environ.get("DEVICES_FILE", str(BASE_DIR / "devices.yaml"))
 LEGACY_STORE_PATH = os.environ.get("DEVICE_STORE_FILE", str(BASE_DIR / "data" / "devices_store.json"))
 LEGACY_SQLITE_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "data" / "switchboard.db"))
+
+# Alertmanager (ROADMAP 3.2), unlike Loki, is a fixed service in this same
+# docker-compose stack rather than something reachable at a
+# deployment-specific address on a separate host - a plain env-var default
+# is enough, no need for the Settings-page-editable DSN treatment Loki
+# gets.
+ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "http://alertmanager:9093")
+ALERTMANAGER = AlertmanagerClient(ALERTMANAGER_URL)
 
 # Deployment config (Postgres DSN, Loki URL, webui login) lives in a small
 # JSON file on the webui-data volume, editable from the in-app Settings
@@ -1354,6 +1364,93 @@ def api_alarm_history(
         e["is_current"] = bool(is_latest_for_component and e.get("alarm_active") is True)
 
     return alarm_events[:limit]
+
+
+# Alerting (ROADMAP 3.2) - proxies Alertmanager's own REST API rather than
+# re-storing alert/silence state in Postgres. Alertmanager is the source
+# of truth for both; Switchboard just gives a UI for them next to
+# everything else instead of a separate tab/tool. See
+# alertmanager/alertmanager.yml for how alerts actually get here
+# (Prometheus evaluating prometheus/alerts.yml's rules against the
+# exporter's s4048_* metrics) and its docstring for why the receiver is
+# currently a webhook back into this app rather than a real
+# Slack/email/PagerDuty destination.
+@app.get("/api/alerts")
+def api_list_alerts(user: str = Depends(require_auth_and_db)):
+    try:
+        return ALERTMANAGER.list_alerts()
+    except AlertmanagerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/silences")
+def api_list_silences(user: str = Depends(require_auth_and_db)):
+    try:
+        return ALERTMANAGER.list_silences()
+    except AlertmanagerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+class SilenceMatcher(BaseModel):
+    name: str
+    value: str
+    isRegex: bool = False
+    isEqual: bool = True
+
+
+class SilenceCreateRequest(BaseModel):
+    matchers: list[SilenceMatcher]
+    duration_hours: float
+    comment: str
+
+
+@app.post("/api/silences")
+def api_create_silence(req: SilenceCreateRequest, user: str = Depends(require_auth_and_db)):
+    if not req.matchers:
+        raise HTTPException(status_code=400, detail="at least one matcher is required")
+    if req.duration_hours <= 0:
+        raise HTTPException(status_code=400, detail="duration_hours must be positive")
+    now = datetime.now(timezone.utc)
+    starts_at = now.isoformat()
+    ends_at = (now + timedelta(hours=req.duration_hours)).isoformat()
+    try:
+        result = ALERTMANAGER.create_silence(
+            [m.model_dump() for m in req.matchers], starts_at, ends_at, user, req.comment
+        )
+    except AlertmanagerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    log.info("user=%s created silence %s (%dh): %s", user, result.get("silenceID"), req.duration_hours, req.comment)
+    return result
+
+
+@app.delete("/api/silences/{silence_id}")
+def api_delete_silence(silence_id: str, user: str = Depends(require_auth_and_db)):
+    try:
+        ALERTMANAGER.delete_silence(silence_id)
+    except AlertmanagerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    log.info("user=%s deleted silence %s", user, silence_id)
+    return {"ok": True}
+
+
+@app.post("/api/alertmanager/webhook")
+async def api_alertmanager_webhook(request: Request):
+    """Receiver for Alertmanager's webhook notifications (see
+    alertmanager/alertmanager.yml) - unauthenticated like /healthz, since
+    Alertmanager doesn't send this app's basic-auth credentials and this
+    is the only receiver configured. Doesn't do anything with the alert
+    beyond logging + counting it: there's no real downstream (Slack/email/
+    PagerDuty) wired up yet, so this exists to make "did an alert actually
+    fire and reach a receiver" observable (via logs and
+    switchboard_alertmanager_notifications_total) rather than a silent
+    dead end."""
+    payload = await request.json()
+    for alert in payload.get("alerts", []):
+        name = alert.get("labels", {}).get("alertname", "unknown")
+        status = alert.get("status", "unknown")
+        metrics.alertmanager_notifications_total.labels(alertname=name, status=status).inc()
+        log.info("alertmanager: %s %s - %s", status, name, alert.get("annotations", {}).get("summary", ""))
+    return {"ok": True}
 
 
 _LLDP_COMMAND = {"os9": "show lldp neighbors detail", "junos": "show lldp neighbors"}

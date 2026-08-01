@@ -23,6 +23,7 @@ const TrendsPage = lazy(() => import("./TrendsPage.jsx"));
 const BulkRunPage = lazy(() => import("./BulkRunPage.jsx"));
 const SchedulesPage = lazy(() => import("./SchedulesPage.jsx"));
 const CompliancePage = lazy(() => import("./CompliancePage.jsx"));
+const AlertsPage = lazy(() => import("./AlertsPage.jsx"));
 
 function PageFallback() {
   return (
@@ -140,6 +141,8 @@ export default function App() {
       ? "schedules"
       : activeHref === "#/compliance"
       ? "compliance"
+      : activeHref === "#/alerts"
+      ? "alerts"
       : activeHref === "#/settings"
       ? "settings"
       : "console";
@@ -152,6 +155,7 @@ export default function App() {
     "bulk-run": "Bulk Run",
     schedules: "Schedules",
     compliance: "Compliance",
+    alerts: "Alerts",
     settings: "Settings",
   };
 
@@ -213,6 +217,7 @@ export default function App() {
               { type: "link", text: "Bulk Run", href: "#/bulk-run" },
               { type: "link", text: "Schedules", href: "#/schedules" },
               { type: "link", text: "Compliance", href: "#/compliance" },
+              { type: "link", text: "Alerts", href: "#/alerts" },
               { type: "divider" },
               { type: "link", text: "Settings", href: "#/settings" },
             ]}
@@ -252,6 +257,8 @@ export default function App() {
                 <SchedulesPage devices={devices} commandTree={commandTree} pushFlash={pushFlash} />
               ) : page === "compliance" ? (
                 <CompliancePage pushFlash={pushFlash} />
+              ) : page === "alerts" ? (
+                <AlertsPage pushFlash={pushFlash} />
               ) : (
                 <ConsolePage
                   devices={devices}

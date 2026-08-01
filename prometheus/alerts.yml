@@ -1,0 +1,53 @@
+groups:
+  - name: s4048-hardware
+    rules:
+      # The exporter itself reachable/polling successfully - the umbrella
+      # check every other rule below implicitly depends on (a dead scrape
+      # can't tell you a fan died, it just goes stale).
+      - alert: S4048DeviceDown
+        expr: s4048_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "S4048 poll failing"
+          description: "The exporter's last SSH poll of the S4048 failed - device may be unreachable, or credentials/SSH config drifted."
+
+      - alert: S4048FanDown
+        expr: s4048_fan_status == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fan {{ $labels.fan }} down (unit {{ $labels.unit }}, bay {{ $labels.bay }})"
+          description: "show environment reports this fan as down."
+
+      - alert: S4048PSUDown
+        expr: s4048_psu_status == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PSU {{ $labels.unit }}/{{ $labels.bay }} down"
+          description: "show environment reports this power supply as down - if the other PSU is also degraded this is a single point of failure."
+
+      - alert: S4048TransceiverAlarm
+        expr: s4048_transceiver_alarm == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Transceiver alarm on {{ $labels.port }} ({{ $labels.flag }})"
+          description: "The optic's own DOM alarm bit is set (show interfaces transceiver) - Rx/Tx power, temperature, voltage, or bias current is outside the vendor's programmed threshold for this specific optic."
+
+      # Flap detection: `changes()` counts every 0<->1 transition the
+      # gauge made in the window, not just "is it down right now" - a
+      # port that's currently up but flapped 6 times in 15 minutes is a
+      # real problem a simple `== 0` check would never catch.
+      - alert: S4048InterfaceFlapping
+        expr: changes(s4048_interface_up[15m]) > 4
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.port }} ({{ $labels.description }}) is flapping"
+          description: "This interface's link state changed more than 4 times in the last 15 minutes."
