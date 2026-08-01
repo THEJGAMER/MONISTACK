@@ -253,6 +253,14 @@ function RulesTab({ pushFlash }) {
                   onChange={({ detail }) => handleUpdate(r.name, { severity: detail.selectedOption.value })}
                   options={SEVERITY_OPTIONS}
                   disabled={savingName === r.name}
+                  // Without this, the dropdown's options list collapses to
+                  // 0x0 when the Select sits inside a Table cell - confirmed
+                  // live by inspecting the open listbox's computed
+                  // getBoundingClientRect(). expandToViewport portals it to
+                  // document.body instead, where it measures/renders
+                  // correctly - the officially recommended fix for Select/
+                  // Multiselect/Autosuggest inside Table/Modal in Cloudscape.
+                  expandToViewport
                 />
               ),
             },
