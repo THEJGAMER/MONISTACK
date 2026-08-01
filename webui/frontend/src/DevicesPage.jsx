@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import Table from "@cloudscape-design/components/table";
@@ -23,6 +23,7 @@ import { useClientPagination } from "./useClientPagination.js";
 const PLATFORM_OPTIONS = [
   { label: "Dell OS9 / Force10 (fully supported)", value: "os9" },
   { label: "Juniper Junos (fully supported)", value: "junos" },
+  { label: "OPNsense (fully supported)", value: "opnsense" },
   { label: "Cisco IOS (experimental)", value: "ios" },
   { label: "Arista EOS (experimental)", value: "eos" },
   { label: "Cisco NX-OS (experimental)", value: "nxos" },
@@ -78,7 +79,7 @@ function toRequestBody(form, editId) {
   };
 }
 
-export default function DevicesPage({ devices, refreshDevices, pushFlash }) {
+export default function DevicesPage({ devices, refreshDevices, pushFlash, prefill, onPrefillConsumed }) {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState(null); // null = adding a new device
   const [loadingEdit, setLoadingEdit] = useState(false);
@@ -88,6 +89,20 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash }) {
   const [testResult, setTestResult] = useState(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [filterText, setFilterText] = useState("");
+
+  // Arrived here from Topology's "Add this device" on an unmanaged LLDP
+  // neighbor - only its LLDP-advertised description is known (e.g. "ge-0/0/2.0"
+  // or a NIC's chassis description), never a management IP, so `host` still
+  // has to be entered by hand.
+  useEffect(() => {
+    if (!prefill) return;
+    setEditingId(null);
+    setForm({ ...EMPTY_FORM, name: prefill.name || "", host: prefill.host || "" });
+    setTestResult(null);
+    setModalOpen(true);
+    onPrefillConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefill]);
 
   const filteredDevices = useMemo(() => {
     const q = filterText.toLowerCase();

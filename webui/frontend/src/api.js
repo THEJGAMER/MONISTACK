@@ -1,5 +1,30 @@
-async function api(path, opts) {
-  const res = await fetch(path, opts);
+// Every backend call is bounded by finite server-side timeouts (SSH
+// connect/run, Loki, DB reconnect all have their own - see ssh_client.py/
+// loki_client.py/db.py), so a *hung* request from the browser's point of
+// view means something's gone wrong outside those bounds (a dropped
+// connection the OS never notices, a proxy sitting silent) - without a
+// client-side timeout too, that shows the user an indefinite spinner
+// instead of a clear, retry-able error. 60s covers the slowest routine
+// case (a handful of sequential SSH commands against one device);
+// `/api/topology` runs that same sequence per device across the whole
+// fleet, so it gets a longer ceiling explicitly rather than one global
+// number being wrong for everyone.
+const DEFAULT_TIMEOUT_MS = 60_000;
+
+async function api(path, opts, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(path, { ...opts, signal: controller.signal });
+  } catch (e) {
+    if (e.name === "AbortError") {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.detail || `HTTP ${res.status}`);
@@ -72,6 +97,30 @@ export const getSyslog = ({ deviceId, category, limit = 200 } = {}) => {
 };
 
 export const getAlarmHistory = (deviceId) => api(`/api/devices/${deviceId}/alarm-history`);
+
+// Runs several sequential SSH commands per device across the whole fleet
+// (LLDP, ARP, MAC table, port-channel membership) - the routine 60s
+// default is right-sized for a single device, not this.
+export const getTopology = () => api("/api/topology", undefined, 180_000);
+
+export const saveTopologyBaseline = () => api("/api/topology/baseline", { method: "POST" });
+
+export const acceptTopologyDrift = (added, removed) =>
+  api("/api/topology/baseline/accept", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ added, removed }),
+  });
+
+export const clearTopologyBaseline = () => api("/api/topology/baseline", { method: "DELETE" });
+
+export const getTrendSeries = (deviceId) => api(`/api/devices/${deviceId}/trends`);
+
+export const getTrendData = (deviceId, metric, port, hours = 168) => {
+  const params = new URLSearchParams({ hours: String(hours) });
+  if (port) params.set("port", port);
+  return api(`/api/devices/${deviceId}/trends/${metric}?${params.toString()}`);
+};
 
 // Unauthenticated - checked before login even applies, so the SPA can show
 // a setup wizard on a fresh deploy instead of a basic-auth prompt.

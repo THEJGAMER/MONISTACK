@@ -191,7 +191,44 @@ JUNOS_COMMAND_TREE = [
     },
 ]
 
-COMMAND_TREES = {"os9": COMMAND_TREE, "junos": JUNOS_COMMAND_TREE}
+OPNSENSE_COMMAND_TREE = [
+    {
+        "id": "system",
+        "label": "System",
+        "items": [
+            {"id": "version", "label": "Version", "cmd": "uname -a"},
+            {"id": "uptime", "label": "Uptime / Load", "cmd": "uptime"},
+            {"id": "top", "label": "CPU / Memory (top)", "cmd": "top -b -d 1"},
+        ],
+    },
+    {
+        "id": "interfaces",
+        "label": "Interfaces",
+        "items": [
+            {"id": "ifconfig", "label": "Interface Status", "cmd": "ifconfig -a"},
+            {"id": "netstat_i", "label": "Interface Counters", "cmd": "netstat -i"},
+        ],
+    },
+    {
+        "id": "routing",
+        "label": "Routing",
+        "items": [
+            {"id": "routes", "label": "Routing Table", "cmd": "netstat -rn"},
+            {"id": "arp", "label": "ARP Table", "cmd": "arp -an"},
+        ],
+    },
+    {
+        "id": "firewall",
+        "label": "Firewall (pf)",
+        "items": [
+            {"id": "pf_info", "label": "State Table Info", "cmd": "pfctl -s info"},
+            {"id": "pf_rules", "label": "Active Rules", "cmd": "pfctl -s rules"},
+            {"id": "pf_nat", "label": "NAT Rules", "cmd": "pfctl -s nat"},
+        ],
+    },
+]
+
+COMMAND_TREES = {"os9": COMMAND_TREE, "junos": JUNOS_COMMAND_TREE, "opnsense": OPNSENSE_COMMAND_TREE}
 
 
 def find_command(category_id, command_id, platform="os9"):

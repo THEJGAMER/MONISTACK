@@ -11,6 +11,8 @@ import DevicesPage from "./DevicesPage.jsx";
 import ResultsPage from "./ResultsPage.jsx";
 import SettingsPage from "./SettingsPage.jsx";
 import SetupWizard from "./SetupWizard.jsx";
+import TopologyPage from "./TopologyPage.jsx";
+import TrendsPage from "./TrendsPage.jsx";
 import { getDevices, getCommands, getSetupStatus } from "./api.js";
 
 let flashId = 0;
@@ -30,6 +32,8 @@ export default function App() {
   const [flashes, setFlashes] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [configured, setConfigured] = useState(null); // null = still checking
+  const [preselectDeviceId, setPreselectDeviceId] = useState(null);
+  const [devicePrefill, setDevicePrefill] = useState(null);
 
   const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
   const [mode, setMode] = usePreference("switchboard-mode", prefersDark ? Mode.Dark : Mode.Light);
@@ -55,6 +59,16 @@ export default function App() {
         onDismiss: () => setFlashes((f) => f.filter((x) => x.id !== id)),
       },
     ]);
+  }, []);
+
+  const openConsoleFor = useCallback((deviceId) => {
+    setPreselectDeviceId(deviceId);
+    setActiveHref("#/console");
+  }, []);
+
+  const openAddDevice = useCallback((prefill) => {
+    setDevicePrefill(prefill);
+    setActiveHref("#/devices");
   }, []);
 
   const refreshDevices = useCallback(async () => {
@@ -99,10 +113,21 @@ export default function App() {
       ? "devices"
       : activeHref === "#/results"
       ? "results"
+      : activeHref === "#/topology"
+      ? "topology"
+      : activeHref === "#/trends"
+      ? "trends"
       : activeHref === "#/settings"
       ? "settings"
       : "console";
-  const pageTitles = { console: "Console", devices: "Devices", results: "Saved Results", settings: "Settings" };
+  const pageTitles = {
+    console: "Console",
+    devices: "Devices",
+    results: "Saved Results",
+    topology: "Topology",
+    trends: "Trends",
+    settings: "Settings",
+  };
 
   if (configured === null) {
     return null;
@@ -155,6 +180,8 @@ export default function App() {
             items={[
               { type: "link", text: "Console", href: "#/console" },
               { type: "link", text: "Devices", href: "#/devices" },
+              { type: "link", text: "Topology", href: "#/topology" },
+              { type: "link", text: "Trends", href: "#/trends" },
               { type: "link", text: "Saved Results", href: "#/results" },
               { type: "divider" },
               { type: "link", text: "Settings", href: "#/settings" },
@@ -173,13 +200,29 @@ export default function App() {
         content={
           loaded &&
           (page === "devices" ? (
-            <DevicesPage devices={devices} refreshDevices={refreshDevices} pushFlash={pushFlash} />
+            <DevicesPage
+              devices={devices}
+              refreshDevices={refreshDevices}
+              pushFlash={pushFlash}
+              prefill={devicePrefill}
+              onPrefillConsumed={() => setDevicePrefill(null)}
+            />
           ) : page === "results" ? (
             <ResultsPage pushFlash={pushFlash} />
           ) : page === "settings" ? (
             <SettingsPage pushFlash={pushFlash} />
+          ) : page === "topology" ? (
+            <TopologyPage pushFlash={pushFlash} onOpenConsole={openConsoleFor} onAddDevice={openAddDevice} />
+          ) : page === "trends" ? (
+            <TrendsPage devices={devices} pushFlash={pushFlash} />
           ) : (
-            <ConsolePage devices={devices} commandTree={commandTree} pushFlash={pushFlash} />
+            <ConsolePage
+              devices={devices}
+              commandTree={commandTree}
+              pushFlash={pushFlash}
+              preselectDeviceId={preselectDeviceId}
+              onPreselectConsumed={() => setPreselectDeviceId(null)}
+            />
           ))
         }
       />

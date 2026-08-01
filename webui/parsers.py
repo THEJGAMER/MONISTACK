@@ -1,6 +1,29 @@
 """Regex/text parsers for Dell OS9 (S4048-ON) `show` command output."""
 import re
 
+# Force10/Dell OS9 spells its own interfaces out in full in `show lldp
+# neighbors detail` ("Local Port ID: TenGigabitEthernet 1/47") even though
+# every other command in this app - and the Console's own port dropdowns -
+# uses the short form ("Te 1/47"). Mapping back to short form here keeps
+# LLDP-derived port names comparable to (and displayable next to) status
+# poller / front-panel port names instead of introducing a second spelling.
+_LLDP_PORT_PREFIXES = {
+    "TenGigabitEthernet": "Te",
+    "GigabitEthernet": "Gi",
+    "FortyGigE": "Fo",
+    "HundredGigE": "Hu",
+    "TwentyFiveGigE": "Tf",
+    "ManagementEthernet": "Ma",
+    "Port-channel": "Po",
+}
+
+
+def _short_port_name(name):
+    for long, short in _LLDP_PORT_PREFIXES.items():
+        if name.startswith(long):
+            return short + name[len(long):]
+    return name
+
 
 def parse_cpu(text):
     """Returns {'cores': {core_id: {'5sec':.., '1min':.., '5min':..}}, 'overall': {...}}"""
@@ -187,6 +210,50 @@ def parse_interfaces_rates(text):
     return out
 
 
+_IFACE_BLOCK_START_RE = re.compile(r"^(TenGigabitEthernet|fortyGigE)\s+(\S+)\s+is\s+(?:up|down)", re.MULTILINE)
+_INPUT_RUNTS_RE = re.compile(r"(\d+)\s+runts,\s+(\d+)\s+giants")
+_INPUT_CRC_RE = re.compile(r"(\d+)\s+CRC,\s+(\d+)\s+overrun,\s+(\d+)\s+discarded")
+_OUTPUT_STATS_RE = re.compile(r"(\d+)\s+throttles,\s+(\d+)\s+discarded,\s+(\d+)\s+collisions,\s+(\d+)\s+wreddrops")
+
+
+def parse_interfaces_errors(text):
+    """Returns {port: {'input_errors','input_discards','output_errors',
+    'output_discards'}} (all ints) from the same bare `show interfaces`
+    output parse_interfaces_rates already reads (confirmed live, same
+    per-port blocks - no extra SSH round trip needed to also get this).
+    Each direction's individually-rare counters (runts/giants/CRC/overrun
+    on input, collisions/throttles on output) are summed into one "errors"
+    number per direction - trending a single number per direction is more
+    useful than four columns that are almost always zero - while discards
+    are kept separate since they're a different signal (queue/congestion
+    drops, not corrupted frames)."""
+    out = {}
+    starts = list(_IFACE_BLOCK_START_RE.finditer(text))
+    for i, m in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(text)
+        block = text[m.start():end]
+        iftype, num = m.group(1), m.group(2)
+        port = f"{_RATE_PREFIX[iftype]} {num}"
+
+        runts_m = _INPUT_RUNTS_RE.search(block)
+        crc_m = _INPUT_CRC_RE.search(block)
+        output_m = _OUTPUT_STATS_RE.search(block)
+        if not (runts_m or crc_m or output_m):
+            continue
+
+        runts, giants = (int(x) for x in runts_m.groups()) if runts_m else (0, 0)
+        crc, overrun, in_discarded = (int(x) for x in crc_m.groups()) if crc_m else (0, 0, 0)
+        throttles, out_discarded, collisions, _wreddrops = (int(x) for x in output_m.groups()) if output_m else (0, 0, 0, 0)
+
+        out[port] = {
+            "input_errors": runts + giants + crc + overrun,
+            "input_discards": in_discarded,
+            "output_errors": collisions,
+            "output_discards": out_discarded + throttles,
+        }
+    return out
+
+
 def parse_transceiver(text):
     """Returns None if not present, else dict with diagnostics for one port.
 
@@ -317,3 +384,99 @@ def parse_alarms(text):
         "minor": section("Minor Alarms", {"Major Alarms"}),
         "major": section("Major Alarms", set()),
     }
+
+
+def parse_lldp_neighbors_detail(text):
+    """Parses `show lldp neighbors detail` - one dict per neighbor entry:
+    {'local_port', 'remote_chassis_id', 'remote_port_id',
+    'remote_port_description', 'remote_system_desc'}. The plain `show lldp
+    neighbors` table is deliberately not used for topology - it only gives
+    the remote port as a bare number for non-Dell neighbors (e.g. a Junos
+    peer's ifIndex), where `detail`'s "Remote Port Description" gives the
+    peer's actual interface name instead (confirmed live against the real
+    Dell<->Juniper LACP uplink). `remote_port_description`/
+    `remote_system_desc` are None when the neighbor didn't advertise them
+    (e.g. a bare NIC without LLDP-MED)."""
+    results = []
+    for chunk in re.split(r"(?=Remote Chassis ID Subtype:)", text)[1:]:
+        chassis_m = re.search(r"Remote Chassis ID:\s*(\S+)", chunk)
+        local_m = re.search(r"Local Port ID:\s*(.+)", chunk)
+        if not (chassis_m and local_m):
+            continue
+        port_id_m = re.search(r"Remote Port ID:\s*(\S+)", chunk)
+        desc_m = re.search(r"Remote Port Description:\s*(.+)", chunk)
+        sysdesc_m = re.search(r"Remote System Desc:\s*(.+?)(?=\s*Existing System Capabilities:)", chunk, re.DOTALL)
+        results.append({
+            "local_port": _short_port_name(local_m.group(1).strip()),
+            "remote_chassis_id": chassis_m.group(1).strip(),
+            "remote_port_id": port_id_m.group(1).strip() if port_id_m else None,
+            "remote_port_description": desc_m.group(1).strip() if desc_m else None,
+            "remote_system_desc": re.sub(r"\s+", " ", sysdesc_m.group(1)).strip() if sysdesc_m else None,
+        })
+    return results
+
+
+_ARP_ROW_RE = re.compile(
+    r"^Internet\s+(?P<ip>\S+)\s+\S+\s+(?P<mac>[0-9a-fA-F:]{17})\s+(?P<interface>\S+(?: \S+)?)\s+", re.MULTILINE
+)
+
+
+def parse_arp(text):
+    """Returns a list of {'ip','mac','interface'} from `show arp`."""
+    return [
+        {"ip": m.group("ip"), "mac": m.group("mac").lower(), "interface": m.group("interface")}
+        for m in _ARP_ROW_RE.finditer(text)
+    ]
+
+
+_MAC_TABLE_ROW_RE = re.compile(
+    r"^\s*\d+\t(?P<mac>[0-9a-fA-F:]{17})\t(?P<type>\S+)\s*\t(?P<interface>.+?)\t", re.MULTILINE
+)
+
+
+def parse_mac_address_table(text):
+    """Returns a list of {'mac','interface'} from `show mac-address-table`
+    - every MAC the switch has ever learned on every port, not just the
+    ones that happen to speak LLDP. This is a second, independent way to
+    discover what's connected to a port: a bridge/CAM table entry exists
+    for *any* device that's sent or received a frame, LLDP or not (e.g. an
+    unmanaged switch/hub full of hosts that never announce themselves via
+    LLDP at all)."""
+    return [
+        {"mac": m.group("mac").lower(), "interface": m.group("interface").strip()}
+        for m in _MAC_TABLE_ROW_RE.finditer(text)
+    ]
+
+
+# Matches both a port-channel's header line (starts with the LACP code
+# letter, LAG number, mode/status/uptime columns, then its first member
+# port) and a continuation line for its other members (just indentation
+# then a port name) - confirmed live: `show interfaces port-channel brief`
+# lists every additional member on its own indented line below the header,
+# with no per-line repeat of the LAG number.
+_PC_LINE_RE = re.compile(
+    r"^\s*(?:[A-Z]\s+(?P<num>\d+)\s+\S+\s+\S+\s+\S+\s+)?(?P<port>[A-Za-z]+ \d+/\d+)\s+\([^)]+\)\s*$", re.MULTILINE
+)
+
+
+def parse_port_channel_brief(text):
+    """Returns {member_port: 'Po N'} from `show interfaces port-channel
+    brief` - which physical ports are actually bundled into which
+    port-channel. Dell's LLDP output never reports this (unlike Junos,
+    which names the parent `ae` interface directly in `show lldp
+    neighbors`), so without this a port-channel whose members happen to
+    carry a confirmed link to another known device (e.g. the uplink to a
+    second switch) can't be told apart from a port-channel that's just a
+    server's LACP-bonded NIC - both would otherwise look like a bare
+    physical port with no lag name at all."""
+    members_by_pc = {}
+    current_pc = None
+    for line in text.splitlines():
+        m = _PC_LINE_RE.match(line)
+        if not m:
+            continue
+        if m.group("num"):
+            current_pc = f"Po {m.group('num')}"
+        if current_pc:
+            members_by_pc.setdefault(current_pc, []).append(m.group("port"))
+    return {port: pc for pc, ports in members_by_pc.items() for port in ports}

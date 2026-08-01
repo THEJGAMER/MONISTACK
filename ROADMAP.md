@@ -78,15 +78,48 @@ build on.
       command run can be traced end to end.
 
 ### 0.5 Resilience and graceful degradation
-- [ ] Audit behavior when Loki is unreachable, the switch is unreachable,
-      or the DB is locked — some paths already handle this well
-      (`summarize()` can never raise; `status_poller` catches per-device),
-      others are less proven.
-- [ ] Global SSH concurrency guard. Dell OS9 has very few vty slots — this
-      already bit us once (see webui README "Session model"). Today's
-      per-device lock is right for one device; a fleet needs a global
-      semaphore and backpressure.
-- [ ] Timeout/retry policy review across SSH, Loki, and the frontend.
+- [x] Audit behavior when Loki is unreachable, the switch is unreachable, or
+      the DB is locked (2026-08-01). Findings: `/api/syslog` and
+      `/api/devices/{id}/alarm-history` already caught `LokiError` cleanly
+      (502 with a real message); `status_poller.py` already catches per-
+      device; `_fetch_live_topology()` already tolerates per-device SSH
+      failures. The real gap was `db.py`-backed stores
+      (`store.py`/`results_store.py`/`topology_store.py`) — none of them
+      catch anything, and `Database._with_reconnect` only absorbs a single
+      dropped connection, not a sustained outage, so a genuinely-down
+      Postgres would propagate a raw `psycopg2.Error` into FastAPI's
+      generic 500 (traceback, no clear message). Fixed with two global
+      `app.exception_handler`s (`psycopg2.Error` → 503 "Database
+      unavailable: ...", `SwitchSSHError` → 502) as a safety net beneath
+      routes that don't already catch these locally — deliberately not
+      route-by-route try/except, since that would mean re-proving the same
+      fix at every call site instead of once.
+- [x] Global SSH concurrency guard (2026-08-01) — `ssh_client.py` gates
+      the actual handshake (`_connect_once`, not steady-state `run()`
+      traffic) behind a module-level `threading.Semaphore(4)` shared
+      across every `SwitchSSH` instance, with a bounded 30s wait (times
+      out with a clear error rather than blocking forever - trading one
+      hang for another would defeat the point). This is a different risk
+      than the vty-exhaustion incident the per-device lock already fixed
+      (see webui README "Session model") - that was one device drowning in
+      *repeated* connection attempts; this is a growing fleet's *pollers
+      all reconnecting at once* after a shared blip (network hiccup,
+      container restart) putting a connection-attempt spike on the webui
+      host and anything shared upstream (jump host, VPN, firewall
+      connection tracking), even though no single device's own vty pool is
+      at risk. Verified live: normal startup (3 devices reconnecting
+      concurrently) is unaffected since it's well under the cap.
+- [x] Timeout/retry policy review across SSH, Loki, and the frontend
+      (2026-08-01). SSH: `connect()` already retried; `run()` now retries
+      once too (reconnect + re-send) — safe unconditionally since every
+      command this app sends is read-only. Loki: `query_range()` had zero
+      retry; now retries once (0.5s backoff) before raising `LokiError`.
+      Frontend: `api()` had no client-side timeout at all (an indefinite
+      spinner on a truly hung request, e.g. a dropped connection the OS
+      never notices) — now wrapped in an `AbortController` with a clear
+      "Request timed out after Ns" error; 60s default, 180s for
+      `/api/topology` specifically (it runs several sequential SSH
+      commands per device across the whole fleet, not just one device).
 
 ### 0.6 Frontend hygiene
 - [ ] Bundle is ~1.03 MB JS / ~1.14 MB CSS (Vite warns; grew from ~996 KB
@@ -194,23 +227,168 @@ The gate on anyone other than you using this.
       are still "(experimental)" - saved and reachable over SSH, but with
       no command tree wired up, so the Console shows an empty Commands
       panel rather than guessing at syntax.
+- [x] **Per-platform command trees — done 2026-07-31, for OPNsense.** Added
+      a real OPNsense 26.1 firewall (root SSH, verified live), architecturally
+      the odd one out among the three platforms: SSH lands in the console's
+      numbered menu, not a shell at all - `ssh_client.py`'s
+      `_connect_opnsense` sends `8` ("Shell") to reach a real FreeBSD shell,
+      whose prompt (`root@host:~ #`) needed its own per-instance prompt
+      regex (`self._prompt_re`, replacing what used to be a single
+      module-level `PROMPT_RE` constant `run()` assumed everywhere) since
+      it has a space before the `#` that the Dell/Junos pattern doesn't
+      expect. Commands are plain FreeBSD CLI (`ifconfig`, `netstat`,
+      `pfctl -s ...`), not a vendor `show` grammar. New `commands.py`'s
+      `OPNSENSE_COMMAND_TREE`, `opnsense_parsers.py` (built from real
+      captured output), `status_poller.py`'s `_poll_once_opnsense`,
+      summaries. Deliberately **not** wired into Front Panel (a firewall
+      appliance has no switch-chassis port layout to illustrate - faking
+      one would violate this app's own rule against fabricating hardware),
+      Topology/LLDP (`/api/topology` now explicitly skips any platform
+      with no LLDP command rather than showing it as a permanently-isolated
+      node), or Syslog/Alarm History (no remote syslog configured for it
+      yet, same gap as the Juniper device).
 - [ ] Replace hand-rolled paramiko + regex with Netmiko/Scrapli +
       ntc-templates/TextFSM for parsing across vendors.
 - [ ] Normalize parsed output into a vendor-neutral shape so the UI and
       alerting don't care what's underneath.
 
 ### 3.4 Predictive / trending
-- [ ] **Optic degradation trending** — Rx/Tx power and temperature are
-      *already collected* per port. Trending them and alerting on gradual
-      Rx-power decline predicts failing optics before links drop. Mostly
-      built; needs the trend + threshold logic.
-- [ ] Port utilization and error-counter trending; capacity forecasting.
-- [ ] PSU power draw trending.
+- [x] **Optic degradation trending** (2026-08-01, Junos added 2026-08-01) —
+      Rx/Tx power and temperature, sampled every 5 min (status poller's
+      slow/transceiver cadence) into a new `metric_samples` Postgres table
+      (see `trending.py`). A trend alert fires when current Rx power has
+      declined ≥3dB from its peak in the window (a halving of optical
+      power - the standard early-warning threshold), independent of the
+      device's own absolute low-power alarm flag. Dell OS9 via per-port
+      `show interfaces <port> transceiver`; Junos via one bulk `show
+      interfaces diagnostics optics` round trip (`junos_parsers.
+      parse_junos_optics_diagnostics`) - confirmed live, but this fleet's
+      real EX3300 has no actual optical transceiver installed (its
+      populated SFP+ ports are 10GBASE-CU1M DACs, which correctly report
+      "N/A"), so **the code path for a real populated optic on Junos is
+      unverified** - the field-level parsing for that case is deliberately
+      left unimplemented (returns nothing rather than guessed numbers)
+      pending a live capture against an actual Junos optical module.
+      OPNsense still excluded (firewall appliance, no pluggable optics).
+- [x] Port utilization and error-counter trending; capacity forecasting
+      (2026-08-01, Junos added 2026-08-01) — interface Mbps and cumulative
+      input/output error+discard counts. Dell OS9 via `parsers.
+      parse_interfaces_errors`, reusing the same bare `show interfaces`
+      output already fetched for rates (no extra SSH round trip). Junos
+      via one bulk `show interfaces extensive` round trip on the slow
+      cadence only (`junos_parsers.parse_junos_interfaces_errors` /
+      `parse_junos_interfaces_traffic_mbps`) - Junos's fast poll (`show
+      interfaces terse`) carries no rate/error data at all, so unlike Dell
+      there's nothing to piggyback on. Capacity forecast is a simple
+      linear regression toward 90% of the port's own negotiated link
+      speed, surfaced as "expected to reach capacity in about N day(s)" -
+      not a guarantee, just a rough current-trend projection.
+- [x] PSU power draw trending (2026-08-01) — `power_watts`/
+      `avg_power_watts` were already parsed per PSU bay; now sampled on
+      the same cadence, with a "notable change" flag when the latest
+      reading deviates ≥20% from its own trailing baseline (either
+      direction - no single "good" direction for this one, unlike optic
+      power). Dell OS9 only - confirmed live this fleet's Junos EX3300 has
+      no CLI command exposing PSU wattage at all (`show chassis power` /
+      `show chassis environment pem` both error "not valid on the
+      ex3300-48p"); not a code gap, there's genuinely nothing to sample.
+- New "Trends" nav page: device + metric/port + time-range pickers, a
+  `LineChart`, and the threshold-alert/forecast banner when one fires.
+  Backed by `GET /api/devices/{id}/trends` (series discovery) and
+  `GET /api/devices/{id}/trends/{metric}` (samples + evaluation).
+- Samples are pruned after 90 days (daemon thread, once/day) so the table
+  doesn't grow unbounded.
 
 ### 3.5 Topology
-- [ ] LLDP neighbors are already collected — build a live topology graph
-      across the fleet.
-- [ ] Overlay link state / utilization on the topology.
+- [x] LLDP neighbors are already collected — build a live topology graph
+      across the fleet. New `webui/topology.py` matches each device's own
+      half-view of a link (parsed by `parsers.parse_lldp_neighbors_detail`
+      for OS9, `junos_parsers.parse_junos_lldp` for Junos) into one edge by
+      *mutual port-name corroboration* rather than chassis ID - Dell OS9
+      has no CLI command that reports its own chassis ID (`show lldp
+      local-info`/`local-information` both 404), so there's no direct way
+      to ask a Dell device its own identity the way Junos's `show lldp
+      local-information` answers for itself. New `GET /api/topology`
+      fetches live from every device (partial-failure tolerant per
+      device), new Topology page (SVG diagram + a Links table) added to
+      the left nav. Verified against the real fleet: correctly reconstructs
+      the known Dell↔Juniper LACP bundle (`ae1`, 2 members) plus the
+      separate out-of-band mgmt link, and surfaces the Dell's other real
+      LLDP neighbors (an AP, a NIC) as external/unmanaged nodes.
+- [x] **Multi-source discovery + MAC/ARP host discovery — done 2026-08-01.**
+      Topology is now explicitly a *multi-discovery-type* graph, not just
+      an LLDP one - every edge carries `discovered_via` (`["lldp"]`,
+      `["mac-table"]`, or both when corroborated). New parsers
+      (`parsers.parse_arp`/`parse_mac_address_table` for OS9,
+      `junos_parsers.parse_arp`/`parse_ethernet_switching_table` for
+      Junos, `opnsense_parsers.parse_arp` for OPNsense) feed two new
+      passes in `topology.py`: (1) every device's ARP table merges into
+      one MAC→IP map so external neighbors show a real IP instead of a
+      bare MAC wherever the fleet's own ARP already knows it (confirmed
+      live, including the case where a multi-port NIC's LLDP chassis ID
+      isn't the MAC ARP actually has - falls back to the port ID); (2) MAC/
+      switching-table entries become their own discovered hosts when LLDP
+      never reported anything at all for that MAC - the explicit "use MAC
+      as fallback" case, since most consumer/IoT devices and unmanaged
+      switches never speak LLDP. Aggregate interfaces (Dell `Po *`, Junos
+      `ae*`) are deliberately excluded from this pass - their
+      mac-address-table entries are often transit traffic through an
+      uplink bundle, not directly-attached hosts, and there's no clean way
+      to reconcile which physical LAG member a learned MAC actually
+      arrived on. Capped per port (4 shown + an overflow summary edge) -
+      a real hub port in this fleet had 14 hosts on it. Baseline drift
+      tracking deliberately only follows LLDP-backed edges (a MAC-table
+      host coming and going, e.g. a guest laptop, would otherwise be
+      constant false "infra changed" noise).
+- [x] Overlay link state / utilization on the topology - reuses the
+      already-running status poller's interface data (no extra SSH round
+      trip): link state (up/down/unknown) colors each edge, and OS9's real
+      input/output Mbps (`status_poller.py`'s rolling ~299s average) shows
+      in the Links table. Junos has no per-interface rate data today (see
+      §3.3's known issues), so its edges show state only, honestly, not a
+      fabricated number.
+- [x] **Baseline topology + drift detection** — new `webui/topology_store.py`
+      (Postgres-backed, one row) saves the current graph as structural
+      "edge signatures" (`topology.edge_signature`/`diff_against_baseline`
+      - device/port identity only, no state/utilization, since that's not
+      what "did the wiring change" means). `POST /api/topology/baseline`
+      is the "Relearn" button (full overwrite); `POST
+      /api/topology/baseline/accept` folds in *specific* added/removed
+      edges by hand without discarding the rest - both exposed in the
+      Topology page's new Baseline panel, alongside per-item and
+      "accept all" actions and a confirm-modal-gated "Forget baseline".
+      Verified live: induced a fake drift by editing the stored baseline
+      directly in Postgres, confirmed the UI correctly showed one "new"
+      and one "missing" edge, and that per-item Accept resolved it.
+- [ ] **Historical/trend view for links** — same idea as Alarm History,
+      but for link state: pull from Loki (or a new poller-recorded table)
+      to show "this link flapped 3 times last week" instead of only ever
+      showing current state.
+- [x] **Background polling + flap alerts** — lighter than a true
+      always-on server poller: the Topology page auto-refreshes every 30s
+      (toggle in the UI) and diffs each fetch's per-edge link state against
+      the previous one client-side, firing a Flashbar the moment a link
+      goes down or recovers. Approximation worth calling out: this only
+      catches a flap while the Topology page is open in a browser, unlike
+      `status_poller.py`'s always-running per-device thread - a real
+      always-on version would need its own background poller + a push
+      channel (websocket/SSE) to notify a closed browser tab, which felt
+      like more surface than this feature warranted yet.
+- [x] **Click a node to jump to its Console tab** - `App.jsx` lifts
+      `preselectDeviceId` state so a node click on Topology sets it and
+      switches to Console, which consumes it to preselect that device.
+      Verified live via Playwright screenshot.
+- [x] **"Add this device" shortcut from an external/unmanaged neighbor** -
+      clicking an external node navigates to Devices and opens "Add a
+      device" pre-filled with the LLDP-derived label (e.g. a NIC's chassis
+      description) as the suggested name; host is left blank for manual
+      entry, since LLDP doesn't reliably give a management IP here.
+      Verified live via Playwright screenshot.
+- [x] **LACP bundle health rollup** - `app.py`'s `_lag_health()` groups
+      internal edges by (device, LAG name) and flags a bundle `degraded`
+      when its members disagree on link state; surfaced as a warning
+      Alert above the Topology diagram. Verified against the real fleet's
+      `ae1` bundle (both members up, correctly not flagged).
 
 ### 3.6 Operational workflow
 - [ ] **Bulk operations** — run a command across N devices, with a
@@ -249,11 +427,14 @@ The gate on anyone other than you using this.
   tool to change production device config - but worth knowing before
   trusting any Junos-side timestamp (device_timestamp-equivalent) at
   face value, unlike the Dell switch's NTP-synced clock.
-- **Junos transceiver diagnostics aren't polled automatically.**
-  `status_poller.py`'s slow-cadence transceiver poll only has a Dell OS9
-  implementation; the Junos command (`show interfaces diagnostics optics
-  <port>`) is available manually from the Console but not wired into the
-  background poll or the Front Panel hover data yet.
+- **Junos transceiver diagnostics ARE now polled automatically** (2026-08-01,
+  see 3.4) via a bulk `show interfaces diagnostics optics` on the slow
+  cadence, feeding both the Front Panel hover data and optic trending -
+  but only the "not present" (N/A) case is parsed/trusted; a real
+  populated optical module's DOM reading fields are unverified on real
+  Junos hardware (this fleet's EX3300 has none installed) and
+  deliberately not guessed at. Re-verify against a live capture before
+  trusting numbers there.
 - **Junos memory/CPU numbers in Switch Status are derived, not exact.**
   `show chassis routing-engine` reports `DRAM 1024 MB` + a single
   `Memory utilization N percent`, not exact used/free byte counts like

@@ -15,6 +15,7 @@ mean "no summary", not a broken response to the user's click.
 import re
 
 import junos_parsers
+import opnsense_parsers
 import parsers
 
 SUMMARIZERS = {}
@@ -502,3 +503,68 @@ def _junos_lacp_detail(out):
     if not m:
         return None
     return f"{m.group(1)}: {len(members)} member(s)" if members else m.group(1)
+
+
+@summarizer("system", "version", platform="opnsense")
+def _opnsense_version(out):
+    m = re.search(r"FreeBSD \S+ (\S+-RELEASE\S*)", out)
+    return m.group(1) if m else None
+
+
+@summarizer("system", "uptime", platform="opnsense")
+def _opnsense_uptime(out):
+    loads = opnsense_parsers.parse_uptime(out)
+    if not loads:
+        return None
+    return f"load {loads['load_1']:.2f}, {loads['load_5']:.2f}, {loads['load_15']:.2f}"
+
+
+@summarizer("system", "top", platform="opnsense")
+def _opnsense_top(out):
+    stats = opnsense_parsers.parse_top(out)
+    if "cpu_pct" not in stats:
+        return None
+    return f"CPU {stats['cpu_pct']}%, {round(stats.get('mem_free_mb', 0))} MB free"
+
+
+@summarizer("interfaces", "ifconfig", platform="opnsense")
+def _opnsense_ifconfig(out):
+    rows = opnsense_parsers.parse_ifconfig(out)
+    up = sum(1 for r in rows if r["status"] == "active")
+    return f"{up}/{len(rows)} interfaces active"
+
+
+@summarizer("routing", "routes", platform="opnsense")
+def _opnsense_routes(out):
+    # Route entries always start with a destination (an address/CIDR or
+    # "default") - distinguishes them from the header lines ("Routing
+    # tables", "Internet:", "Destination ... Netif Expire") without having
+    # to enumerate every possible header text.
+    n = _count(r"^(?:default|[0-9a-fA-F.:]+(?:/\d+)?)\s+\S+", out, re.MULTILINE)
+    return f"{n} route(s)" if n else None
+
+
+@summarizer("routing", "arp", platform="opnsense")
+def _opnsense_arp(out):
+    n = _count(r"^\? \(", out, re.MULTILINE)
+    return f"{n} ARP entries" if n else "0 ARP entries"
+
+
+@summarizer("firewall", "pf_info", platform="opnsense")
+def _opnsense_pf_info(out):
+    info = opnsense_parsers.parse_pf_info(out)
+    if "current_states" not in info:
+        return None
+    return f"{'enabled' if info['enabled'] else 'disabled'}, {info['current_states']} active states"
+
+
+@summarizer("firewall", "pf_rules", platform="opnsense")
+def _opnsense_pf_rules(out):
+    n = _count(r"^(block|pass|scrub)\b", out, re.MULTILINE)
+    return f"{n} rule(s)" if n else None
+
+
+@summarizer("firewall", "pf_nat", platform="opnsense")
+def _opnsense_pf_nat(out):
+    n = _count(r"^nat\b", out, re.MULTILINE)
+    return f"{n} NAT rule(s)" if n else None

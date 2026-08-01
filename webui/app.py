@@ -5,17 +5,22 @@ import re
 import secrets
 import sqlite3
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+import psycopg2
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import junos_parsers
+import opnsense_parsers
+import parsers
 import settings as settings_store
 from commands import COMMAND_TREES, find_command
 from db import Database
@@ -26,6 +31,9 @@ from ssh_client import SwitchSSH, SwitchSSHError
 from status_poller import StatusPoller
 from store import DeviceStore
 from summarize import summarize
+import topology
+import trending
+from topology_store import TopologyStore
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("webui")
@@ -79,9 +87,33 @@ def require_auth_and_db(credentials: Optional[HTTPBasicCredentials] = Depends(se
 app = FastAPI(title="Switchboard")
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
+
+# Safety nets, not the primary error path: most routes already catch
+# SwitchSSHError/LokiError locally and return a clean message (a device
+# being unreachable, or Loki being down, is routine and expected). These
+# two handlers exist for whatever slips through uncaught - most notably
+# every `db.py`-backed store (store.py/results_store.py/topology_store.py)
+# does zero exception handling of its own and lets a sustained Postgres
+# outage propagate straight up (`Database._with_reconnect` only absorbs a
+# single dropped connection, not a genuinely down database) - without
+# this, that surfaces as FastAPI's generic 500 with a raw traceback
+# instead of a clear "the database is unavailable" the Settings page
+# already trains users to expect (see require_auth_and_db's 503).
+@app.exception_handler(psycopg2.Error)
+async def _db_error_handler(request: Request, exc: psycopg2.Error):
+    log.error("unhandled database error on %s: %s", request.url.path, exc)
+    return JSONResponse(status_code=503, content={"detail": f"Database unavailable: {exc}"})
+
+
+@app.exception_handler(SwitchSSHError)
+async def _ssh_error_handler(request: Request, exc: SwitchSSHError):
+    log.warning("unhandled SSH error on %s: %s", request.url.path, exc)
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
+
 DB = None
 STORE = None
 RESULTS = None
+TOPOLOGY_STORE = None
 DEVICES = []
 DEVICES_BY_ID = {}
 LOKI = None
@@ -197,7 +229,24 @@ def _get_session(device):
 # container or Prometheus being reachable. Created once at import time;
 # _load_database() below (re)populates the devices it polls, including
 # on a Settings-page DSN change, without needing a new instance.
-STATUS = StatusPoller(get_session=_get_session, lock_for=lambda device_id: _session_locks[device_id])
+STATUS = StatusPoller(
+    get_session=_get_session, lock_for=lambda device_id: _session_locks[device_id], get_db=lambda: DB
+)
+
+# Trend samples (see trending.py) accumulate at ~288/day/metric/port on the
+# status poller's slow cadence - pruned once a day so the table doesn't
+# grow forever. A plain daemon thread rather than a scheduler dependency;
+# prune_old_samples() is a no-op until DB is actually configured.
+def _trend_pruner_loop():
+    while True:
+        time.sleep(24 * 3600)
+        try:
+            trending.prune_old_samples(DB, keep_days=90)
+        except Exception:
+            log.exception("trend sample pruning failed")
+
+
+threading.Thread(target=_trend_pruner_loop, daemon=True, name="trend-pruner").start()
 
 
 def _load_database(dsn):
@@ -205,11 +254,12 @@ def _load_database(dsn):
     devices + status polling from it. Raises on a bad DSN/unreachable host
     so callers (setup wizard, Settings save) can report a clear error
     without disturbing whatever was working before the attempt."""
-    global DB, STORE, RESULTS, DEVICES, DEVICES_BY_ID
+    global DB, STORE, RESULTS, TOPOLOGY_STORE, DEVICES, DEVICES_BY_ID
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
-    DB, STORE, RESULTS = new_db, new_store, new_results
+    new_topology_store = TopologyStore(new_db)
+    DB, STORE, RESULTS, TOPOLOGY_STORE = new_db, new_store, new_results, new_topology_store
 
     _migrate_legacy_json_devices()
     _migrate_legacy_sqlite()
@@ -559,6 +609,79 @@ def api_device_status_refresh(device_id: str, user: str = Depends(require_auth_a
     return status
 
 
+@app.get("/api/devices/{device_id}/trends")
+def api_device_trend_series(device_id: str, user: str = Depends(require_auth_and_db)):
+    """Every distinct trend series this device actually has samples for
+    (metric + port) - drives the frontend's metric/port picker without it
+    needing to guess in advance which ports have optics or PSUs."""
+    device = DEVICES_BY_ID.get(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    series = trending.list_available_series(DB, device_id)
+    for s in series:
+        s["label"] = trending.METRIC_LABELS.get(s["metric"], s["metric"])
+    return {"series": series}
+
+
+# Rough, honestly-labeled thresholds per metric - see trending.py's
+# evaluate_decline/evaluate_deviation/forecast_linear docstrings for why
+# each one is shaped the way it is. Not applied to metrics with no sound
+# threshold to reason about yet (temperature: no alarm precedent to trend
+# against beyond what the device's own alarm flags already cover).
+_TREND_EVALUATORS = {
+    "optic_rx_power_dbm": lambda samples: trending.evaluate_decline(samples, warn_by=3.0, unit=" dBm"),
+    "psu_power_watts": lambda samples: trending.evaluate_deviation(samples, warn_pct=20.0, unit=" W"),
+}
+# Interface capacity forecasts need the port's own link speed as the
+# target, not a fixed number - resolved per-request from the device's live
+# interface list (see api_device_trend_data). Dell OS9's `show interfaces
+# status` reports it as e.g. "10000 Mbit" (confirmed live) - parsed rather
+# than matched against a fixed table, so any speed the switch reports just
+# works.
+_SPEED_MBIT_RE = re.compile(r"(\d+)\s*Mbit")
+
+
+def _link_speed_mbps(speed_str):
+    m = _SPEED_MBIT_RE.search(speed_str or "")
+    return float(m.group(1)) if m else None
+
+
+@app.get("/api/devices/{device_id}/trends/{metric}")
+def api_device_trend_data(
+    device_id: str, metric: str, port: Optional[str] = None, hours: int = 168, user: str = Depends(require_auth_and_db)
+):
+    """Sample history for one trend series, plus a threshold evaluation
+    where one applies (see _TREND_EVALUATORS) and, for interface
+    utilization, a simple capacity forecast toward the port's own link
+    speed (ROADMAP 3.4's "capacity forecasting")."""
+    device = DEVICES_BY_ID.get(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    samples = trending.get_samples(DB, device_id, metric, port=port, hours=hours)
+
+    alert = None
+    evaluator = _TREND_EVALUATORS.get(metric)
+    if evaluator:
+        alert = evaluator(samples)
+
+    forecast = None
+    if metric in ("iface_input_mbps", "iface_output_mbps") and port:
+        status = STATUS.get(device_id, include_interfaces=True) or {}
+        iface = next((i for i in status.get("interfaces", []) if i["port"] == port), None)
+        link_mbps = _link_speed_mbps((iface or {}).get("speed"))
+        if link_mbps:
+            forecast = trending.forecast_linear(samples, target_value=link_mbps * 0.9, unit=" Mbps")
+
+    return {
+        "metric": metric,
+        "port": port,
+        "label": trending.METRIC_LABELS.get(metric, metric),
+        "samples": samples,
+        "alert": alert,
+        "forecast": forecast,
+    }
+
+
 @app.post("/api/devices/test")
 def api_test_device(req: DeviceCreateRequest, user: str = Depends(require_auth_and_db)):
     """Try connecting with the given draft device details, without saving
@@ -847,6 +970,233 @@ def api_alarm_history(
         e["is_current"] = bool(is_latest_for_component and e.get("alarm_active") is True)
 
     return alarm_events[:limit]
+
+
+_LLDP_COMMAND = {"os9": "show lldp neighbors detail", "junos": "show lldp neighbors"}
+_ARP_COMMAND = {"os9": "show arp", "junos": "show arp", "opnsense": "arp -an"}
+_ARP_PARSER = {"os9": parsers.parse_arp, "junos": junos_parsers.parse_arp, "opnsense": opnsense_parsers.parse_arp}
+# MAC-address/switching table: a second, independent topology discovery
+# source alongside LLDP (see topology.py's module docstring) - only
+# meaningful on an actual switch, so OPNsense (a firewall, no bridge
+# table) has no entry here, same as _LLDP_COMMAND.
+_MAC_TABLE_COMMAND = {"os9": "show mac-address-table", "junos": "show ethernet-switching table"}
+_MAC_TABLE_PARSER = {"os9": parsers.parse_mac_address_table, "junos": junos_parsers.parse_ethernet_switching_table}
+# Port-channel membership: only needed for Dell OS9 - its LLDP output never
+# names the parent port-channel a member belongs to (unlike Junos, which
+# reports the `ae` interface directly in `show lldp neighbors`), so without
+# this a Dell port-channel that happens to carry a confirmed uplink to
+# another known device can't be distinguished from one that's just a
+# server's LACP-bonded NIC (see topology.py's build_topology).
+_PORT_CHANNEL_COMMAND = {"os9": "show interfaces port-channel brief"}
+_PORT_CHANNEL_PARSER = {"os9": parsers.parse_port_channel_brief}
+
+
+def _lag_health(edges):
+    """Flags a LAG bundle as degraded when its members disagree on link
+    state (one up, one down) - a real problem that nothing else in this
+    app calls out today (each member port looks individually "up" or
+    "down" on its own, nothing rolls that up to bundle level)."""
+    groups = {}
+    for e in edges:
+        if e["kind"] != "internal":
+            continue
+        for side in ("a", "b"):
+            ep = e[side]
+            if ep.get("lag"):
+                groups.setdefault((ep["device_id"], ep["lag"]), []).append(ep["state"]["status"])
+    health = []
+    for (device_id, lag), statuses in groups.items():
+        known = [s for s in statuses if s]
+        health.append({
+            "device_id": device_id,
+            "lag": lag,
+            "member_count": len(statuses),
+            "statuses": statuses,
+            "degraded": len(set(known)) > 1 if known else False,
+        })
+    return health
+
+
+def _fetch_live_topology():
+    """Fetches live LLDP from every device, builds the graph, and overlays
+    current link state + (where the platform has it) Mbps utilization from
+    the already-running status poller - no extra SSH round trip for that
+    part, just whatever's already cached. Per-device SSH failures don't
+    fail the whole call - that device just shows up with no edges and
+    `lldp_error` set, same partial-failure tolerance as the rest of this
+    app's multi-device endpoints."""
+    raw_by_device = {}
+    errors_by_device = {}
+    for device in DEVICES:
+        # Not every platform runs/exposes LLDP (e.g. OPNsense - a firewall
+        # appliance, not part of the LLDP-discovered switch fabric) -
+        # skipped entirely rather than surfaced as a per-device error.
+        lldp_command = _LLDP_COMMAND.get(device.platform)
+        if lldp_command is None:
+            continue
+        try:
+            with _session_locks[device.id]:
+                switch = _get_session(device)
+                raw_by_device[device.id] = switch.run(lldp_command)
+        except SwitchSSHError as e:
+            errors_by_device[device.id] = str(e)
+        except Exception:
+            log.exception("unexpected error fetching LLDP for topology from %s", device.id)
+            errors_by_device[device.id] = "internal error"
+
+    # ARP tables merge in from every device regardless of LLDP support -
+    # OPNsense (no LLDP integration) still sees the whole LAN and is often
+    # the most complete source, since it's the router. Best-effort: a
+    # device that fails here just doesn't contribute any MAC->IP entries,
+    # same partial-failure tolerance as everything else on this page.
+    arp_rows_by_device = {}
+    for device in DEVICES:
+        arp_command = _ARP_COMMAND.get(device.platform)
+        if arp_command is None:
+            continue
+        try:
+            with _session_locks[device.id]:
+                switch = _get_session(device)
+                raw_arp = switch.run(arp_command)
+            arp_rows_by_device[device.id] = _ARP_PARSER[device.platform](raw_arp)
+        except Exception:
+            log.warning("could not fetch ARP table from %s for topology", device.id, exc_info=True)
+    mac_to_ip = topology.merge_mac_to_ip(arp_rows_by_device)
+
+    # MAC/switching table: a second, independent discovery source (see
+    # topology.py's module docstring) that finds hosts LLDP never will -
+    # anything that's sent/received a frame shows up here, LLDP-capable or
+    # not. Same best-effort tolerance as ARP above.
+    mac_table_by_device = {}
+    for device in DEVICES:
+        mac_table_command = _MAC_TABLE_COMMAND.get(device.platform)
+        if mac_table_command is None:
+            continue
+        try:
+            with _session_locks[device.id]:
+                switch = _get_session(device)
+                raw_mac_table = switch.run(mac_table_command)
+            mac_table_by_device[device.id] = _MAC_TABLE_PARSER[device.platform](raw_mac_table)
+        except Exception:
+            log.warning("could not fetch MAC table from %s for topology", device.id, exc_info=True)
+
+    # Port-channel membership (Dell OS9 only - see _PORT_CHANNEL_COMMAND).
+    # Same best-effort tolerance as ARP/MAC-table above.
+    port_channel_members_by_device = {}
+    for device in DEVICES:
+        pc_command = _PORT_CHANNEL_COMMAND.get(device.platform)
+        if pc_command is None:
+            continue
+        try:
+            with _session_locks[device.id]:
+                switch = _get_session(device)
+                raw_pc = switch.run(pc_command)
+            port_channel_members_by_device[device.id] = _PORT_CHANNEL_PARSER[device.platform](raw_pc)
+        except Exception:
+            log.warning("could not fetch port-channel membership from %s for topology", device.id, exc_info=True)
+
+    result = topology.build_topology(
+        DEVICES,
+        raw_by_device,
+        errors_by_device,
+        mac_to_ip=mac_to_ip,
+        mac_table_by_device_id=mac_table_by_device,
+        port_channel_members_by_device_id=port_channel_members_by_device,
+    )
+
+    def _iface_lookup(device_id):
+        status = STATUS.get(device_id, include_interfaces=True)
+        return {i["port"]: i for i in (status or {}).get("interfaces", [])}
+
+    ifaces_by_device = {d.id: _iface_lookup(d.id) for d in DEVICES}
+
+    def _endpoint_state(device_id, port):
+        iface = ifaces_by_device.get(device_id, {}).get(port)
+        if iface is None:
+            return {"status": None, "input_mbps": None, "output_mbps": None}
+        return {
+            "status": iface.get("status"),
+            "input_mbps": iface.get("input_mbps"),
+            "output_mbps": iface.get("output_mbps"),
+        }
+
+    def _endpoint_state_multi(device_id, ports):
+        # An external edge's `port` can be a port-channel name (e.g. "Po
+        # 2") when the host was reached over a LAG - the status poller
+        # only ever tracks physical interfaces (confirmed live: `show
+        # interfaces status` has no "Po N" row), so state/utilization is
+        # combined across the port-channel's actual physical members
+        # instead of a single direct lookup that would always come up
+        # empty for an aggregate name.
+        states = [_endpoint_state(device_id, p) for p in ports]
+        known_statuses = [s["status"] for s in states if s["status"]]
+        status = "Up" if "Up" in known_statuses else (known_statuses[0] if known_statuses else None)
+        ins = [s["input_mbps"] for s in states if s["input_mbps"] is not None]
+        outs = [s["output_mbps"] for s in states if s["output_mbps"] is not None]
+        return {
+            "status": status,
+            "input_mbps": sum(ins) if ins else None,
+            "output_mbps": sum(outs) if outs else None,
+        }
+
+    for edge in result["edges"]:
+        if edge["kind"] == "internal":
+            edge["a"]["state"] = _endpoint_state(edge["a"]["device_id"], edge["a"]["port"])
+            edge["b"]["state"] = _endpoint_state(edge["b"]["device_id"], edge["b"]["port"])
+        else:
+            edge["state"] = _endpoint_state_multi(edge["device_id"], edge.get("member_ports") or [edge["port"]])
+
+    return result
+
+
+@app.get("/api/topology")
+def api_topology(user: str = Depends(require_auth_and_db)):
+    """Fleet-wide topology from live LLDP data - fetched fresh on every
+    call (no background poller for this) since topology changes rarely and
+    there are only ever as many devices as are configured, so the extra
+    per-device SSH round trip on page load/refresh is cheap."""
+    result = _fetch_live_topology()
+    result["lag_health"] = _lag_health(result["edges"])
+
+    baseline = TOPOLOGY_STORE.get()
+    result["baseline"] = (
+        {"saved_at": baseline["saved_at"], "saved_by": baseline["saved_by"]} if baseline else None
+    )
+    result["drift"] = topology.diff_against_baseline(result["edges"], baseline["edges"] if baseline else None)
+    return result
+
+
+@app.post("/api/topology/baseline")
+def api_save_topology_baseline(user: str = Depends(require_auth_and_db)):
+    """"Relearn" - overwrites the whole baseline with exactly what's live
+    right now, discarding any previously-accepted drift."""
+    result = _fetch_live_topology()
+    signatures = [topology.edge_signature(e) for e in result["edges"]]
+    TOPOLOGY_STORE.save(signatures, saved_by=user)
+    log.info("user=%s relearned the topology baseline (%d edges)", user, len(signatures))
+    return {"ok": True, "edge_count": len(signatures)}
+
+
+class TopologyBaselineAcceptRequest(BaseModel):
+    added: list = []
+    removed: list = []
+
+
+@app.post("/api/topology/baseline/accept")
+def api_accept_topology_drift(req: TopologyBaselineAcceptRequest, user: str = Depends(require_auth_and_db)):
+    """Manually folds specific drift into the baseline (e.g. "yes, that
+    link was intentionally moved") without discarding the rest of the
+    baseline the way a full relearn would."""
+    TOPOLOGY_STORE.accept(req.added, req.removed, saved_by=user)
+    log.info("user=%s accepted topology drift (+%d/-%d)", user, len(req.added), len(req.removed))
+    return {"ok": True}
+
+
+@app.delete("/api/topology/baseline")
+def api_clear_topology_baseline(user: str = Depends(require_auth_and_db)):
+    TOPOLOGY_STORE.clear()
+    log.info("user=%s cleared the topology baseline", user)
+    return {"ok": True}
 
 
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"

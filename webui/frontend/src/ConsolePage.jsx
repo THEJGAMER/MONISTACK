@@ -97,7 +97,7 @@ function formatBytes(n) {
   return `${n} B`;
 }
 
-export default function ConsolePage({ devices, commandTree, pushFlash }) {
+export default function ConsolePage({ devices, commandTree, pushFlash, preselectDeviceId, onPreselectConsumed }) {
   const [filterText, setFilterText] = useState("");
   const [selected, setSelected] = useState(null);
   const [paramValues, setParamValues] = useState({}); // `${deviceId}:${param}` -> [values]
@@ -133,6 +133,16 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
   useEffect(() => {
     if (devices.length === 1 && !selected) setSelected(devices[0]);
   }, [devices, selected]);
+
+  // Jumped here from Topology's "open in Console" - takes priority over
+  // the single-device auto-select above since it's an explicit user action.
+  useEffect(() => {
+    if (!preselectDeviceId) return;
+    const match = devices.find((d) => d.id === preselectDeviceId);
+    if (match) setSelected(match);
+    onPreselectConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preselectDeviceId, devices]);
 
   const platformCommandTree = (selected && commandTree[selected.platform]) || [];
 
@@ -686,6 +696,11 @@ export default function ConsolePage({ devices, commandTree, pushFlash }) {
                 label: "Front Panel",
                 content: !selected ? (
                   <Box color="text-status-inactive">Select a device first.</Box>
+                ) : selected.platform === "opnsense" ? (
+                  <Box color="text-status-inactive">
+                    No front-panel view for this platform - OPNsense is a firewall appliance, not a switch
+                    chassis with a fixed port layout to illustrate.
+                  </Box>
                 ) : (
                   <FrontPanelView
                     device={selected}

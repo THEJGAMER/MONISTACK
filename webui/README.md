@@ -407,6 +407,24 @@ both of these plus one more found live: the EX3300's own clock is
 drifted (shows April 2026 while it's really July) - informational only,
 not something this tool changes on production gear.
 
+**OPNsense also has a real command tree, parsers, and live status polling**
+(verified live against a real OPNsense 26.1 box, root SSH at 192.168.0.1).
+Architecturally the odd one out among the three: SSH lands in the
+console's numbered menu, not a shell - `ssh_client.py`'s `_connect_opnsense`
+sends `8` ("Shell") to reach a real FreeBSD shell first, whose prompt
+(`root@host:~ #`) needed its own prompt regex (`self._prompt_re`, no
+longer just a module-level constant) since it has a space before the `#`
+that the Dell/Junos prompt pattern doesn't expect. Commands are plain
+FreeBSD/OPNsense CLI (`ifconfig`, `netstat`, `pfctl -s ...`), not a vendor
+`show` grammar - kept strictly read-only same as the other two platforms,
+just without a shared verb prefix to lean on. Deliberately **not**
+integrated with Front Panel (a firewall appliance, not a switch chassis -
+faking one would violate this app's own rule against fabricating hardware
+layouts) or Topology/LLDP (it isn't part of the LLDP-discovered switch
+fabric, so `/api/topology` skips it entirely rather than showing it as a
+permanently-isolated node) or Syslog/Alarm History (no remote syslog
+configured for it yet, same deliberate gap as the Juniper device).
+
 ## Layout
 
 - `devices.yaml` — static device registry (see above).
@@ -443,6 +461,13 @@ not something this tool changes on production gear.
   interfaces_terse`/`parse_junos_interfaces_descriptions`. Every sample
   these were built against was captured live from the real EX3300, not
   guessed from Junos documentation.
+- `opnsense_parsers.py` — the OPNsense equivalent: `parse_ifconfig`
+  (per-interface status/description/inet, block-split since `ifconfig -a`
+  has no fixed column layout to key off), `parse_uptime` (load averages),
+  `parse_top` (CPU% + memory from FreeBSD `top`'s batch mode, `-b -d 1` -
+  the Linux `-bn1` spelling isn't valid here), `parse_pf_info` (pf
+  enabled/state-table size). Every sample was captured live from the real
+  OPNsense box, not guessed from FreeBSD/OPNsense documentation.
 - `summarize.py` — best-effort one-line summaries per command (e.g. "54
   ports: 8 up, 46 down" for interface status, "1 neighbor(s): 1 FULL" for
   OSPF). Keyed by `(category_id, command_id)`; can never raise - anything

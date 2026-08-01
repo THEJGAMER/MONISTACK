@@ -37,6 +37,31 @@ CREATE TABLE IF NOT EXISTS results (
 );
 CREATE INDEX IF NOT EXISTS idx_results_device ON results(device_id);
 CREATE INDEX IF NOT EXISTS idx_results_created ON results(created_at);
+
+CREATE TABLE IF NOT EXISTS topology_baseline (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    saved_at TEXT NOT NULL,
+    saved_by TEXT
+);
+
+-- Trend samples for predictive/trending monitoring (see trending.py):
+-- optic Rx/Tx power + temperature, PSU power draw, interface utilization
+-- and error/discard counts. One row per (device, metric, port) per sample
+-- tick - `port` is NULL for device-wide metrics (none yet, but kept
+-- nullable rather than using a sentinel string). Written on the status
+-- poller's slow (transceiver) cadence, not every fast poll, to keep row
+-- growth bounded (~288 samples/day/metric/port instead of ~2880).
+CREATE TABLE IF NOT EXISTS metric_samples (
+    id BIGSERIAL PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    port TEXT,
+    value DOUBLE PRECISION NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_metric_samples_lookup
+    ON metric_samples(device_id, metric, port, recorded_at);
 """
 
 

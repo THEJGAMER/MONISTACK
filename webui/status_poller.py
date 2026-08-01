@@ -29,7 +29,9 @@ import time
 from datetime import datetime, timezone
 
 import junos_parsers
+import opnsense_parsers
 import parsers
+import trending
 from ssh_client import SwitchSSHError
 
 log = logging.getLogger("webui.status")
@@ -78,6 +80,26 @@ def _merge_activity(interfaces, rates):
         iface["activity"] = r["input_pps"] > 0 or r["output_pps"] > 0
         iface["input_mbps"] = r["input_mbps"]
         iface["output_mbps"] = r["output_mbps"]
+    return interfaces
+
+
+def _merge_errors(interfaces, errors):
+    """Adds cumulative error/discard counters to each interface dict, from
+    the same bare `show interfaces` output _merge_activity's rates already
+    came from (see parsers.parse_interfaces_errors) - used for trend
+    sampling (see trending.py), not shown live anywhere today."""
+    for iface in interfaces:
+        e = errors.get(iface["port"])
+        if e is None:
+            iface["input_errors"] = None
+            iface["input_discards"] = None
+            iface["output_errors"] = None
+            iface["output_discards"] = None
+            continue
+        iface["input_errors"] = e["input_errors"]
+        iface["input_discards"] = e["input_discards"]
+        iface["output_errors"] = e["output_errors"]
+        iface["output_discards"] = e["output_discards"]
     return interfaces
 
 
@@ -205,9 +227,15 @@ class StatusPoller:
     than opening a second, competing session per device.
     """
 
-    def __init__(self, get_session, lock_for, interval=30, transceiver_interval=300):
+    def __init__(self, get_session, lock_for, get_db=lambda: None, interval=30, transceiver_interval=300):
         self._get_session = get_session
         self._lock_for = lock_for
+        # A callable, not a fixed reference: DB is None at import time and
+        # only set once settings load/change (see app.py's _load_database)
+        # - this background thread outlives any one Database instance, so
+        # it needs to ask for the current one on every trend-sample write
+        # rather than capturing a possibly-stale (or still-None) object.
+        self._get_db = get_db
         self.interval = interval
         self.transceiver_interval = transceiver_interval
         self._status: dict[str, DeviceStatus] = {}
@@ -250,14 +278,81 @@ class StatusPoller:
             now = time.time()
             if now - last_transceiver_poll >= self.transceiver_interval:
                 self._poll_transceivers_once(device)
+                self._record_trend_samples(device)
                 last_transceiver_poll = now
             self._stop.wait(self.interval)
 
     def _poll_once(self, device):
         if device.platform == "junos":
             self._poll_once_junos(device)
+        elif device.platform == "opnsense":
+            self._poll_once_opnsense(device)
         else:
             self._poll_once_os9(device)
+
+    def _poll_once_opnsense(self, device):
+        """OPNsense equivalent of _poll_once_os9/_poll_once_junos - same
+        DeviceStatus fields, populated from opnsense_parsers instead. No
+        env (fans/PSUs/sensors) at all - a firewall appliance doesn't have
+        Dell/Junos's chassis environment monitoring, and this app doesn't
+        fabricate fields for hardware that isn't there. `device_alarms` is
+        likewise always empty - OPNsense has no equivalent concept of
+        active hardware alarms to poll."""
+        status = self._status.setdefault(device.id, DeviceStatus())
+        try:
+            with self._lock_for(device.id):
+                switch = self._get_session(device)
+                top_stats = opnsense_parsers.parse_top(switch.run("top -b -d 1"))
+                ifaces = opnsense_parsers.parse_ifconfig(switch.run("ifconfig -a"))
+
+            interfaces = [
+                {
+                    "port": i["interface"],
+                    "description": i["description"] or "",
+                    "status": "Up" if i["status"] == "active" else ("Down" if i["status"] else "Unknown"),
+                    "port_state": "up" if i["status"] == "active" else ("down" if i["status"] else "unknown"),
+                    "admin_status": None,
+                    "protocol_status": None,
+                    "activity": False,
+                }
+                for i in ifaces
+            ]
+            up_count = sum(1 for i in interfaces if i["status"] == "Up")
+            # Only interfaces that report a carrier state at all count
+            # toward the total - loopback/pfsync/pflog/enc never do, and
+            # counting them as "down" out of some denominator would be
+            # misleading busy-work, not a real fact about the device.
+            countable = [i for i in ifaces if i["status"] is not None]
+
+            cpu_pct = top_stats.get("cpu_pct")
+            cpu = {"overall": {"5sec": cpu_pct, "1min": cpu_pct, "5min": cpu_pct}, "cores": {}} if cpu_pct is not None else {}
+
+            memory = {}
+            if "mem_active_mb" in top_stats:
+                used = round((top_stats["mem_active_mb"] + top_stats["mem_wired_mb"]) * 1_000_000)
+                free = round(top_stats["mem_free_mb"] * 1_000_000)
+                memory = {"total": used + free, "used": used, "free": free, "lowest": None, "largest": None}
+
+            status.state = STATE_UP
+            status.alarms = []
+            status.interfaces = interfaces
+            status.interfaces_up = up_count
+            status.interfaces_total = len(countable)
+            status.env = {}
+            status.cpu = cpu
+            status.memory = memory
+            status.device_alarms = {"minor": [], "major": []}
+            status.last_error = None
+        except SwitchSSHError as e:
+            status.state = STATE_DOWN
+            status.alarms = []
+            status.last_error = str(e)
+        except Exception:
+            log.exception("unexpected error polling status for %s", device.id)
+            status.state = STATE_DOWN
+            status.last_error = "internal error"
+        finally:
+            status.last_polled = datetime.now(timezone.utc)
 
     def _poll_once_junos(self, device):
         """Junos equivalent of _poll_once_os9 - same DeviceStatus fields,
@@ -351,12 +446,15 @@ class StatusPoller:
                 env = parsers.parse_environment(switch.run("show environment"))
                 interfaces = parsers.parse_interfaces_status(switch.run("show interfaces status"))
                 desc_rows = parsers.parse_interfaces_description(switch.run("show interfaces description"))
-                rates = parsers.parse_interfaces_rates(switch.run("show interfaces"))
+                iface_raw = switch.run("show interfaces")
+                rates = parsers.parse_interfaces_rates(iface_raw)
+                errors = parsers.parse_interfaces_errors(iface_raw)
                 cpu = parsers.parse_cpu(switch.run("show processes cpu"))
                 memory = parsers.parse_memory(switch.run("show memory"))
                 device_alarms = parsers.parse_alarms(switch.run("show alarms"))
             _merge_port_state(interfaces, desc_rows)
             _merge_activity(interfaces, rates)
+            _merge_errors(interfaces, errors)
             env["fans"] = _fill_missing_bays(env.get("fans", []), status.known_fan_bays, _fan_placeholder)
             env["psus"] = _fill_missing_bays(env.get("psus", []), status.known_psu_bays, _psu_placeholder)
             state, alarms, up_count, total = _evaluate(env, interfaces)
@@ -393,26 +491,117 @@ class StatusPoller:
             status.last_polled = datetime.now(timezone.utc)
 
     def _poll_transceivers_once(self, device):
-        # Not wired up for Junos yet - `show interfaces <port> transceiver`
-        # is Dell OS9 syntax; sending it at a Junos device would just fail
-        # per-port (or worse, silently mean something else). Leave
-        # transceivers empty for those devices rather than guess.
-        if device.platform == "junos":
+        # OPNsense has no SFP/transceiver diagnostics concept at all - it's
+        # a firewall appliance, not a switch with pluggable optics.
+        if device.platform == "opnsense":
             return
         status = self._status.get(device.id)
         if status is None:
             return
         transceivers = {}
-        for port in device.valid_ports:
-            try:
+        try:
+            if device.platform == "junos":
+                # One bulk round trip covers every optics-capable port
+                # (confirmed live) - unlike Dell OS9, which has no
+                # per-device "all ports" transceiver command and needs the
+                # per-port loop below.
                 with self._lock_for(device.id):
                     switch = self._get_session(device)
-                    output = switch.run(f"show interfaces {port} transceiver")
-                transceivers[port] = parsers.parse_transceiver(output)
-            except SwitchSSHError:
-                continue
-            except Exception:
-                log.exception("unexpected error polling transceiver %s on %s", port, device.id)
-                continue
+                    output = switch.run("show interfaces diagnostics optics")
+                transceivers = junos_parsers.parse_junos_optics_diagnostics(output)
+            else:
+                for port in device.valid_ports:
+                    try:
+                        with self._lock_for(device.id):
+                            switch = self._get_session(device)
+                            output = switch.run(f"show interfaces {port} transceiver")
+                        transceivers[port] = parsers.parse_transceiver(output)
+                    except SwitchSSHError:
+                        continue
+                    except Exception:
+                        log.exception("unexpected error polling transceiver %s on %s", port, device.id)
+                        continue
+        except SwitchSSHError:
+            pass
+        except Exception:
+            log.exception("unexpected error polling transceivers for %s", device.id)
         status.transceivers = transceivers
         status.transceivers_polled = datetime.now(timezone.utc)
+
+        db = self._get_db()
+        rows = []
+        for port, t in transceivers.items():
+            # Only a real optical reading is trend-worthy - AOC/DAC/absent
+            # ports report None for these even when `present` is True (see
+            # parsers.parse_transceiver / parse_junos_optics_diagnostics),
+            # and trending a stream of nulls would just be noise.
+            if not t or not t.get("present") or not t.get("dom_supported"):
+                continue
+            rows.append((device.id, "optic_rx_power_dbm", port, t.get("rx_power_dbm")))
+            rows.append((device.id, "optic_tx_power_dbm", port, t.get("tx_power_dbm")))
+            rows.append((device.id, "optic_temp_c", port, t.get("temperature_c")))
+        trending.record_samples(db, rows)
+
+    def _record_junos_trend_samples(self, device):
+        """Junos equivalent of _record_trend_samples: `show interfaces
+        terse` (the Junos fast poll's only interface command) has no
+        traffic-rate or error-counter data at all, so unlike Dell OS9
+        there's nothing already sitting in DeviceStatus to snapshot - this
+        does its own single bulk `show interfaces extensive` round trip,
+        on the slow cadence only (same reasoning as everywhere else in
+        this module: trend data doesn't need 30s freshness, and this
+        command's output is large). PSU wattage isn't recorded for Junos -
+        confirmed live this platform (EX3300) has no CLI command exposing
+        it at all (`show chassis power`/`show chassis environment pem`
+        both error "not valid on the ex3300-48p"), nothing to sample."""
+        db = self._get_db()
+        if db is None:
+            return
+        try:
+            with self._lock_for(device.id):
+                switch = self._get_session(device)
+                raw = switch.run("show interfaces extensive")
+        except Exception:
+            log.warning("could not fetch interface stats from %s for trending", device.id, exc_info=True)
+            return
+        errors = junos_parsers.parse_junos_interfaces_errors(raw)
+        traffic = junos_parsers.parse_junos_interfaces_traffic_mbps(raw)
+        rows = []
+        for port, e in errors.items():
+            rows.append((device.id, "iface_input_errors", port, e["input_errors"]))
+            rows.append((device.id, "iface_output_errors", port, e["output_errors"]))
+        for port, t in traffic.items():
+            rows.append((device.id, "iface_input_mbps", port, t["input_mbps"]))
+            rows.append((device.id, "iface_output_mbps", port, t["output_mbps"]))
+        trending.record_samples(db, rows)
+
+    def _record_trend_samples(self, device):
+        """Persists a snapshot of PSU power draw and interface utilization/
+        error counters already sitting in this device's DeviceStatus (from
+        the most recent fast poll) - called on the slow cadence alongside
+        _poll_transceivers_once so trend rows accumulate at ~288/day rather
+        than every 30s, with no extra SSH round trips of its own. Junos
+        has its own path (_record_junos_trend_samples) since its fast poll
+        doesn't carry this data at all (see there)."""
+        if device.platform == "junos":
+            self._record_junos_trend_samples(device)
+            return
+        db = self._get_db()
+        if db is None:
+            return
+        status = self._status.get(device.id)
+        if status is None:
+            return
+        rows = []
+        for psu in (status.env or {}).get("psus", []):
+            if psu.get("removed"):
+                continue
+            bay = f"{psu['unit']}/{psu['bay']}"
+            rows.append((device.id, "psu_power_watts", bay, psu.get("power_watts")))
+        for iface in status.interfaces:
+            port = iface.get("port")
+            rows.append((device.id, "iface_input_mbps", port, iface.get("input_mbps")))
+            rows.append((device.id, "iface_output_mbps", port, iface.get("output_mbps")))
+            rows.append((device.id, "iface_input_errors", port, iface.get("input_errors")))
+            rows.append((device.id, "iface_output_errors", port, iface.get("output_errors")))
+        trending.record_samples(db, rows)

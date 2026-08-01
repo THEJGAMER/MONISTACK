@@ -52,11 +52,23 @@ class LokiClient:
             "direction": "backward",
         }
         url = f"{self.base_url}/loki/api/v1/query_range?{urllib.parse.urlencode(params)}"
-        try:
-            with urllib.request.urlopen(url, timeout=self.timeout) as resp:
-                data = json.load(resp)
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
-            raise LokiError(str(e)) from e
+        # One quick retry - a query is read-only and idempotent, so
+        # absorbing a single transient blip (the same class of thing
+        # ssh_client.py's connect()/run() retries already handle) is safe
+        # and avoids surfacing "Loki unreachable" to the user for what was
+        # actually just one dropped connection.
+        last_err = None
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+                    data = json.load(resp)
+                break
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+                last_err = e
+                if attempt == 0:
+                    time.sleep(0.5)
+        else:
+            raise LokiError(str(last_err)) from last_err
 
         events = []
         for stream in data.get("data", {}).get("result", []):

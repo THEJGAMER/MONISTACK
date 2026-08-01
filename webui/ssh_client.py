@@ -19,11 +19,21 @@ by platform:
   screen-length 0 doesn't always suppress (seen live on `| last N` output)
   - `run()` handles this by sending a space and continuing to read rather
     than disabling it once at connect time.
+- OPNsense (verified live against a real 26.1 box): SSH lands in the
+  console's numbered menu ("Enter an option: "), not a shell at all -
+  option `8` ("Shell") has to be selected to reach a real FreeBSD shell,
+  whose prompt (`root@host:~ #`) has a space before the `#` that the
+  Dell/Junos prompt regex doesn't expect, so this platform gets its own
+  prompt regex (set as `self._prompt_re`, used everywhere `run()` would
+  otherwise assume the shared Dell/Junos one). No paging to disable -
+  commands here are chosen specifically to avoid pagers (`pfctl -s ...`,
+  `ifconfig`, `netstat`, not `less`/`more`-driven tools).
 """
 import io
 import logging
 import re
 import socket
+import threading
 import time
 
 import paramiko
@@ -33,8 +43,34 @@ log = logging.getLogger("ssh_client")
 PROMPT_RE = re.compile(r"[\r\n]?\S+[>#]\s*$")
 JUNOS_SHELL_PROMPT_RE = re.compile(r"[\r\n]?\S+%\s*$")
 JUNOS_MORE_RE = re.compile(r"---\(more.*?\)---\s*$")
+OPNSENSE_MENU_PROMPT_RE = re.compile(r"Enter an option:\s*$")
+OPNSENSE_SHELL_PROMPT_RE = re.compile(r"[\r\n]?\S+@\S+:.*#\s*$")
 
 _KEY_TYPES = [paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey]
+
+# Global (cross-device) cap on concurrent *new* SSH handshakes - the
+# per-device lock in app.py already serializes everything for one device,
+# which was the actual fix for the vty-exhaustion incident this module's
+# docstring/README describe (see "Session model"), but that incident was
+# with a single device. A growing fleet reintroduces a related risk one
+# level up: if many devices' persistent sessions all drop at once (a
+# network blip, a switch stack reload, the webui container restarting),
+# every device's poller/lock reconnects independently and simultaneously -
+# each one is a fresh TCP+SSH handshake, and firing dozens of those at
+# once is real load on the webui host (threads/fds) and on anything
+# shared upstream (a jump host, VPN concentrator, firewall connection
+# tracking) even though no single device's own vty pool is at risk this
+# time. Acquired only around the handshake itself (_connect_once) - once
+# a session is established it holds no shared resource, so steady-state
+# command throughput is unaffected. `set_max_concurrent_connects()` exists
+# for tests/tuning rather than a settings-page knob, since the right
+# number depends on infrastructure this app has no visibility into.
+_connect_semaphore = threading.Semaphore(4)
+
+
+def set_max_concurrent_connects(n):
+    global _connect_semaphore
+    _connect_semaphore = threading.Semaphore(n)
 
 
 class SwitchSSHError(Exception):
@@ -70,6 +106,7 @@ class SwitchSSH:
         self.platform = platform
         self._client = None
         self._chan = None
+        self._prompt_re = PROMPT_RE  # overridden per-platform in _connect_once for platforms whose prompt doesn't fit this
 
     def connected(self):
         return self._chan is not None and not self._chan.closed
@@ -101,30 +138,42 @@ class SwitchSSH:
 
     def _connect_once(self):
         self.close()
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        pkey = load_private_key(self.private_key, self.passphrase) if self.private_key else None
-        client.connect(
-            self.host,
-            port=self.port,
-            username=self.username,
-            password=None if pkey else self.password,
-            pkey=pkey,
-            look_for_keys=False,
-            allow_agent=False,
-            timeout=self.timeout,
-            banner_timeout=self.timeout,
-            auth_timeout=self.timeout,
-        )
-        chan = client.invoke_shell()
-        chan.settimeout(self.timeout)
-        self._client = client
-        self._chan = chan
+        # Bounded wait, not an indefinite block - if backpressure itself
+        # can't get a turn within a generous window, something's already
+        # badly wrong (or the fleet is enormous), and hanging forever here
+        # would just trade one kind of stall for another.
+        if not _connect_semaphore.acquire(timeout=30):
+            raise SwitchSSHError(f"too many concurrent SSH connection attempts in progress, timed out waiting for {self.host}")
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            pkey = load_private_key(self.private_key, self.passphrase) if self.private_key else None
+            client.connect(
+                self.host,
+                port=self.port,
+                username=self.username,
+                password=None if pkey else self.password,
+                pkey=pkey,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=self.timeout,
+                banner_timeout=self.timeout,
+                auth_timeout=self.timeout,
+            )
+            chan = client.invoke_shell()
+            chan.settimeout(self.timeout)
+            self._client = client
+            self._chan = chan
 
-        if self.platform == "junos":
-            self._connect_junos()
-        else:
-            self._connect_os9()
+            self._prompt_re = PROMPT_RE
+            if self.platform == "junos":
+                self._connect_junos()
+            elif self.platform == "opnsense":
+                self._connect_opnsense()
+            else:
+                self._connect_os9()
+        finally:
+            _connect_semaphore.release()
 
     def _connect_os9(self):
         self._read_until_prompt()  # initial ">" prompt
@@ -155,6 +204,18 @@ class SwitchSSH:
         self._raw_send("set cli screen-width 0")
         self._read_until_prompt()
         log.info("connected and reached Junos CLI on %s", self.host)
+
+    def _connect_opnsense(self):
+        # SSH lands in the console's numbered menu, not a shell - option 8
+        # ("Shell") drops into a real one.
+        self._read_until_prompt(prompt_re=OPNSENSE_MENU_PROMPT_RE)
+
+        self._raw_send("8")
+        self._prompt_re = OPNSENSE_SHELL_PROMPT_RE
+        resp = self._read_until_prompt(prompt_re=OPNSENSE_SHELL_PROMPT_RE)
+        if not OPNSENSE_SHELL_PROMPT_RE.search(resp):
+            raise SwitchSSHError(f"failed to reach OPNsense shell, got: {resp!r}")
+        log.info("connected and reached OPNsense shell on %s", self.host)
 
     def close(self):
         if self._chan is not None:
@@ -209,21 +270,36 @@ class SwitchSSH:
                 break
         return buf
 
-    def run(self, command, timeout=20):
+    def run(self, command, timeout=20, retries=1):
         """Send a show command and return its output with the echoed
-        command and trailing prompt stripped."""
-        if not self.connected():
-            self.connect()
-        try:
-            self._raw_send(command)
-            raw = self._read_until_prompt(overall_timeout=timeout)
-        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as e:
-            self.close()
-            raise SwitchSSHError(f"error running {command!r}: {e}") from e
+        command and trailing prompt stripped.
+
+        Retries once (by reconnecting and re-sending) on a channel-level
+        failure - safe to do unconditionally because every command this
+        app ever sends is a read-only `show`/query command, never
+        something state-changing, so re-running it after a transient drop
+        can't double-apply anything. This is the same class of blip
+        `connect()`'s own retry already absorbs, just for a channel that
+        dies *during* a command rather than at login."""
+        last_err = None
+        for attempt in range(1, retries + 2):
+            if not self.connected():
+                self.connect()
+            try:
+                self._raw_send(command)
+                raw = self._read_until_prompt(overall_timeout=timeout, prompt_re=self._prompt_re)
+                break
+            except (socket.timeout, EOFError, paramiko.SSHException, OSError) as e:
+                last_err = e
+                self.close()
+                if attempt < retries + 1:
+                    log.warning("run %r on %s failed (%s), retrying", command, self.host, e)
+                    continue
+                raise SwitchSSHError(f"error running {command!r}: {e}") from e
 
         lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         if lines and lines[0].strip() == command.strip():
             lines = lines[1:]
-        if lines and PROMPT_RE.match(lines[-1].strip() + " "):
+        if lines and self._prompt_re.match(lines[-1].strip() + " "):
             lines = lines[:-1]
         return "\n".join(lines).strip("\n")
