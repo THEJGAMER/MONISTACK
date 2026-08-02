@@ -309,12 +309,70 @@ The gate on anyone other than you using this.
       session per device, all inside one uvicorn process. Fine at 5
       devices; it will not hold at 200+. Move to a worker pool / job queue
       (arq, RQ, Celery) with bounded concurrency.
-- [ ] **Multi-device exporter.** `exporter/exporter.py` is hardcoded to a
-      single switch via `SWITCH_HOST`/`SWITCH_USER`/`SWITCH_PASS` env
-      vars. It should read the same device registry the webui uses.
-- [x] **Postgres instead of SQLite** — done 2026-07-30. `webui/db.py` now
-      connects to Postgres via `DATABASE_URL`; `store.py`/`results_store.py`
-      unchanged in shape (same public methods, `?` → `%s` placeholders).
+- [x] **Multi-device exporter** — done 2026-08-02. `exporter/exporter.py`
+      no longer hardcodes one switch via `SWITCH_HOST`/`SWITCH_USER`/
+      `SWITCH_PASS`; it polls every OS9 device in the same registry the
+      webui manages (`common/devices.yaml` static entries + Postgres
+      `DATABASE_URL`, if set), one thread per device, re-reading the
+      registry every `REGISTRY_REFRESH_INTERVAL` (default 60s) so a device
+      added/edited/removed through the Devices page takes effect without
+      restarting the exporter - directly live-verified: added a real
+      device through the live API, watched the exporter start a new poll
+      loop for it ~53s later, then removed it and watched the loop stop
+      cleanly.
+
+      Required moving `db.py`/`store.py`/`devices.py`/`ssh_client.py`/
+      `metrics.py`/`devices.yaml` out of `webui/` into a new shared
+      `common/` directory (both Docker builds now use the repo root as
+      their build context - see `webui/Dockerfile`/`exporter/Dockerfile`)
+      rather than vendoring a second copy into `exporter/` - the old
+      `exporter/ssh_client.py` had already drifted stale (Dell OS9 only,
+      no Junos/OPNsense/private-key support) from exactly this kind of
+      copy-paste, and vendoring again would have repeated it. Metric
+      *names* keep their `s4048_*` prefix (renaming would break existing
+      Grafana dashboards/Prometheus alert rules); every metric gained a
+      `device_id` label instead, which is additive and doesn't break a
+      query with no label selector.
+
+      Also fixed along the way: `SESSION_SECRET_KEY` wasn't set in `.env`,
+      so the webui silently generated a new random one on every process
+      start - every restart/redeploy logged everyone out with no visible
+      error. Now set to a fixed value.
+- [x] **Junos exporter support** — done 2026-08-02, same day as the
+      multi-device exporter above. `common/junos_parsers.py` moved out of
+      `webui/` (same shared-module reasoning) so the exporter reuses the
+      Console's real, already live-verified parsers instead of guessing at
+      Junos output. `poll_fast_junos`/`poll_slow_junos` in
+      `exporter/exporter.py` map Junos's `show chassis routing-engine` /
+      `show chassis environment` / `show interfaces terse` + `descriptions`
+      onto the same `s4048_*` Gauges OS9 uses (fleet-wide alert rules like
+      `s4048_up == 0` now cover Junos devices too, no per-platform rule
+      needed) - with the mapping honestly approximate where Junos's data
+      shape genuinely differs (one CPU snapshot, not OS9's per-core/
+      5sec/1min/5min breakdown; qualitative fan health, no RPM; no PSU
+      wattage on this hardware). Added
+      `common/junos_parsers.py::parse_junos_interfaces_speed` - the only
+      new parser needed, since Junos's fast-cyclable `Speed:` field just
+      reports "Auto" (the port's configured mode), not the real negotiated
+      rate, which only shows up in `show interfaces extensive`.
+
+      Real per-command timing against a live 48-port EX3300 drove a real
+      design split: `show chassis routing-engine`/`environment`/`interfaces
+      terse`/`descriptions` together take ~5s (fast cycle), but `show
+      interfaces extensive` (needed for negotiated speed) took ~19s -
+      moved to the same slow `TRANSCEIVER_INTERVAL` cadence OS9's
+      transceiver poll already uses, alongside `show interfaces
+      diagnostics optics` (~4s). All of it live-verified end to end: real
+      CPU/memory/fan/PSU/temp/interface-status/speed/optics-presence
+      numbers cross-checked against directly-captured command output
+      before being trusted, then confirmed present and correct in the
+      real running exporter's `/metrics` and in Prometheus's own query
+      API. OPNsense is still listed and skipped (no parser exists yet).
+- [x] **Postgres instead of SQLite** — done 2026-07-30. `db.py` (now in
+      `common/`, shared with the exporter - see "Multi-device exporter"
+      above) connects to Postgres via `DATABASE_URL`;
+      `store.py`/`results_store.py` unchanged in shape (same public
+      methods, `?` → `%s` placeholders).
       Single-connection-behind-a-lock design kept as-is (still correct at
       this request volume) with one addition: a retry-once-after-reconnect
       wrapper, since a network DB can drop a connection in ways a local

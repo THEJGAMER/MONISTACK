@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs the S4048 exporter into a venv on this host (LXC or otherwise)
 # and runs it as a systemd service. Run as root, from a checkout that still
-# has the ../exporter directory next to this script.
+# has ../exporter and ../common next to this script.
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -11,6 +11,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXPORTER_SRC="$SCRIPT_DIR/../exporter"
+COMMON_SRC="$SCRIPT_DIR/../common"
 INSTALL_DIR=/opt/s4048-exporter
 CONFIG_DIR=/etc/s4048-exporter
 SERVICE_USER=s4048-exporter
@@ -18,6 +19,10 @@ SERVICE_NAME=s4048-exporter
 
 if [[ ! -f "$EXPORTER_SRC/exporter.py" ]]; then
   echo "Couldn't find $EXPORTER_SRC/exporter.py - run this from the packaging/ dir of the repo checkout" >&2
+  exit 1
+fi
+if [[ ! -f "$COMMON_SRC/db.py" ]]; then
+  echo "Couldn't find $COMMON_SRC/db.py - the exporter now shares db.py/store.py/devices.py/ssh_client.py/metrics.py with webui/, run this from a full repo checkout" >&2
   exit 1
 fi
 
@@ -34,7 +39,8 @@ fi
 
 echo "==> Installing app to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/app"
-cp "$EXPORTER_SRC"/ssh_client.py "$EXPORTER_SRC"/parsers.py "$EXPORTER_SRC"/exporter.py "$EXPORTER_SRC"/requirements.txt "$INSTALL_DIR/app/"
+cp "$COMMON_SRC"/db.py "$COMMON_SRC"/store.py "$COMMON_SRC"/devices.py "$COMMON_SRC"/ssh_client.py "$COMMON_SRC"/metrics.py "$COMMON_SRC"/junos_parsers.py "$COMMON_SRC"/devices.yaml "$INSTALL_DIR/app/"
+cp "$EXPORTER_SRC"/parsers.py "$EXPORTER_SRC"/exporter.py "$EXPORTER_SRC"/requirements.txt "$INSTALL_DIR/app/"
 
 if [[ ! -d "$INSTALL_DIR/venv" ]]; then
   echo "==> Creating venv"

@@ -30,6 +30,11 @@ fi
 echo "==> Installing binary to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 install -m 755 "$BINARY_SRC" "$INSTALL_DIR/s4048-exporter"
+# devices.yaml is optional (see exporter.env.example) - build_binary.sh
+# copies it next to the binary when present, this carries it along.
+if [[ -f "$(dirname "$BINARY_SRC")/devices.yaml" ]]; then
+  cp "$(dirname "$BINARY_SRC")/devices.yaml" "$INSTALL_DIR/devices.yaml"
+fi
 
 echo "==> Writing config to $CONFIG_DIR"
 mkdir -p "$CONFIG_DIR"

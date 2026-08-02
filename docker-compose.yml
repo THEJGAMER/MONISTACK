@@ -1,6 +1,12 @@
 services:
   s4048-exporter:
-    build: ./exporter
+    # Build context is the repo root, not ./exporter, because the image
+    # needs files from common/ (shared with webui - see exporter/Dockerfile)
+    # as well as exporter/ itself; Docker COPY can't reach outside its
+    # build context.
+    build:
+      context: .
+      dockerfile: exporter/Dockerfile
     container_name: s4048-exporter
     restart: unless-stopped
     env_file: .env
@@ -18,7 +24,11 @@ services:
       - "9101:9101"
 
   webui:
-    build: ./webui
+    # Build context is the repo root, not ./webui - same reason as
+    # s4048-exporter above (needs common/, shared with the exporter).
+    build:
+      context: .
+      dockerfile: webui/Dockerfile
     container_name: s4048-webui
     restart: unless-stopped
     env_file: .env

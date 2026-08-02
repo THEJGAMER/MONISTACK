@@ -1,15 +1,21 @@
 FROM node:20-slim AS frontend-build
 WORKDIR /frontend
-COPY frontend/package.json ./
+COPY webui/frontend/package.json ./
 RUN npm install
-COPY frontend/ ./
+COPY webui/frontend/ ./
 RUN npm run build
 
 FROM python:3.13-slim
 WORKDIR /app
-COPY requirements.txt .
+COPY webui/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py occurrences.py paging.py commands.py devices.py store.py results_store.py status_poller.py db.py loki_client.py alertmanager_client.py alert_rules.py alert_acks.py audit.py interface_alerting.py ssh_client.py parsers.py junos_parsers.py opnsense_parsers.py summarize.py settings.py topology.py topology_store.py trending.py metrics.py logging_setup.py scheduler.py compliance.py devices.yaml .
+# db.py/store.py/devices.py/ssh_client.py live in common/ - shared with the
+# exporter (both processes independently read the same Postgres device
+# registry; see common/README or exporter.py's docstring) rather than each
+# keeping its own copy, which is exactly what let exporter/ssh_client.py go
+# stale (Dell OS9-only, no Junos/OPNsense/private-key support) before this.
+COPY common/db.py common/store.py common/devices.py common/ssh_client.py common/metrics.py common/junos_parsers.py common/devices.yaml .
+COPY webui/app.py webui/auth.py webui/occurrences.py webui/paging.py webui/commands.py webui/results_store.py webui/status_poller.py webui/loki_client.py webui/alertmanager_client.py webui/alert_rules.py webui/alert_acks.py webui/audit.py webui/interface_alerting.py webui/parsers.py webui/opnsense_parsers.py webui/summarize.py webui/settings.py webui/topology.py webui/topology_store.py webui/trending.py webui/logging_setup.py webui/scheduler.py webui/compliance.py .
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 RUN mkdir -p /app/data
 

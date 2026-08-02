@@ -213,8 +213,16 @@ def _require_env(name, device_id):
 
 
 def load_static_devices(path):
-    with open(path) as f:
-        raw = yaml.safe_load(f)
+    # A missing file is a valid configuration, not an error - a
+    # Postgres-only deployment (all devices added through the webui) or
+    # the standalone exporter package (packaging/) with no devices.yaml at
+    # all shouldn't crash just because this optional file isn't there.
+    try:
+        with open(path) as f:
+            raw = yaml.safe_load(f)
+    except FileNotFoundError:
+        log.info("no devices.yaml at %s - skipping static devices", path)
+        return []
     devices = []
     for d in raw["devices"]:
         device = StaticDevice(d)

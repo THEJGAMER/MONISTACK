@@ -227,6 +227,26 @@ def parse_junos_interfaces_errors(text):
     return out
 
 
+_JUNOS_LINK_PARTNER_SPEED_RE = re.compile(r"Link partner Speed:\s+(\d+)\s*Mbps")
+
+
+def parse_junos_interfaces_speed(text):
+    """Returns {interface: speed_mbps} from the same bare `show interfaces
+    extensive` output the other extensive-based parsers here read. Junos's
+    own `Speed:` field on the `Link-level type:` line reports the port's
+    *configured* mode ("Auto" on every real copper port on this fleet, not
+    a negotiated rate) - the actual negotiated rate is one line further
+    down, under "Link partner Speed: N Mbps" (confirmed live on a real
+    EX3300 port at 1000 Mbps). Only present for ports with an active link
+    partner - interfaces without it are simply omitted, not guessed at."""
+    out = {}
+    for iface, block in _physical_blocks(text, _EXTENSIVE_BLOCK_START_RE):
+        m = _JUNOS_LINK_PARTNER_SPEED_RE.search(block)
+        if m:
+            out[iface] = int(m.group(1))
+    return out
+
+
 _JUNOS_TRAFFIC_RE = re.compile(r"Input\s+bytes\s*:\s+\d+\s+(\d+)\s+bps\s*\n\s*Output\s+bytes\s*:\s+\d+\s+(\d+)\s+bps")
 
 

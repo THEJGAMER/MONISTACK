@@ -1,2 +1,7 @@
 paramiko>=3.4,<6
 prometheus-client>=0.20,<1
+pyyaml>=6,<7
+# To read the same Postgres device registry the webui manages (see
+# common/db.py, common/store.py, common/devices.py) - multi-device
+# support means this process is no longer configured by env vars alone.
+psycopg2-binary>=2.9,<3
