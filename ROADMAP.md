@@ -91,15 +91,47 @@ build on.
       `frontend-build` (`npm ci && npm run build`).
 
 ### 0.3 Data durability and growth
-- [ ] **Results grow unbounded.** Every `/api/run` auto-saves a row; the
-      only deletion path is a manual click. At fleet scale with scheduled
-      polling this is a slow-motion disk-fill. Add retention (age- and/or
-      count-based), a prune job, and a documented policy.
-- [ ] **No DB backup.** `switchboard.db` lives on a single Docker volume.
-      Host dies → device inventory and all saved results are gone. Add a
-      scheduled dump (`sqlite3 .backup`) to somewhere off-host.
-- [ ] Add DB schema migrations (currently `CREATE TABLE IF NOT EXISTS`
-      only — fine today, painful the first time a column changes).
+- [ ] **Results grow unbounded — still true, and now bigger than when this
+      was written (checked live 2026-08-02).** `results` sits at 150 rows
+      with zero automated retention - the only deletion path is still a
+      manual per-row click. A working prune pattern already exists in the
+      codebase (`trending.py`'s `prune_old_samples`, called daily, keeps
+      90 days of `metric_samples`) - it was just never applied to
+      `results`. Worse, three more unbounded tables were added since this
+      item was written and inherited the same gap: `alert_history` (79
+      rows), `audit_log` (18 rows), and `alert_occurrences`/
+      `alarm_comments` (the per-alarm ticketing added 2026-08-01/02) - none
+      of them have retention either. Needs: age- and/or count-based
+      retention, a prune job (mirroring `trending.py`'s), and a documented
+      policy - now covering all four tables, not just `results`.
+- [ ] **No DB backup - the original wording is stale, the concern isn't.**
+      This used to say `switchboard.db` lives on a single Docker volume -
+      that's no longer true. The app moved to Postgres on a remote host
+      (`192.168.0.146`, see `.env`'s `DATABASE_URL` and `db.py`'s own
+      docstring on the migration) mid-project, so there's no local SQLite
+      file to `sqlite3 .backup` anymore. Checked live: no backup script of
+      any kind exists in this repo. The real question is now organizational
+      as much as technical - does whoever runs that Postgres host already
+      have it covered (routine `pg_dump`/volume snapshots), or does this
+      app need to own that responsibility itself against a database it
+      doesn't host? Needs an answer before it needs code.
+- [x] **DB schema migrations - done, in practice, just not the way this
+      item pictured it (confirmed live 2026-08-02).** Originally worried
+      `CREATE TABLE IF NOT EXISTS` was the only mechanism, which would make
+      the first column change to an existing table painful. That's no
+      longer accurate: `db.py` now has 9 `ALTER TABLE ... ADD COLUMN IF
+      NOT EXISTS` statements, and every column added to an existing table
+      all session went through exactly this pattern (`page_delay_seconds`,
+      `fingerprint` on two tables, all four paging columns on
+      `alert_occurrences`, `occurrence_id` on `audit_log`) - idempotent,
+      safe to run every startup, exercised repeatedly with zero incidents.
+      Real remaining gap, worth its own item rather than reopening this
+      one: this pattern only covers *additive* changes (a new column with
+      a safe default) - there's still no story for a rename, a drop, a
+      type change, or any migration that needs real data transformation,
+      and no version/history table recording what's been applied. Not
+      needed yet; would be needed the first time a column genuinely has to
+      change shape, not just appear.
 
 ### 0.4 Self-observability
 - [x] `/healthz` and `/readyz` endpoints (2026-08-01) — unauthenticated
