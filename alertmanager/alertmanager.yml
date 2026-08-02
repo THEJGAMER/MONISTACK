@@ -40,7 +40,16 @@ route:
   # a whole switch failing triggers several rules at once) now arrive as
   # separate pushes instead of one batched one.
   group_wait: 0s
-  group_interval: 5m
+  # 30s, lowered from 5m (2026-08-01). group_interval is how long a group
+  # waits before notifying again after its contents change - which includes
+  # an alert becoming un-silenced. Switchboard's paging holds (paging.py)
+  # are Alertmanager silences, so "Page now" works by deleting the silence;
+  # at 5m that meant "page now" could take five minutes to actually page,
+  # confirmed live (the alert went active immediately, but
+  # alertmanager_notifications_total did not move). 30s bounds that to
+  # something a human waiting at a console can live with. Trade-off: a
+  # group whose membership keeps changing re-notifies more often.
+  group_interval: 30s
   repeat_interval: 4h
 
 receivers:

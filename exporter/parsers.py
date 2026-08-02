@@ -58,6 +58,32 @@ def parse_environment(text):
             }
         )
 
+    # A physically removed fan tray reports TrayStatus `absent` with none
+    # of the Fan1/Speed/Fan2/Speed columns present at all - confirmed live
+    # (`' 1    3     absent      '`) - so the row above never matches it.
+    # Same bug shape as the PSU fix below, and just as serious here: since
+    # Prometheus gauges hold their last-set value when a scrape stops
+    # reporting a label combination, a fan tray silently dropped from
+    # `out["fans"]` meant `s4048_fan_status{bay="3",...}` just kept
+    # reporting its last-known "up" (1.0) forever - a real, physical fan
+    # pull produced zero alarm, confirmed live (S4048FanDown never fired
+    # despite `show environment` showing the tray gone). Treated as both
+    # fans down (0 RPM): "absent" is a strictly worse cooling state than
+    # "down", not a lesser one, so it must alert at least as readily.
+    for m in re.finditer(r"^\s*(\d+)\s+(\d+)\s+absent\s*$", text, re.MULTILINE):
+        unit, bay = m.groups()
+        out["fans"].append(
+            {
+                "unit": unit,
+                "bay": bay,
+                "tray_status": "absent",
+                "fan1_status": "down",
+                "fan1_rpm": 0,
+                "fan2_status": "down",
+                "fan2_rpm": 0,
+            }
+        )
+
     # Type is `AC`/`DC` when the PSU is up, but confirmed live: a PSU
     # that's down or removed reports Type `UNKNOWN` instead - the row is
     # still there, the device just can't identify it anymore. Matching

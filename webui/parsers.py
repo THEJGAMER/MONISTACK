@@ -81,6 +81,30 @@ def parse_environment(text):
             }
         )
 
+    # A physically removed fan tray reports TrayStatus `absent` with none of
+    # the Fan1/Speed/Fan2/Speed columns present at all - confirmed live
+    # (`' 1    3     absent      '`) - so the row above never matches it.
+    # Same bug shape as the PSU fix below: the row being silently dropped
+    # from `out["fans"]` meant `s4048_fan_status` just held its last-known
+    # "up" reading forever, so pulling a fan tray produced no alarm at all
+    # despite `s4048_fan_status == 0` being exactly the rule meant to catch
+    # this. Treated as both fans down (0 RPM) - "absent" is a strictly
+    # worse cooling state than "down" (there's nothing there to fail back
+    # to), so it must alert at least as readily.
+    for m in re.finditer(r"^\s*(\d+)\s+(\d+)\s+absent\s*$", text, re.MULTILINE):
+        unit, bay = m.groups()
+        out["fans"].append(
+            {
+                "unit": unit,
+                "bay": bay,
+                "tray_status": "absent",
+                "fan1_status": "down",
+                "fan1_rpm": 0,
+                "fan2_status": "down",
+                "fan2_rpm": 0,
+            }
+        )
+
     # Type is `AC`/`DC` when the PSU is up, but confirmed live: a PSU that's
     # down or removed reports Type `UNKNOWN` instead - the device stops
     # being able to identify it, but the row is still there. An earlier

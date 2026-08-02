@@ -21,7 +21,7 @@ groups:
       summary: Fan {{ $labels.fan }} down (unit {{ $labels.unit }}, bay {{ $labels.bay
         }})
       description: show environment reports this fan as down.
-    for: 120s
+    for: 10s
   - alert: S4048InterfaceFlapping
     expr: changes(s4048_interface_up[15m]) > 4
     labels:
@@ -38,7 +38,7 @@ groups:
       summary: PSU {{ $labels.unit }}/{{ $labels.bay }} down
       description: show environment reports this power supply as down - if the other
         PSU is also degraded this is a single point of failure.
-    for: 120s
+    for: 10s
   - alert: S4048TransceiverAlarm
     expr: s4048_transceiver_alarm == 1 and on(port) s4048_interface_up == 1
     labels:
@@ -48,4 +48,4 @@ groups:
       description: The optic's own DOM alarm bit is set (show interfaces transceiver)
         on a link that's currently up - Rx/Tx power, temperature, voltage, or bias
         current is outside the vendor's programmed threshold for this specific optic.
-    for: 300s
+    for: 120s

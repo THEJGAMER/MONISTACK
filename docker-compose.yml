@@ -4,6 +4,16 @@ services:
     container_name: s4048-exporter
     restart: unless-stopped
     env_file: .env
+    environment:
+      # 10s, down from the 30s default (2026-08-02) - confirmed live via
+      # s4048_scrape_duration_seconds{section="fast"} that one poll cycle
+      # (CPU/memory/fan/PSU/interfaces - NOT the separate slow transceiver
+      # scrape) only takes ~0.46s, so there's ample headroom. Real PSU-pull
+      # test showed ~90s from the physical event to Switchboard even
+      # showing "pending" - this was the largest single piece of that
+      # (stacked with Prometheus's scrape_interval and evaluation_interval,
+      # both tightened alongside this - see prometheus/prometheus.yml).
+      FAST_POLL_INTERVAL: "10"
     ports:
       - "9101:9101"
 

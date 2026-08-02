@@ -166,6 +166,49 @@ export const submitSetup = (body) =>
   });
 
 export const getAlerts = () => api("/api/alerts");
+export const getLiveAlerts = () => api("/api/alerts/live");
+export const getAlertsOverview = () => api("/api/alerts/overview");
+export const getAuditLog = (limit = 200) => api(`/api/audit-log?limit=${limit}`);
+
+// Alarm occurrences - one record per fired-to-resolved episode, each with
+// its own id and its own shareable URL. Occurrences of the same alarm are
+// linked (previous_occurrences) rather than merged.
+export const getAlarms = (limit = 200, signature) =>
+  api(`/api/alarms?limit=${limit}${signature ? `&signature=${encodeURIComponent(signature)}` : ""}`);
+export const getAlarm = (id) => api(`/api/alarms/${id}`);
+export const ackAlarm = (id, note) =>
+  api(`/api/alarms/${id}/ack`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note: note || null }),
+  });
+export const unackAlarm = (id) => api(`/api/alarms/${id}/unack`, { method: "POST" });
+export const resolveAlarm = (id) => api(`/api/alarms/${id}/resolve`, { method: "POST" });
+
+// Paging control for one occurrence (see paging.py).
+export const pageNow = (id) => api(`/api/alarms/${id}/page-now`, { method: "POST" });
+export const delayPage = (id, seconds) =>
+  api(`/api/alarms/${id}/delay-page`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ seconds }),
+  });
+export const nargAlarm = (id, note) =>
+  api(`/api/alarms/${id}/narg`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note: note || null }),
+  });
+export const enablePaging = (id) => api(`/api/alarms/${id}/enable-paging`, { method: "POST" });
+export const addComment = (id, body) =>
+  api(`/api/alarms/${id}/comments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+export const deleteComment = (id, commentId) =>
+  api(`/api/alarms/${id}/comments/${commentId}`, { method: "DELETE" });
+
 export const listSilences = () => api("/api/silences");
 export const createSilence = (body) =>
   api("/api/silences", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

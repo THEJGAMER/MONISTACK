@@ -104,6 +104,13 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     enabled INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
 );
+-- Added after alert_rules already shipped (same catch-up pattern as
+-- interface_alert_rules.severity above) - how long this specific rule's
+-- alarms are held before paging (see paging.py), overriding the app-wide
+-- PAGE_DELAY_SECONDS default. NULL means "use the app-wide default", not
+-- "page instantly" - a rule that has never had this touched should not
+-- silently start paging immediately once the column exists.
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS page_delay_seconds INTEGER;
 
 -- Per-interface down-alerting config (ROADMAP 3.2's Interfaces tab) -
 -- unlike prometheus/alerts.yml's fleet-wide rules, this is genuinely
@@ -151,6 +158,135 @@ CREATE TABLE IF NOT EXISTS alert_history (
     received_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_alert_history_received ON alert_history(received_at DESC);
+-- Added after alert_history already shipped (same catch-up pattern as
+-- interface_alert_rules.severity above). Lets a history row be correlated
+-- with the acknowledgement/audit records for the same alert identity,
+-- which are keyed by fingerprint rather than by the (mutable) summary text.
+ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS fingerprint TEXT;
+CREATE INDEX IF NOT EXISTS idx_alert_history_fingerprint ON alert_history(fingerprint);
+
+-- One row per *occurrence* of an alarm: a single fired-to-resolved
+-- episode, with its own id. This is the unit everything else hangs off,
+-- and the reason is record-keeping: if a port flaps four times, that is
+-- four separate things that happened, each with its own acknowledgement,
+-- its own discussion and its own audit trail. Collapsing them into one
+-- long-lived row per alarm signature loses that separation - you can no
+-- longer say who handled the second occurrence versus the fourth.
+--
+-- `signature` is the label-set fingerprint (alert_acks.fingerprint_for).
+-- It deliberately does NOT identify the occurrence; it groups occurrences
+-- of the same underlying alarm so a new one can link back to its
+-- predecessors, the way a ticketing system opens a fresh ticket and
+-- references the previous ones rather than reopening a closed one.
+--
+-- Rows are created and closed from the Alertmanager webhook
+-- (app.py's /api/alertmanager/webhook), which every alert path in this
+-- app already funnels through - both Prometheus rules and the
+-- directly-posted per-interface alerts.
+CREATE TABLE IF NOT EXISTS alert_occurrences (
+    id BIGSERIAL PRIMARY KEY,
+    signature TEXT NOT NULL,
+    alertname TEXT NOT NULL,
+    severity TEXT,
+    summary TEXT,
+    labels TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_occurrences_signature ON alert_occurrences(signature, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_occurrences_started ON alert_occurrences(started_at DESC);
+-- At most one open occurrence per signature: a second "firing" for an
+-- alarm that is already open is the same episode being re-notified
+-- (Alertmanager repeat_interval, or this app's own heartbeat), not a new
+-- one. Enforced in the database rather than only in code, because the
+-- webhook can be delivered concurrently.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_occurrences_one_open
+    ON alert_occurrences(signature) WHERE resolved_at IS NULL;
+
+-- Paging control (see paging.py). An alarm is held back from paging for a
+-- short investigation window rather than paging the instant it fires:
+--   page_at         when the hold lifts and it pages (NULL = already paged)
+--   paged_at        when it actually paged
+--   paging_disabled operator turned paging off for this occurrence (NARG)
+--   silence_id      the Alertmanager silence currently holding it back
+-- The hold is an Alertmanager silence, not a Switchboard-side queue, so
+-- Alertmanager remains the thing that actually delivers pages: if
+-- Switchboard is down, no hold gets created and the alarm pages
+-- immediately. The failure mode is "pages sooner than you wanted", never
+-- "never pages", which is the right way round for a pager.
+ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS page_at TEXT;
+ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS paged_at TEXT;
+ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS paging_disabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS silence_id TEXT;
+
+-- Acknowledgement of a single occurrence (not of the alarm in general):
+-- acknowledging today's flap says nothing about tomorrow's, which is the
+-- whole point of keeping occurrences separate. Deliberately NOT a
+-- silence - the alarm keeps firing and still notifies on state changes;
+-- an ack only records that a human has taken it.
+CREATE TABLE IF NOT EXISTS alarm_acks (
+    occurrence_id BIGINT PRIMARY KEY REFERENCES alert_occurrences(id) ON DELETE CASCADE,
+    acked_by TEXT NOT NULL,
+    acked_at TEXT NOT NULL,
+    note TEXT
+);
+
+-- Audit/event log: every operator-initiated mutation in the app (alert
+-- ack/unack/manual resolve, silence create/expire, alert-rule and
+-- interface-alert config changes), with who did it and when. Distinct
+-- from alert_history, which records what the *system* did (notifications
+-- Alertmanager sent); this records what *people* did, which is the half
+-- that was previously only visible in container logs.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    ts TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT,
+    detail TEXT,
+    fingerprint TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts DESC);
+-- Alert-related audit entries carry the alert's fingerprint so one alarm's
+-- entire operator timeline (acks, notes, manual resolves) can be pulled by
+-- alarm identity - this is what makes the per-alarm "ticket" view possible
+-- without scanning and re-hashing every row's detail JSON. NULL for entries
+-- that aren't about a specific alert (rule/config changes).
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS fingerprint TEXT;
+CREATE INDEX IF NOT EXISTS idx_audit_log_fingerprint ON audit_log(fingerprint);
+
+-- Discussion thread on a single alarm (the Communication tab) - the
+-- human back-and-forth while an incident is being worked, kept separate
+-- from audit_log on purpose. audit_log answers "who changed what, and
+-- can I trust this record" and is append-only; this is conversation,
+-- where being able to delete your own typo is normal and expected.
+-- Mixing them would mean either an audit trail with holes in it or a
+-- discussion nobody can correct. Keyed by fingerprint (see alert_acks.py)
+-- so a thread follows one specific alarm across every recurrence, which
+-- is what makes a shared link to it useful to a colleague.
+CREATE TABLE IF NOT EXISTS alarm_comments (
+    id BIGSERIAL PRIMARY KEY,
+    occurrence_id BIGINT NOT NULL REFERENCES alert_occurrences(id) ON DELETE CASCADE,
+    author TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alarm_comments_occurrence ON alarm_comments(occurrence_id, created_at);
+
+-- Ties an audit entry to the specific occurrence it was about, so one
+-- occurrence's operator history can be pulled without dragging in every
+-- other occurrence of the same alarm. `fingerprint` (the signature) stays
+-- alongside it for signature-wide queries.
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS occurrence_id BIGINT;
+CREATE INDEX IF NOT EXISTS idx_audit_log_occurrence ON audit_log(occurrence_id);
+
+-- Superseded by the occurrence-scoped tables above, which arrived in the
+-- same change - these were keyed by signature, which is exactly the
+-- collapsing this redesign exists to undo. Dropped rather than left
+-- behind so there is one obvious place acknowledgements and comments
+-- live; both were empty at the point of the switch.
+DROP TABLE IF EXISTS alert_acks;
+DROP TABLE IF EXISTS alert_comments;
 """
 
 

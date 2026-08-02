@@ -4,12 +4,18 @@ alerts.yml becomes a *generated* file from here on - Prometheus itself
 still needs an actual file on disk to load rules from, this module just
 owns writing it and telling Prometheus to reload.
 
-Only `severity` (which drives Pushover priority via alertmanager.yml's
-`{{ if eq .CommonLabels.severity "critical" }}...` template) and
-`enabled` are editable from the UI. `expr`/`for_seconds` are not: a
-PromQL typo has no pre-flight validation before Prometheus rejects the
-whole rules file at reload time, which is a worse failure mode than a
+`severity` (drives Pushover priority via alertmanager.yml's
+`{{ if eq .CommonLabels.severity "critical" }}...` template), `enabled`,
+`for_seconds` (how long the condition must hold before Prometheus counts
+it as firing - the "pending" window shown on the Alerts/Alarms pages),
+and `page_delay_seconds` (how long this rule's alarms are held before
+paging - see paging.py) are editable from the UI. `expr` is not: a PromQL
+typo has no pre-flight validation before Prometheus rejects the whole
+rules file at reload time, which is a worse failure mode than a
 slightly-wrong severity label - see README/ROADMAP for the reasoning.
+`for_seconds` doesn't carry that risk (it's a plain integer formatted as
+`f"{n}s"` in render_yaml, not PromQL Prometheus has to parse), so it's
+safe to expose the same way severity/enabled already are.
 """
 import logging
 import urllib.error
@@ -91,17 +97,48 @@ class AlertRuleStore:
         rows = self.db.query("SELECT * FROM alert_rules ORDER BY name")
         return [self._to_dict(r) for r in rows]
 
-    def update(self, name, severity=None, enabled=None):
+    def update(self, name, severity=None, enabled=None, for_seconds=None,
+               page_delay_seconds=None, clear_page_delay=False):
         if severity is not None:
             if severity not in ("warning", "critical"):
                 raise ValueError("severity must be 'warning' or 'critical'")
             self.db.execute("UPDATE alert_rules SET severity = %s, updated_at = %s WHERE name = %s",
                              (severity, datetime.now(timezone.utc).isoformat(), name))
+        if for_seconds is not None:
+            # Unlike page_delay_seconds, there's no "app-wide default" to
+            # fall back to here - every rule always has a real for_seconds
+            # value (0 is valid and means "fire the instant the condition
+            # is true, no confirmation window"), so this is a plain bounded
+            # integer update, not a nullable override.
+            if for_seconds < 0 or for_seconds > 86400:
+                raise ValueError("for_seconds must be between 0 and 86400")
+            self.db.execute("UPDATE alert_rules SET for_seconds = %s, updated_at = %s WHERE name = %s",
+                             (for_seconds, datetime.now(timezone.utc).isoformat(), name))
         if enabled is not None:
             self.db.execute("UPDATE alert_rules SET enabled = %s, updated_at = %s WHERE name = %s",
                              (1 if enabled else 0, datetime.now(timezone.utc).isoformat(), name))
+        if clear_page_delay:
+            # Explicit "go back to the app-wide default" - distinct from
+            # page_delay_seconds=0, which means "page this rule instantly".
+            self.db.execute("UPDATE alert_rules SET page_delay_seconds = NULL, updated_at = %s WHERE name = %s",
+                             (datetime.now(timezone.utc).isoformat(), name))
+        elif page_delay_seconds is not None:
+            if page_delay_seconds < 0 or page_delay_seconds > 86400:
+                raise ValueError("page_delay_seconds must be between 0 and 86400")
+            self.db.execute("UPDATE alert_rules SET page_delay_seconds = %s, updated_at = %s WHERE name = %s",
+                             (page_delay_seconds, datetime.now(timezone.utc).isoformat(), name))
         row = self.db.query_one("SELECT * FROM alert_rules WHERE name = %s", (name,))
         return self._to_dict(row) if row else None
+
+    def page_delay_for(self, name, default_seconds):
+        """The paging-hold duration for one rule by name - its own
+        page_delay_seconds if set, else the app-wide default. Used by
+        paging.py at the moment a hold is placed, so a per-rule override
+        takes effect on the very next alarm without any other wiring."""
+        row = self.db.query_one("SELECT page_delay_seconds FROM alert_rules WHERE name = %s", (name,))
+        if row is None or row["page_delay_seconds"] is None:
+            return default_seconds
+        return row["page_delay_seconds"]
 
     @staticmethod
     def _to_dict(row):
@@ -113,6 +150,7 @@ class AlertRuleStore:
             "summary_template": row["summary_template"],
             "description_template": row["description_template"],
             "enabled": bool(row["enabled"]),
+            "page_delay_seconds": row["page_delay_seconds"],
             "updated_at": row["updated_at"],
         }
 

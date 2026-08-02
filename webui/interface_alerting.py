@@ -267,17 +267,16 @@ class InterfaceAlertChecker:
         self._last_syslog_ts_ns = newest_seen
 
     def reconcile_via_poll(self, configs, get_state_and_polled_at, device_name_for, alertmanager):
-        """Safety net for currently-alerting immediate-mode ports, run on
-        a tight ~5s loop (see app.py): if a *fresh* status-poller SSH poll
-        (status_poller.py's own independent 30s cycle) shows the port
-        genuinely up, resolves the alert. Exists specifically for what
-        check_via_syslog can't cover on its own - a missed/dropped syslog
-        "up" event (Vector hiccup, a Loki ingestion gap) would otherwise
-        leave an alert stuck firing forever, since resolve is normally
-        syslog's exclusive job for immediate mode (see check_once's
-        docstring for why a bare "trust whatever's polled" design was
-        removed in the first place: a *stale* read can falsely resolve a
-        real ongoing outage).
+        """Safety net for immediate-mode ports, run on a tight ~5s loop
+        (see app.py): if a *fresh* status-poller SSH poll (status_poller.py's
+        own independent 30s cycle) shows the port genuinely up, resolves
+        the alert. Exists specifically for what check_via_syslog can't
+        cover on its own - a missed/dropped syslog "up" event (Vector
+        hiccup, a Loki ingestion gap) would otherwise leave an alert stuck
+        firing forever, since resolve is normally syslog's exclusive job
+        for immediate mode (see check_once's docstring for why a bare
+        "trust whatever's polled" design was removed in the first place:
+        a *stale* read can falsely resolve a real ongoing outage).
 
         The safety here is in what counts as "fresh": each config's
         last-considered `last_polled` timestamp is tracked, and a resolve
@@ -288,13 +287,28 @@ class InterfaceAlertChecker:
         began (the `_last_seen_poll_at` entry for a key is cleared every
         time that key starts a fresh alerting episode, in both check_once
         and check_via_syslog) - so this doesn't reopen the original
-        stale-read hazard, it only reacts to genuinely new information."""
+        stale-read hazard, it only reacts to genuinely new information.
+
+        Deliberately does NOT require `key in self._alerting` any more
+        (confirmed live this was a real bug, not just theoretical): this
+        module's tracking state is in-memory only and is wiped on every
+        webui restart (see class docstring). A restart mid-outage orphaned
+        a real, still-active Alertmanager alert - nothing resolved it or
+        kept it heartbeating, so it sat firing (paging PagerDuty) for
+        several extra minutes past the port's real ~30s recovery, until
+        Alertmanager's own resolve_timeout silently expired it. Now this
+        loop treats a fresh poll as ground truth regardless of what our
+        bookkeeping thinks: an unexpectedly-up port gets resolved (a
+        resolve for an alert Alertmanager doesn't have active is a safe
+        no-op), and an unexpectedly-down port gets its fire/heartbeat
+        bookkeeping re-established, so a lost-state restart converges back
+        to reality within one poll cycle instead of drifting until either
+        a fresh syslog event or a 5-minute timeout happens to fix it."""
+        now = time.monotonic()
         for cfg in configs:
             if not cfg["enabled"] or cfg["mode"] != "immediate":
                 continue
             key = (cfg["device_id"], cfg["port"])
-            if key not in self._alerting:
-                continue
             state, polled_at = get_state_and_polled_at(cfg["device_id"], cfg["port"])
             if polled_at is None or state is None:
                 continue
@@ -302,26 +316,127 @@ class InterfaceAlertChecker:
                 continue  # same snapshot as last check - nothing new learned
             self._last_seen_poll_at[key] = polled_at
             if state != "down":
+                if key in self._alerting:
+                    log.info(
+                        "interface alert reconciled via poll (missed syslog up?): %s/%s",
+                        cfg["device_id"], cfg["port"],
+                    )
+                    self._resolve(cfg, alertmanager, device_name_for)
+                    self._alerting.discard(key)
+                    self._down_since.pop(key, None)
+                    self._last_posted.pop(key, None)
+                    self._last_seen_poll_at.pop(key, None)
+            elif key not in self._alerting:
                 log.info(
-                    "interface alert reconciled via poll (missed syslog up?): %s/%s",
+                    "interface alert re-armed via poll (state lost, e.g. restart): %s/%s",
                     cfg["device_id"], cfg["port"],
                 )
-                self._resolve(cfg, alertmanager, device_name_for)
-                self._alerting.discard(key)
-                self._down_since.pop(key, None)
-                self._last_posted.pop(key, None)
-                self._last_seen_poll_at.pop(key, None)
+                self._down_since.setdefault(key, now)
+                self._fire(cfg, alertmanager, device_name_for, 0)
+                self._alerting.add(key)
+                self._last_posted[key] = now
 
-    def _fire(self, cfg, alertmanager, device_name_for, down_for, log_it=True):
-        starts_at = datetime.now(timezone.utc).isoformat()
-        try:
-            alertmanager.post_alerts([{
+    def forget(self, device_id, port):
+        """Drops all tracking for one port, so a manual resolve from the UI
+        (app.py's /api/alerts/resolve) isn't immediately undone by this
+        module's own heartbeat re-posting the alert it just cleared.
+
+        Note this does not, and should not, *suppress* the port: if it's
+        genuinely still down, the next fresh poll re-arms it via
+        reconcile_via_poll and it fires again. Manually resolving a real,
+        ongoing fault is meant to be temporary - the tool for "stop telling
+        me about this known problem" is a maintenance window (silence),
+        which is time-boxed and leaves an auditable reason, rather than a
+        one-click way to permanently hide a live fault."""
+        key = (device_id, port)
+        self._alerting.discard(key)
+        self._down_since.pop(key, None)
+        self._last_posted.pop(key, None)
+        self._last_seen_poll_at.pop(key, None)
+
+    def pending_entries(self, configs, device_name_for):
+        """Delayed-mode ports currently counting down toward their
+        `delay_seconds` confirmation window (down, but not yet fired) - the
+        interface-alerting equivalent of a Prometheus rule's "pending"
+        state (see app.py's /api/alerts/live, which surfaces both so a
+        currently-down-but-not-yet-alerted condition is visible in the UI
+        instead of looking like nothing is happening, the exact confusion
+        that came up over a Prometheus rule's own pending window). Immediate
+        mode has no pending phase - it fires the instant a down event is
+        seen - so this only ever reports delayed-mode configs."""
+        now = time.monotonic()
+        out = []
+        for cfg in configs:
+            if not cfg["enabled"] or cfg["mode"] != "delayed":
+                continue
+            key = (cfg["device_id"], cfg["port"])
+            if key in self._alerting or key not in self._down_since:
+                continue
+            down_for = now - self._down_since[key]
+            if down_for >= cfg["delay_seconds"]:
+                continue  # about to fire on the next check_once tick
+            out.append({
                 "labels": {
                     "alertname": "InterfaceDown",
                     "device_id": cfg["device_id"],
                     "port": cfg["port"],
                     "severity": cfg["severity"],
                 },
+                "annotations": {
+                    "summary": f"{cfg['port']} on {device_name_for(cfg['device_id'])} is down",
+                    "description": f"Down for {int(down_for)}s - alerts at {cfg['delay_seconds']}s if it doesn't recover first.",
+                },
+                "status": {"state": "pending"},
+                "startsAt": datetime.now(timezone.utc).isoformat(),
+            })
+        return out
+
+    def reseed_from_alertmanager(self, alertmanager):
+        """Called once at process startup (see app.py) - repopulates
+        `_alerting`/`_down_since`/`_last_posted` from whatever InterfaceDown
+        alerts are genuinely still active in Alertmanager right now, so a
+        webui restart doesn't leave those alerts orphaned (heartbeat-less
+        and untracked) until reconcile_via_poll's next fresh-poll tick or a
+        new syslog event happens to rediscover them. Best-effort: if
+        Alertmanager isn't reachable yet at startup, the self-healing in
+        reconcile_via_poll (and check_via_syslog for a fresh down/up event)
+        still converges on its own within one poll cycle - this just makes
+        the common case (Alertmanager already up) instant instead of
+        leaving a real alert briefly unheartbeated after every restart."""
+        try:
+            alerts = alertmanager.list_alerts()
+        except Exception:
+            log.warning("could not reseed interface-alert state from Alertmanager", exc_info=True)
+            return
+        now = time.monotonic()
+        seeded = 0
+        for alert in alerts or []:
+            labels = alert.get("labels", {})
+            if labels.get("alertname") != "InterfaceDown":
+                continue
+            if alert.get("status", {}).get("state") != "active":
+                continue
+            key = (labels.get("device_id"), labels.get("port"))
+            if None in key:
+                continue
+            self._alerting.add(key)
+            self._down_since.setdefault(key, now)
+            self._last_posted[key] = now
+            seeded += 1
+        if seeded:
+            log.info("interface alert state reseeded from Alertmanager: %d alert(s) still active", seeded)
+
+    def _fire(self, cfg, alertmanager, device_name_for, down_for, log_it=True):
+        starts_at = datetime.now(timezone.utc).isoformat()
+        labels = {
+            "alertname": "InterfaceDown",
+            "device_id": cfg["device_id"],
+            "port": cfg["port"],
+            "severity": cfg["severity"],
+        }
+        try:
+            alertmanager.post_alerts([{
+                "labels": labels,
                 "annotations": {
                     "summary": f"{cfg['port']} on {device_name_for(cfg['device_id'])} is down",
                     "description": (

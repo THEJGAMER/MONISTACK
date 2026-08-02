@@ -45,6 +45,28 @@ def test_parse_environment_psu_down_reports_type_unknown():
     assert down["power_watts"] == 0
 
 
+def test_parse_environment_fan_absent_reports_both_fans_down():
+    """Regression test for a real bug: a physically removed fan tray
+    reports TrayStatus `absent` with none of the Fan1/Speed/Fan2/Speed
+    columns present at all - a fixture captured live from a real fan-tray
+    pull on the S4048 (bay 3). The regex used to only match rows with all
+    five up|down/speed fields, which silently dropped this row entirely
+    (so `s4048_fan_status{bay="3",...}` in the exporter went stale at its
+    last "up" reading instead of ever reflecting the removal, and
+    S4048FanDown never fired despite the tray being physically gone)."""
+    env = parsers.parse_environment(load_fixture("environment_fan_absent.txt"))
+    assert len(env["fans"]) == 3
+    absent = next(f for f in env["fans"] if f["bay"] == "3")
+    assert absent["tray_status"] == "absent"
+    assert absent["fan1_status"] == "down"
+    assert absent["fan1_rpm"] == 0
+    assert absent["fan2_status"] == "down"
+    assert absent["fan2_rpm"] == 0
+    # The other two trays are genuinely fine and must not be affected.
+    still_up = [f for f in env["fans"] if f["bay"] != "3"]
+    assert all(f["fan1_status"] == "up" and f["fan2_status"] == "up" for f in still_up)
+
+
 def test_parse_interfaces_status():
     rows = parsers.parse_interfaces_status(load_fixture("interfaces_status.txt"))
     assert len(rows) == 54

@@ -1,5 +1,16 @@
 global:
   scrape_interval: 30s
+  # Explicit, down from Prometheus's own default of 1m (2026-08-02) - this
+  # was never set before, and turned out to be the single largest piece of
+  # a real, measured detection-latency complaint: a physically pulled PSU
+  # took ~90s to even reach Switchboard's "pending" state despite the
+  # switch's syslog reporting it immediately, because a rule whose
+  # underlying metric changes the instant after an evaluation tick has to
+  # wait for the *next* tick - up to a full 1m - before Prometheus even
+  # notices. 15s bounds that same worst case to 15s instead. Confirmed via
+  # /api/v1/status/config that '1m' was the real effective value, not a
+  # guess from documentation.
+  evaluation_interval: 15s
 
 alerting:
   alertmanagers:
@@ -11,6 +22,13 @@ rule_files:
 
 scrape_configs:
   - job_name: s4048
+    # 10s, down from the global 30s default (2026-08-02, same investigation
+    # as evaluation_interval above) - matched to the exporter's own new
+    # FAST_POLL_INTERVAL (docker-compose.yml) so this scrape isn't itself
+    # the bottleneck once the exporter is updating that fast. A single
+    # scrape of this exporter is a handful of already-in-memory gauge
+    # values, not a new SSH round trip - negligible cost at this cadence.
+    scrape_interval: 10s
     static_configs:
       - targets: ["s4048-exporter:9101"]
 

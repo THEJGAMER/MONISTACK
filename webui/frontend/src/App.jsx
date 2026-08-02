@@ -24,6 +24,7 @@ const BulkRunPage = lazy(() => import("./BulkRunPage.jsx"));
 const SchedulesPage = lazy(() => import("./SchedulesPage.jsx"));
 const CompliancePage = lazy(() => import("./CompliancePage.jsx"));
 const AlertsPage = lazy(() => import("./AlertsPage.jsx"));
+const AlarmsPage = lazy(() => import("./AlarmsPage.jsx"));
 
 function PageFallback() {
   return (
@@ -35,6 +36,32 @@ function PageFallback() {
 
 let flashId = 0;
 
+/**
+ * Real hash routing, replacing the plain useState this app used to keep the
+ * current page in. Two things that only work with the URL as the source of
+ * truth: pasting a link to a specific alarm actually opens that alarm for
+ * whoever you sent it to, and the browser's back button works. Previously
+ * the initial hash was ignored entirely, so every deep link silently landed
+ * on the Console.
+ */
+function useHashRoute() {
+  const read = () => window.location.hash || "#/console";
+  const [href, setHref] = useState(read);
+  useEffect(() => {
+    const onChange = () => setHref(read());
+    window.addEventListener("hashchange", onChange);
+    return () => window.removeEventListener("hashchange", onChange);
+  }, []);
+  const navigate = useCallback((next) => {
+    // Assigning to location.hash fires hashchange, which updates state; the
+    // else-branch covers navigating to where we already are (a no-op for
+    // the browser, but callers still expect a render).
+    if (window.location.hash !== next) window.location.hash = next;
+    else setHref(next);
+  }, []);
+  return [href, navigate];
+}
+
 function usePreference(key, defaultValue) {
   const [value, setValue] = useState(() => localStorage.getItem(key) || defaultValue);
   useEffect(() => {
@@ -44,7 +71,7 @@ function usePreference(key, defaultValue) {
 }
 
 export default function App() {
-  const [activeHref, setActiveHref] = useState("#/console");
+  const [activeHref, setActiveHref] = useHashRoute();
   const [devices, setDevices] = useState([]);
   const [commandTree, setCommandTree] = useState([]);
   const [flashes, setFlashes] = useState([]);
@@ -126,26 +153,23 @@ export default function App() {
     })();
   }, [configured, pushFlash]);
 
-  const page =
-    activeHref === "#/devices"
-      ? "devices"
-      : activeHref === "#/results"
-      ? "results"
-      : activeHref === "#/topology"
-      ? "topology"
-      : activeHref === "#/trends"
-      ? "trends"
-      : activeHref === "#/bulk-run"
-      ? "bulk-run"
-      : activeHref === "#/schedules"
-      ? "schedules"
-      : activeHref === "#/compliance"
-      ? "compliance"
-      : activeHref === "#/alerts"
-      ? "alerts"
-      : activeHref === "#/settings"
-      ? "settings"
-      : "console";
+  // "#/alarms/6da766d164443d00" -> section "alarms", param "6da766d164443d00".
+  // Only the Alarms page takes a path parameter today; everything else is a
+  // bare section, so unknown sections still fall through to the Console.
+  const [section, routeParam] = activeHref.replace(/^#\/?/, "").split("/");
+  const KNOWN_PAGES = [
+    "devices",
+    "results",
+    "topology",
+    "trends",
+    "bulk-run",
+    "schedules",
+    "compliance",
+    "alerts",
+    "alarms",
+    "settings",
+  ];
+  const page = KNOWN_PAGES.includes(section) ? section : "console";
   const pageTitles = {
     console: "Console",
     devices: "Devices",
@@ -156,8 +180,19 @@ export default function App() {
     schedules: "Schedules",
     compliance: "Compliance",
     alerts: "Alerts",
+    alarms: "Alarms",
     settings: "Settings",
   };
+  // A deep-linked alarm gets its own breadcrumb level, so someone who
+  // arrives from a pasted link can see where they are and get back to the
+  // full list without knowing the URL scheme.
+  const breadcrumbs = [
+    { text: "Switchboard", href: "#/console" },
+    { text: pageTitles[page], href: page === "alarms" ? "#/alarms" : activeHref },
+  ];
+  if (page === "alarms" && routeParam) {
+    breadcrumbs.push({ text: routeParam, href: activeHref });
+  }
 
   if (configured === null) {
     return null;
@@ -218,6 +253,7 @@ export default function App() {
               { type: "link", text: "Schedules", href: "#/schedules" },
               { type: "link", text: "Compliance", href: "#/compliance" },
               { type: "link", text: "Alerts", href: "#/alerts" },
+              { type: "link", text: "Alarms", href: "#/alarms" },
               { type: "divider" },
               { type: "link", text: "Settings", href: "#/settings" },
             ]}
@@ -225,10 +261,11 @@ export default function App() {
         }
         breadcrumbs={
           <BreadcrumbGroup
-            items={[
-              { text: "Switchboard", href: "#/console" },
-              { text: pageTitles[page], href: activeHref },
-            ]}
+            items={breadcrumbs}
+            onFollow={(e) => {
+              e.preventDefault();
+              setActiveHref(e.detail.href);
+            }}
           />
         }
         notifications={<Flashbar items={flashes} />}
@@ -259,6 +296,12 @@ export default function App() {
                 <CompliancePage pushFlash={pushFlash} />
               ) : page === "alerts" ? (
                 <AlertsPage devices={devices} pushFlash={pushFlash} />
+              ) : page === "alarms" ? (
+                <AlarmsPage
+                  fingerprint={routeParam || null}
+                  pushFlash={pushFlash}
+                  onNavigate={setActiveHref}
+                />
               ) : (
                 <ConsolePage
                   devices={devices}

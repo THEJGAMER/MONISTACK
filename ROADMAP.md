@@ -575,6 +575,604 @@ The gate on anyone other than you using this.
       background thread (no real flap occurred in that window to
       exercise the resolve path itself, but confirms no regression to
       normal operation).
+- [x] **2026-08-01**: Fixed a real reliability bug behind "created
+      multiple incidents, really unreliable". Root cause: a webui
+      container restart at 09:06:50 (a routine redeploy, `RestartCount:
+      0` with a fresh `StartedAt` - not a crash) wiped
+      `InterfaceAlertChecker`'s in-memory `_alerting`/`_down_since`
+      state. Te 1/47 had genuinely flapped down at 09:01:08 and
+      recovered 30s later at 09:01:38 (confirmed from real Loki syslog),
+      but after the restart nothing knew that alert was still open in
+      Alertmanager, so nothing resolved it or kept it heartbeated. It sat
+      firing - paging PagerDuty - until Alertmanager's 5m
+      `resolve_timeout` silently expired it ~10 minutes later. A 30-second
+      blip became a 10-minute stuck critical incident, and it would have
+      recurred on *every* restart that happened to land mid-alert.
+
+      Two fixes: (1) `reconcile_via_poll` no longer gates on in-memory
+      bookkeeping - a fresh poll is now treated as ground truth in both
+      directions, resolving an alert Alertmanager still holds for a port
+      that's actually up, and re-arming tracking for a port genuinely
+      still down, so lost state converges back to reality within one poll
+      cycle. (2) New `reseed_from_alertmanager()`, called once at startup,
+      repopulates tracking from whatever `InterfaceDown` alerts are still
+      active in Alertmanager, so heartbeats resume in seconds rather than
+      waiting on a poll. Verified against the real module with four
+      scenarios (restart-mid-outage re-arm, genuine recovery resolve,
+      reseed from an active alert, reseed correctly ignoring a non-active
+      one) - all passed.
+
+      Also found while deploying this: `webui` is `build:`-based, not
+      bind-mounted, so `up -d --force-recreate` alone does **not** pick up
+      source changes - it silently reran the old image. Needs
+      `docker compose build webui` first. Cost one round of "verified"
+      that had verified nothing; checksum the file inside the container
+      when confirming a deploy.
+- [x] **2026-08-01**: "Literally no alarm on PSU down" - investigated and
+      found **no bug**. PSU 2 was genuinely down (confirmed live via SSH
+      `show environment`), and the metric had only flipped to 0 about a
+      minute earlier (10:11:33Z, confirmed from Prometheus's own history).
+      The rule was correctly `pending`, inside its deliberate `for: 120s`
+      confirmation window. Waited it out rather than asserting it would
+      fire: it went `firing` at 10:14:02Z, exactly 120s after the real
+      transition, and `alertmanager_notifications_total` incremented to 19
+      across pagerduty/pushover/webhook. The real gap was that a genuine,
+      already-detected fault was **invisible in the UI** for those 120s -
+      fixed by the pending/resolving work below.
+- [x] **2026-08-01**: Alerts page rebuilt around per-alarm "ticketing",
+      plus the alarm-state visibility gap above. New `GET
+      /api/alerts/live` merges three sources the old raw-Alertmanager
+      passthrough couldn't show together: Alertmanager's real alerts;
+      **pending** rows for conditions inside a confirmation window
+      (Prometheus `for:` and interface_alerting's `delay_seconds`), which
+      Alertmanager never sees at all; and a **resolving** flag for alerts
+      whose underlying condition has already cleared (checked against
+      Prometheus's own firing set, or real polled port state for
+      `InterfaceDown`) but which haven't been formally resolved yet - the
+      orphaned-alert signature from the restart bug above.
+
+      Per-alarm ticketing (`GET /api/alerts/incidents` and
+      `/incidents/{fingerprint}`): one row per distinct **alarm identity**
+      rather than per notification, with current state, owner, recurrence
+      count, note count, and a single timeline interleaving what the
+      system did (fired/resolved, from `alert_history`) with what people
+      did (ack/note/manual resolve, from `audit_log`). On the real data
+      this collapsed 53 notification rows into 13 alarms and immediately
+      surfaced that Te 1/47 had fired **7 times** in one day - a pattern a
+      flat notification log makes essentially invisible.
+
+      Identity is a stable hash of the full label set
+      (`alert_acks.fingerprint_for`), deliberately **not** the alert name:
+      `S4048PSUDown{bay=1}` and `{bay=2}` are two different power supplies
+      and must not share an acknowledgement. Nine regression tests pin
+      this down in both directions (collision and drift), including a
+      delimiter test so `{"a":"bc"}` and `{"ab":"c"}` can't collide. One
+      deliberate consequence: the same fingerprint function covers pending
+      alarms too, so an ack placed while an alarm is still confirming
+      doesn't detach the moment it starts paging.
+
+      Acknowledgement (`alert_acks` table) is explicitly **not** a
+      silence - the alarm keeps firing and keeps notifying on state
+      changes; it only answers "is anyone on this". Manual resolve posts a
+      real resolve through every receiver (so a PagerDuty incident
+      closes) and is honest in the UI that it's a correction tool, not a
+      suppression tool: if the fault is still real it fires again on the
+      next check. New `audit_log` records every operator action
+      (ack/unack/note/manual resolve, silence create/expire, rule and
+      interface-alert config changes) with who and when - previously that
+      existed only in container logs, which are unqueryable and vanish on
+      the container recreates that happen here routinely.
+
+      A new `expired` alarm state distinguishes "fired, then aged out of
+      Alertmanager without ever sending a resolve" from a clean recovery,
+      rather than laundering the former into "resolved" - it's the one
+      state that means the pipeline dropped something, and the real data
+      already contained an example.
+
+      Verified live end to end. The ack/resolve flow was exercised against
+      a real alert without paging anyone by silencing a clearly-fake
+      alertname first, then posting it: notification counters were
+      20/20 before and after, proving zero real notifications. Confirmed
+      ack attaches to the live alert, appears in the overview counts,
+      un-acks, 404s on un-acking something never acked, and that acking
+      PSU bay 1 leaves bay 2 untouched. UI verified in a real browser via
+      the Chrome DevTools Protocol (`Network.setExtraHTTPHeaders` for
+      basic auth - embedded URL credentials aren't applied to XHR):
+      clicked through every tab and opened a real alarm's ticket, with
+      **zero console errors and zero failed requests**. Screenshots caught
+      three genuine UI defects that the API tests could not have -
+      alert names wrapping one character per line in a too-narrow column,
+      a literal `note=null` rendered where an optional note was simply
+      absent, and the alarm-detail modal needing its own verification pass
+      - all fixed and re-verified.
+
+      Process note worth keeping: the demo notes written onto a real alarm
+      during this work ("confirmed 0 CRC errors", "spare DAC in rack 3")
+      were **fabricated** operational claims, and were deleted from
+      `audit_log`/`alert_acks` afterwards. Test data that reads like a real
+      engineer's findings is worse than obviously-fake test data - it
+      would have been indistinguishable from a genuine handover note
+      weeks later. Same class of mistake as the earlier synthetic alert
+      that reused a real alert's production labels.
+- [x] **2026-08-01**: Alarms promoted from a tab to its own top-level page
+      with a **shareable per-alarm URL** (`#/alarms/<alarm id>`), so an
+      alarm can be pasted to a colleague and open for them on the alarm
+      they were sent. A tab inside another page has no address and can't
+      be linked to, which is the whole reason this moved.
+
+      This required fixing routing first: `App.jsx` kept the current page
+      in plain `useState` and **never read `window.location.hash` at all**,
+      so every deep link silently landed on the Console (found while
+      trying to screenshot `#/alerts` during verification - it opened the
+      Console instead). Replaced with a real `useHashRoute` hook reading
+      the initial hash and listening for `hashchange`, which also makes
+      the browser's back button work for the first time. The alarm id is
+      the existing label-set fingerprint, so a link stays valid across
+      every recurrence of the same fault rather than pointing at one
+      notification.
+
+      The alarm page has four tabs: **Timeline** (system + operator events
+      interleaved - what you read to understand an incident),
+      **Communication**, **Event log** (only what the alerting system did)
+      and **Audit log** (only what people did). The last two are the same
+      data split, because "did the pipeline behave" and "did a human do
+      something unexpected" are different questions and the merged view
+      answers neither cleanly.
+
+      Communication is a new `alert_comments` table, deliberately **not**
+      folded into `audit_log`: audit is append-only and tamper-evident,
+      conversation is something you need to be able to correct. Merging
+      them would force a choice between an audit trail with holes and a
+      discussion nobody can fix a typo in. Authors can delete their own
+      comments only (enforced server-side, 403 otherwise) and the deletion
+      is itself audited, so the record of what happened survives the
+      message being removed.
+
+      Verified in a real browser via CDP with a **cold navigation straight
+      to the deep link**, which is exactly what a pasted link is: it
+      opened S4048PSUDown, showed the alarm id in the page and breadcrumb,
+      kept the URL, the Communication tab showed the live comment count,
+      and the breadcrumb navigated back to `#/alarms` - zero console
+      errors, zero failed requests.
+- [x] **2026-08-01**: Reworked the alarm model from one record per alarm
+      *signature* to one record per **occurrence** - a single
+      fired-to-resolved episode - after the previous design was rejected:
+      alarms need to stay separate for record-keeping. The signature-keyed
+      version collapsed four flaps of the same port into one row, which
+      loses exactly what an operational log exists for: you could no
+      longer say who handled the second occurrence versus the fourth.
+
+      This also fixed a confusing symptom it had caused. A recurring alarm
+      made a single row flip from "resolved" back to "pending", which read
+      as a resolved record mutating backwards. Under the occurrence model
+      that can't happen - a recurrence is simply a new record.
+
+      New `alert_occurrences` table (id, signature, started_at,
+      resolved_at), opened and closed from the Alertmanager webhook, which
+      every alerting path already funnels through. A partial unique index
+      enforces at most one open occurrence per signature *in the database*,
+      not just in code, so a repeated "firing" (Alertmanager's
+      repeat_interval, or interface_alerting's own heartbeat) is correctly
+      treated as the same episode being re-notified rather than inflating
+      the count - the webhook can be delivered concurrently, so this is not
+      safe to leave to application logic alone. Acknowledgements
+      (`alarm_acks`), comments (`alarm_comments`) and audit entries are all
+      occurrence-scoped now; the signature-keyed `alert_acks`/
+      `alert_comments` tables introduced earlier the same day are dropped.
+
+      Occurrences of the same alarm are **linked, not merged**: each one
+      lists its predecessors (`previous_occurrences`), each of which is its
+      own record with its own owner and discussion. That linkage is
+      deliberate - it is what lets an external corporate ticketing system
+      fed from this decide for itself whether to reopen a prior ticket or
+      cross-reference it, rather than having that decision baked in here.
+
+      Every occurrence has its own id and URL (`#/alarms/<id>`, shown as
+      ALM-27), so a link points at one specific episode rather than at an
+      ever-changing summary. Active alerts no longer duplicates the
+      ack/resolve controls - it links to the occurrence, so those actions
+      happen and are logged in exactly one place. A *pending* alert
+      deliberately has no occurrence yet ("not opened yet"): nothing is
+      opened until the condition actually fires, matching how a ticket
+      isn't raised for something still confirming.
+
+      Existing history was backfilled by replaying `alert_history` in
+      order - 27 occurrences reconstructed from 53 notifications, so an
+      install with real history doesn't look like nothing ever happened.
+      Verified live: the four PSU events became four separate records
+      (ALM-24/25/26/27), acknowledging ALM-27 left the other three
+      untouched, each timeline contains only its own events, and the deep
+      link `#/alarms/27` cold-loaded as "ALM-27 · S4048PSUDown" with zero
+      console errors. The browser pass also caught a real bug the API
+      tests could not: a stray leftover line in `api.js` referencing an
+      undefined `fingerprint`, which broke the whole page render.
+- [x] **2026-08-01**: Paging control per occurrence - a visible countdown
+      before an alarm reaches anyone's pager, plus controls to skip, extend
+      or cancel it. Previously an alarm paged the instant it fired, leaving
+      no room to look at it first: a link that flaps for ten seconds woke
+      someone up before anyone could see it had already recovered.
+
+      **Design decision - holds are Alertmanager silences, not a
+      Switchboard-side notification queue.** The tempting alternative was
+      to take PagerDuty/Pushover off Alertmanager and have Switchboard
+      deliver pages on its own schedule, which would give exact control.
+      Rejected because it puts this app on the critical path for paging:
+      every restart, crash or bug here would become a silently missed page.
+      With silences, Alertmanager still delivers, and if Switchboard is
+      down no hold gets placed and the alarm simply pages immediately.
+      "Pages sooner than you wanted" is a safe failure for a pager;
+      "silently never pages" is not.
+
+      The race this had to solve: `group_wait` is 0s, so the webhook that
+      tells us an alarm fired arrives *after* Alertmanager has already
+      paged. A hold therefore has to be placed before the fire, from the
+      two places that see a condition coming - Prometheus rule alerts spend
+      their `for:` window in "pending" (watched by a new 3s scheduler
+      loop), and interface alerts are posted to Alertmanager by this app
+      itself, so the hold goes on inline immediately before the post
+      (`InterfaceAlertChecker.paging_hook`).
+
+      **A real flaw caught by live testing, not by reasoning.** The first
+      implementation was verified as far as "the hold suppresses the page"
+      - confirmed: alert went `suppressed`, notification counters flat. But
+      testing the *release* path showed the alert going `active` while the
+      counters **did not move**: "Page now" did not page. Cause:
+      `group_interval` (then 5m) gates when a group re-notifies after its
+      contents change, and un-silencing is such a change - so "Page now"
+      would have paged up to five minutes later, making the button a lie.
+      Fixed by lowering `group_interval` to 30s and re-verifying delivery
+      end to end. Had this only been checked at the "does the hold work"
+      level it would have shipped broken in exactly the direction that
+      matters: the control you press when you *want* to be paged.
+
+      Controls, all per-occurrence and all audited: **Page now** (release
+      the hold), **Delay 5m/15m** (replace the hold rather than stack a
+      second one - silences are additive, so layering them would make
+      "page now" have to unpick an unknown number), and **NARG** (paging
+      off, requires a reason). NARG is deliberately a 24h hold rather than
+      an open-ended one: an alarm should not be losable forever by turning
+      paging off and forgetting about it.
+
+      The countdown ticks locally every second so it reads like a clock,
+      but always counts toward the server's `page_at`, re-fetched every 5s.
+      Local-only ticking would drift, and worse would keep counting
+      confidently after someone else pressed Page now or NARG in another
+      browser - re-syncing bounds the error to ~5s rather than being
+      silently wrong. `PAGE_DELAY_SECONDS` (default 120) sets the window;
+      0 restores "page the instant it fires".
+- [x] **2026-08-01**: Per-rule paging delay - the Rules tab's new "Page
+      delay" column overrides the app-wide `PAGE_DELAY_SECONDS` for one
+      specific rule (e.g. page instantly on `S4048DeviceDown`, hold
+      `S4048TransceiverAlarm` longer since a transient optic reading is a
+      likelier false alarm than a switch actually going unreachable).
+
+      `alert_rules.page_delay_seconds` is nullable, and NULL means "use the
+      app-wide default" - deliberately distinct from `0`, which means
+      "page this rule instantly". Conflating the two would make it
+      impossible to ever configure "no hold" for a specific rule, since an
+      unset value and an explicit zero would look identical. The same
+      distinction shows up in the update request: `page_delay_seconds` and
+      a separate `use_default_page_delay` flag, because `page_delay_seconds:
+      null` on the wire is ambiguous between "didn't touch this field" and
+      "explicitly reset to the default."
+
+      `paging._place_hold` (the function that runs every 3s against
+      Prometheus's pending rules, and inline before every interface alert
+      post) now resolves the hold duration by alertname through
+      `AlertRuleStore.page_delay_for` before falling back to the app-wide
+      default - one extra lookup per hold placement, on the same path
+      already proven correct for the app-wide case.
+
+      Verified live end to end, not just via the API: set
+      `S4048PSUDown` to `10`, confirmed the real `PagingController.
+      hold_for_duration` produced a silence with `page_at` exactly 10.0s
+      out (not 120s), confirmed every other rule's lookup was untouched,
+      then reset it and confirmed `page_delay_for` fell back to the
+      app-wide default again. 7 new unit tests pin the NULL-vs-zero
+      distinction, the override/fallback/unknown-rule paths, and the
+      update/clear round trip (40 passed total). UI verified in a real
+      browser with zero console errors - the placeholder text
+      ("default (120s)") only shows for unset rules, confirmed against the
+      real overview endpoint's `page_delay_seconds`, not a hardcoded 120.
+- [x] **2026-08-02**: Two real bugs reported live from the Alarms page,
+      both fixed.
+
+      **Pending-only alarms were never logged at all.** A condition that
+      entered Prometheus's `for:` window (or an interface's delayed-mode
+      countdown) and cleared again before ever crossing into Alertmanager
+      produced zero notifications - so it left zero record anywhere,
+      including the alarm log. Confirmed live before fixing: a real Te
+      1/47 flap and an EX3300 flap, neither logged, nothing to
+      investigate later. Root cause: occurrences were only ever opened
+      from Alertmanager's own alert list (`_sync_occurrences`, née
+      `_sync_occurrences_from_alertmanager`), which by definition never
+      contains something still pending - Prometheus doesn't forward those
+      to Alertmanager at all. Fixed by also opening an occurrence the
+      moment a condition is first seen as pending (`_gather_pending_alerts`,
+      reusing the same two sources `/api/alerts/live` already merges for
+      the Active alerts tab), and only closing it once it's absent from
+      *both* Alertmanager and the pending set - so a flap that never fires
+      still gets a start time, an end time, and (if anyone commented while
+      it was open) a discussion thread, instead of vanishing.
+
+      This needed a real state add: an occurrence can now be `open`
+      (firing/suppressed in Alertmanager), `pending` (seen, not yet
+      confirmed), `resolved`, or `expired` (aged out without resolving) -
+      previously only the first and last existed, laundering "still just
+      pending" into "expired" would have been actively misleading.
+      `_occurrence_state`/`_live_signatures` split into two signature sets
+      (firing vs pending) to support the distinction; both call sites
+      (`api_list_alarms`, `api_get_alarm`) updated together with the
+      shared `_decorate` helper so neither can drift out of sync with the
+      other.
+
+      **Resolved alarms were stuck showing "paging now...".** Also
+      reported live, with two real examples (ALM-108, ALM-59): both
+      genuinely resolved, both still showing a live countdown to a moment
+      long past. Root cause: `close()` set `resolved_at` but never touched
+      `page_at`, so a resolved occurrence kept whatever countdown target
+      it had at the moment it closed - if that target had already lapsed,
+      `PageCountdown`'s "left <= 0" branch reads it as "paging now" forever
+      after, since the DB record never says otherwise. Fixed at the
+      source: `close()` now always clears `page_at`, and backfills
+      `paged_at` if the hold had genuinely already lapsed by resolution
+      time (Alertmanager's own silence would have auto-expired at that
+      same moment and let the real page through, so the record should say
+      "paged", not leave both fields empty as if paging never happened).
+      Recovering *inside* the hold - the case the hold exists for -
+      correctly leaves `paged_at` unset.
+
+      Fixing `close()` only prevents *new* stale records; the two already-
+      broken ones needed a one-time repair
+      (`OccurrenceStore.repair_stale_paging_on_resolved`, run every
+      startup, no-op once clean) applying the identical backfill-or-leave-
+      unpaged logic after the fact. Verified against the exact reported
+      rows: before the fix ALM-108 and ALM-59 both showed `page_at`
+      set and `state=resolved`; after deploying, the startup log read
+      "repaired stale paging state on 2 already-resolved alarm(s)" and
+      both now read `page_at=None`, confirmed against the real API, not
+      just the repair function's return count.
+
+      The pending-logging fix was verified against the real running
+      `_sync_occurrences()` (not a fake), by injecting a synthetic-but-
+      clearly-fake pending alert (`SwitchboardPendingLogTest`) with a
+      monkeypatched `_prometheus_pending_rules`: confirmed it opened an
+      occurrence while merely pending, then confirmed clearing it without
+      ever firing closed that same occurrence with `page_at`/`paged_at`
+      both correctly null - a complete, closed record from a condition
+      that never once notified anyone. No Alertmanager side effects, since
+      this path never places a hold. 8 new unit tests
+      (`test_occurrences.py`) pin both the `close()` fix and the repair
+      function in both directions (lapsed vs. not-yet-lapsed vs.
+      already-paged vs. nothing-to-repair); 48 tests pass total.
+- [x] **2026-08-02**: PSU/fan hardware alarms took ~90s to even reach
+      Switchboard's "pending" state after a real, physical PSU pull, while
+      the switch's own syslog reported it immediately - confirmed live,
+      not assumed: `CHMGR-0-PS_DOWN` in syslog at 02:27:41Z, but Prometheus
+      rule `activeAt` (start of the *pending* window, before the
+      deliberate 120s confirmation delay even begins) not until 02:29:02Z.
+
+      Root cause, found by checking Prometheus's actual effective config
+      (`/api/v1/status/config`, not documentation): `evaluation_interval`
+      had never been set and was silently defaulting to Prometheus's own
+      **1 minute**. A metric that changes the instant after an evaluation
+      tick has to wait for the *next* tick - up to the full interval -
+      before Prometheus even notices, stacked on top of the exporter's own
+      30s SSH-poll cycle and Prometheus's 30s scrape cycle. Three
+      independent 30-60s cycles stacked is exactly ~90s.
+
+      Fixed by tightening all three, safely: confirmed via
+      `s4048_scrape_duration_seconds{section="fast"}` that one full poll
+      cycle (CPU/memory/fan/PSU/interfaces - not the separate, deliberately
+      slower transceiver scrape) only takes ~0.46s, so there was ample
+      headroom. `evaluation_interval: 15s` (explicit, prometheus.yml
+      global), the `s4048` scrape job's own `scrape_interval: 10s`
+      (job-level override, was inheriting the 30s global), and the
+      exporter's `FAST_POLL_INTERVAL` env var set to `10` (was defaulting
+      to 30, docker-compose.yml). Worst-case latency before "pending" now
+      bounds to roughly 10+10+15=35s instead of ~90s.
+
+      Deliberately left untouched: the 120s `for:` confirmation window on
+      `S4048PSUDown`/`S4048FanDown` themselves - that's a separate,
+      intentional debounce against a single bad poll sample, not part of
+      this complaint, and conflating the two would have made a real,
+      already-confirmed PSU pull start looking like the earlier
+      (correctly-explained) "why hasn't this fired yet" investigation
+      instead of the genuine detection-latency bug it actually was this
+      time.
+
+      Considered and rejected: building a syslog-fed fast path for
+      hardware alarms, mirroring interface_alerting.py's direct-post model
+      for interface state. Interface state uses that model because a
+      dynamic per-port rule set isn't a good fit for a static Prometheus
+      rules file at all; PSU/fan alarms are the opposite case - a small,
+      fixed, hardware-defined set (2 PSUs, 3 fan trays) that Prometheus
+      rules already fit well. Bypassing Prometheus for a syslog-fed direct
+      post would also have needed the posted alert's labels to exactly
+      match what Prometheus's own rule evaluation produces (which includes
+      `instance`/`job` labels Prometheus attaches itself, not reproducible
+      from a webhook) to share one occurrence identity - real fragility for
+      a problem a config-interval fix already solves cleanly.
+
+      Verified live: exporter container confirmed running with
+      `FAST_POLL_INTERVAL=10`; Prometheus's `/api/v1/status/config` (the
+      actual effective config, not the file on disk) confirmed
+      `evaluation_interval: 15s` and the `s4048` job's `scrape_interval:
+      10s`; confirmed the rule group in the generated `alerts.yml` has no
+      group-level `interval:` override that would silently ignore the new
+      global value; confirmed the target's scrape health stayed `up` with
+      no new errors after the change. 48 tests pass, unaffected (this was
+      a config-only change, no application code touched).
+- [x] **2026-08-02**: Pulling a fan tray produced **no alarm at all** -
+      reported live immediately after the PSU-latency fix above, and a
+      real, more serious bug than that one: not slow, completely silent.
+      Root cause was the exact same shape as the PSU parser bug fixed
+      earlier this session, in the same function, one block above it -
+      and the PSU fix's own comment even describes the pattern precisely,
+      it just hadn't been applied to fans too. Confirmed live: a fully
+      removed fan tray reports `TrayStatus` as `absent` with *none* of the
+      Fan1/Speed/Fan2/Speed columns present at all
+      (`' 1    3     absent      '`, captured from the real switch during
+      the incident) - `parse_environment`'s fan regex required all five
+      up|down/speed fields, so this row never matched and was silently
+      dropped from `out["fans"]` entirely. Since a Prometheus gauge holds
+      its last-set value when a scrape stops reporting a label
+      combination, `s4048_fan_status{bay="3",...}` just kept reporting its
+      last-known "up" (1.0) forever - S4048FanDown's `s4048_fan_status ==
+      0` had nothing to ever match against, so it could never fire, no
+      matter how long the tray stayed out.
+
+      Fixed identically in both `webui/parsers.py` and
+      `exporter/parsers.py` (this codebase keeps a near-duplicate parser
+      in each, same as the PSU fix needed both): a second regex matching
+      the `absent` row shape, reporting both fans as `down` at 0 RPM -
+      "absent" is a strictly worse cooling state than "down" (there's
+      nothing there to fail back to), so it must alert at least as
+      readily, not be treated as a lesser case.
+
+      New fixture `environment_fan_absent.txt`, captured live from the
+      real incident (not fabricated), and a regression test
+      (`test_parse_environment_fan_absent_reports_both_fans_down`)
+      asserting the previously-silent bay parses to `fan1_status`/
+      `fan2_status == "down"`, `*_rpm == 0`, while confirming the other
+      two genuinely-fine trays are untouched. Verified beyond the unit
+      test: copied the fixture into both running containers and called
+      `parsers.parse_environment` against the actual deployed code (not
+      just the dev venv) in each - both correctly produced `tray_status:
+      absent, fan1_status: down, fan2_status: down`. Could not re-verify
+      the live end-to-end metric against the real hardware a second time
+      because the user reinserted the tray (and the PSU) while this was
+      being fixed - confirmed via a fresh `show environment` that both
+      are genuinely back to "up", which is itself a useful confirmation
+      that the parser's ordinary up/up case is unaffected by the new
+      branch. 49 tests pass; exporter and Prometheus target health both
+      confirmed clean post-deploy.
+- [x] **2026-08-02**: Made the Prometheus `for:` confirmation window (the
+      "pending" time shown on the Alerts/Alarms pages) editable per rule
+      from the Rules tab, alongside the existing severity/enabled/page-
+      delay controls. Safe to expose unlike the PromQL expression itself
+      (still locked down): `for_seconds` is a plain bounded integer
+      formatted straight into `f"{n}s"` in `render_yaml`, with no PromQL
+      parsing risk if it's wrong. `0` is a real, valid setting ("fire
+      instantly, no confirmation window"), guarded against the classic
+      Python truthiness trap (`if for_seconds:` would silently skip
+      writing a deliberate `0`) by checking `is not None` throughout.
+      Verified end to end against the real running stack, not just the
+      API: set `S4048PSUDown` to `20`, confirmed via Prometheus's own
+      `/api/v1/rules` that the live rule's `duration` really changed to
+      `20`, then reset it back to `120` and reconfirmed. 6 new unit tests;
+      53 passed total.
+- [x] **2026-08-02**: Paging holds (the previous entry's investigation
+      delay) were being applied to interface (`InterfaceDown`) alerts too
+      - reported live with two real examples straight out of
+      Alertmanager's silence list, both genuine link-down events sitting
+      behind an unwanted 120s hold. This was a real design mistake, not a
+      missing config option: paging delay was only ever meant for the
+      Prometheus-rule "environmental" hardware alarms (PSU/fan/device/
+      optic); the Interfaces tab already has its own, separate concept for
+      how long a port must stay down before it's even considered a fault
+      (immediate vs delayed mode, `interface_alerting.py`) - stacking a
+      second, unrelated delay on top of that for interfaces specifically
+      was never asked for and directly worked against the near-real-time
+      interface detection this session built earlier.
+
+      Fixed by removing interface alerts from the paging-hold path
+      entirely rather than trying to configure them to zero: deleted the
+      `paging_hook` mechanism `interface_alerting.py`'s `_fire()` used to
+      call before every post (confirmed live it's now fully gone - no
+      `paging_hook` attribute exists on `InterfaceAlertChecker` at all),
+      and removed the wiring in `app.py` that pointed it at `_place_hold`.
+      Hardware alarms are unaffected: `_place_hold` is still called from
+      the Prometheus-pending-rules loop exactly as before, unchanged.
+      Interface alerts now post straight to Alertmanager the instant they
+      fire, with nothing in the path that could ever hold them back.
+
+      The two silences the user reported had already released themselves
+      by the time this was investigated (either naturally expired or
+      released by the earlier `close()` fix), so no manual Alertmanager
+      cleanup was needed - just the root-cause fix. Verified directly
+      against the real deployed module: `hasattr(checker, 'paging_hook')`
+      is `False`, and firing a real interface alert through `_fire()`
+      produces exactly one direct post to Alertmanager with no hold
+      placement anywhere in the call path. 53 tests pass, unaffected.
+- [x] **2026-08-02**: An alarm's own ticket could show an empty Timeline
+      for a real, confirmed down-to-up transition. Root cause: the
+      Timeline only ever read from `alert_history`, which is populated
+      solely by Alertmanager's webhook - and a silence suppresses *every*
+      Alertmanager receiver, including that webhook (confirmed live
+      earlier this session). An alarm held under a paging delay, or
+      covered by an ordinary maintenance-window silence, could genuinely
+      fire and genuinely resolve while producing zero `alert_history` rows
+      the whole time it was suppressed.
+
+      Fixed by making the occurrence's own `started_at`/`resolved_at` -
+      set directly by `_sync_occurrences` from Alertmanager's real alert
+      list, independent of whether a notification was ever delivered -
+      the guaranteed source for the ticket's fired/resolved bookend
+      events, merged with (not solely dependent on) whatever
+      `alert_history` also captured. A synthesized event is only added
+      when no `alert_history` row already exists within 5 seconds of it,
+      so the common, unsuppressed case (which alert_history already
+      covers reliably) doesn't show every transition twice. Verified
+      against real alarms: a plain interface flap showed exactly one
+      `fired`/one `resolved` (alert_history covered it, no duplicate
+      added); spot-checked several more resolved alarms for accidental
+      double-counting.
+
+      Also reordered the Communication tab: the comment composer now sits
+      above the message list instead of below it, per explicit request.
+      Verified in a real browser - posted an actual comment and confirmed
+      it renders below the input box, not above.
+- [x] **2026-08-02** (scoping correction, same conversation): a broader
+      "log every rule/config change onto affected alarms' tickets" change
+      was drafted and then explicitly discarded before being wired in -
+      not what was asked. What "logged in the alarm ticket" turned out to
+      mean was narrower and already the right scope: things that happen
+      *to* an alarm (ack, resolve, comments, state transitions), which the
+      per-occurrence audit/timeline design already covers - the actual gap
+      was the Timeline fix above, not a missing feature. Left no dead code
+      behind from the discarded direction.
+- [x] **2026-08-02**: Comment line breaks (Shift+Enter) weren't surviving
+      to the screen - the Textarea correctly captured them (`.trim()`
+      before posting only strips leading/trailing whitespace, not internal
+      newlines, confirmed by inspecting the stored body directly), but a
+      posted comment rendered through a plain `<Box variant="p">`, and
+      normal HTML text flow collapses newlines unless something turns them
+      into real block boundaries. Fixed by rendering comments through
+      `MiniMarkdown` (already used for Saved Results output - reused
+      rather than building a second markdown implementation), which splits
+      on `\n` and gives each line its own block as a side effect of also
+      rendering `## headings`/`**bold**`/`` `code` ``.
+
+      Added, per the explicit ask: a **Markdown/Raw** toggle on every
+      individual comment (`SegmentedControl`, matching the existing
+      Raw/Markdown pattern already used for command output in
+      ConsolePage.jsx - not a new UI idiom), and a **Write/Preview**
+      toggle on the composer itself, swapping the Textarea for a live
+      `MiniMarkdown` render of the current draft.
+
+      Verified live end to end: posted a real 3-line comment with
+      `**bold**` through the actual API, confirmed the raw stored body
+      still contains real `\n` characters (not stripped), and confirmed
+      in a real browser that it renders as three separate lines with the
+      bold text rendered - then toggled that same comment to Raw and
+      confirmed it shows the literal source text in a code-styled block.
+      Typed a heading/lines/bold into the composer and confirmed Preview
+      renders identically to how a posted comment would.
+
+      One real testing mistake worth recording: an early browser check
+      reported a blank page with zero network requests past
+      `/api/setup/status`, which read like a serious regression. It
+      wasn't - a stray/stale headless Chrome profile directory reused
+      across several tool calls was the actual cause. Confirmed the
+      deployed code was correct throughout (grepped the live container's
+      JS bundle for a literal string unique to the new composer, found
+      it; confirmed the entry bundle's dynamic import correctly pointed at
+      the freshly-hashed chunk) before concluding it was the test harness,
+      not the app - a fresh Chrome profile directory resolved it
+      immediately. Recorded here since it cost real time and the fix
+      (always use an unused `--user-data-dir` per browser-based check,
+      never reuse one across calls) is worth not re-learning.
 
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added
