@@ -28,8 +28,9 @@ each pull from `common/` (see `webui/Dockerfile`/`exporter/Dockerfile`).
 
 ## How it works
 
-`exporter/exporter.py` polls **every OS9 device in the registry** - not
-just one hardcoded switch. The registry is the same one the webui manages:
+`exporter/exporter.py` polls **every OS9 and Junos device in the
+registry** - not just one hardcoded switch. The registry is the same one
+the webui manages:
 `common/devices.yaml` (static entries, credentials from env vars) plus
 whatever's been added through the Devices page (Postgres, if `DATABASE_URL`
 is set - see `.env.example`). One background thread per device, each
@@ -75,7 +76,7 @@ exposed" below).
 
 This repo supports two ways to run the exporter itself:
 
-1. **Directly on an LXC** (no Docker) — see [Installing on an LXC](#installing-on-an-lxc-no-docker) below. Point the `prometheus/prometheus.yml` `targets` at the LXC's IP:9101, and still run Prometheus/Grafana via Docker Compose (or however you already run them) elsewhere.
+1. **Directly on an LXC** (no Docker) — see [docs/deploy-lxc-exporter.md](docs/deploy-lxc-exporter.md) (or [Deploying on an LXC](#deploying-on-an-lxc) below for the other split options). Point the `prometheus/prometheus.yml` `targets` at the LXC's IP:9101, and still run Prometheus/Grafana via Docker Compose (or however you already run them) elsewhere.
 2. **Everything in Docker Compose** (exporter + Prometheus + Grafana bundled) — the original all-in-one path, described right here.
 
 ### Docker Compose (all-in-one)

@@ -19,7 +19,7 @@ older shape of the codebase.
 
 | | needs on the LXC | how it runs |
 |---|---|---|
-| `install.sh` (recommended) | Python 3 (already on Debian/Ubuntu templates) | venv under `/opt/s4048-exporter`, systemd service |
+| `install.sh` (recommended) | Python 3 (already on Debian/Ubuntu templates) - `install.sh` installs `python3-venv`/`python3-pip` itself, nothing to prepare | venv under `/opt/s4048-exporter`, systemd service |
 | `install-binary.sh` | nothing - single compiled executable | binary under `/opt/s4048-exporter`, systemd service |
 
 Since the exporter now shares `db.py`/`store.py`/`devices.py`/
