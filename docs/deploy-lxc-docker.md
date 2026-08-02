@@ -6,7 +6,9 @@ Grafana - via `docker compose`, running inside one Debian 12 / Ubuntu
 
 For a lighter option (just the exporter, no Docker, talking to a
 Prometheus/Grafana you already have elsewhere), see
-[deploy-lxc-exporter.md](deploy-lxc-exporter.md) instead.
+[deploy-lxc-exporter.md](deploy-lxc-exporter.md) instead. For maximum
+isolation (each service on its own LXC instead of sharing one), see
+[deploy-lxc-split.md](deploy-lxc-split.md).
 
 Exercised against this repo's actual layout after the 2026-08-02
 restructure (shared `common/` module, per-user OIDC login, multi-device
