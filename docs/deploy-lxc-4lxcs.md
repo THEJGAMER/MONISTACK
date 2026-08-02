@@ -5,6 +5,10 @@ LXC, everything) and [deploy-lxc-split.md](deploy-lxc-split.md) (five LXCs,
 one per service) - `webui` and `prometheus` share one LXC, `s4048-exporter`,
 `alertmanager`, and `grafana` each get their own.
 
+This guide uses Docker on each LXC. For the same split with no Docker
+anywhere - every service as a native systemd unit - see
+[deploy-lxc-4lxcs-native.md](deploy-lxc-4lxcs-native.md).
+
 **Why keep these two together specifically:** the webui's Rules tab
 regenerates `prometheus/alerts.yml` and calls Prometheus's `/-/reload` to
 pick it up live. That relies on both containers bind-mounting the *same

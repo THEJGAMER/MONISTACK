@@ -123,7 +123,7 @@ label was.
 
 ## Deploying on an LXC
 
-Four full walkthroughs, depending on what you need:
+Five full walkthroughs, depending on what you need:
 
 - **[docs/deploy-lxc-docker.md](docs/deploy-lxc-docker.md)** — the whole
   stack (webui + exporter + Prometheus + Alertmanager + Grafana) via
@@ -136,6 +136,11 @@ Four full walkthroughs, depending on what you need:
   ground: `webui` and `prometheus` share one LXC (they're coupled at the
   filesystem level via the Rules tab's `alerts.yml`, so keeping them
   together avoids needing NFS), the rest each get their own.
+- **[docs/deploy-lxc-4lxcs-native.md](docs/deploy-lxc-4lxcs-native.md)** —
+  the same 4-LXC split, but with **no Docker anywhere**: every service as
+  a real systemd unit, built/installed directly on the host. Every command
+  in it was actually run to confirm the versions/paths/CLI flags are real,
+  not guessed from documentation.
 - **[docs/deploy-lxc-exporter.md](docs/deploy-lxc-exporter.md)** — just the
   exporter, native, no Docker, as a systemd service (`packaging/`) - for
   when Prometheus/Grafana already exist elsewhere. Point them at
