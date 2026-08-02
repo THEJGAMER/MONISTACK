@@ -222,23 +222,52 @@ build on.
 
 The gate on anyone other than you using this.
 
-- [ ] **Per-user identity** — OIDC/SAML/LDAP, or at minimum real local
-      accounts. Today it's one shared basic-auth credential.
-- [ ] **RBAC** — who may run which command category against which device
-      (or device group). Read-only-viewer vs operator vs admin.
-- [ ] **Real audit trail** — every command attributed to a real human,
-      append-only, exportable. Today's `log.info("user=admin ...")` logs
-      the shared account, which is not an audit trail.
-- [ ] **TLS** — the webui is plain HTTP today.
+- [x] **Per-user identity** — 2026-08-02: shared HTTP Basic Auth
+      (`admin`/`changeme-webui`) removed entirely, replaced with per-user
+      OIDC login (Authorization Code + PKCE S256) against an external,
+      BYO Keycloak instance (`webui/auth.py`, `webui/app.py`'s
+      `/api/auth/*` routes). No local-account fallback. Live-verified: a
+      real login round trip against a real Keycloak realm, real
+      `preferred_username`/`resource_access` claims, real logout via
+      RP-Initiated Logout, and Back-Channel Logout for out-of-band session
+      termination (see `webui/README.md`'s "Login: OIDC against Keycloak"
+      section for the full design and required Keycloak-side setup).
+- [x] **RBAC** — 2026-08-02: three tiers (viewer/operator/admin) mapped
+      from Keycloak *client* roles on the `switchboard` client, enforced
+      server-side per route (`require_role` in `webui/app.py`, applied
+      across all 31 mutating routes) - the frontend hides the
+      corresponding UI too, but that's cosmetic only. An account with
+      **no** role assigned is denied at login entirely (no session
+      created, and `require_auth` independently rejects any session
+      lacking a role as a backstop) - fails closed to *no access*, not to
+      read-only. Live-verified with real viewer/operator/admin Keycloak
+      users: correct 403s on under-privileged actions, correct success on
+      privileged ones.
+- [x] **Real audit trail** — 2026-08-02: the existing `audit_log` table
+      now records the real per-user Keycloak username
+      (`preferred_username`) as `actor` on every action, not the shared
+      `"admin"` string this item originally called out. `auth.login`/
+      `auth.logout`/`auth.denied`/`auth.backchannel_logout` events are
+      recorded too, so login/logout activity itself is part of the trail,
+      not just in-app actions.
+- [ ] **TLS** — the webui is plain HTTP today. (`SESSION_COOKIE_SECURE`
+      env var is already wired up to flip the session cookie to `Secure`
+      once this lands - see `webui/README.md`.)
 - [ ] **Secrets management** — switch credentials currently sit in
       plaintext in `.env` and in the SQLite device store, protected by
       filesystem permissions only. Move to Vault / cloud secret manager /
       SOPS, or per-device SSH keys in a real keystore.
-- [ ] **Credential rotation** — including rotating the credentials used
-      throughout this project's development (`.env` still holds the
-      placeholder `admin` / `changeme-webui`, and the switch password has
-      been shared in plaintext).
-- [ ] Session management, CSRF protection, rate limiting on auth.
+- [ ] **Credential rotation** — the specific placeholder this item
+      originally flagged (`WEBUI_USER`/`WEBUI_PASS` in `.env`) no longer
+      exists at all as of the OIDC change above, not just rotated - but
+      switch device credentials are still unrotated plaintext and this
+      item remains open for those.
+- [x] **Session management, CSRF protection, rate limiting on auth** —
+      2026-08-02: Starlette `SessionMiddleware` (signed, `SameSite=Lax`,
+      `httponly` cookie; `SESSION_TTL_HOURS` bounds exposure). CSRF
+      mitigated via `SameSite=Lax` + no CORS middleware + JSON-only
+      mutating bodies (documented inline in `webui/app.py`) rather than a
+      separate token scheme. Per-IP rate limit on `/api/auth/callback`.
 
 ---
 

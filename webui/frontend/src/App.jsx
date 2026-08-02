@@ -9,7 +9,9 @@ import Box from "@cloudscape-design/components/box";
 import { applyMode, applyDensity, Mode, Density } from "@cloudscape-design/global-styles";
 
 import SetupWizard from "./SetupWizard.jsx";
-import { getDevices, getCommands, getSetupStatus } from "./api.js";
+import AccessDeniedPage from "./AccessDeniedPage.jsx";
+import { getDevices, getCommands, getSetupStatus, getCurrentUser, logout } from "./api.js";
+import { AuthProvider, useHasRole } from "./AuthContext.jsx";
 
 // Each page is its own chunk - board-components (Console) and the
 // markdown/plotting bits (Topology/Trends) are the heaviest deps in the
@@ -25,6 +27,7 @@ const SchedulesPage = lazy(() => import("./SchedulesPage.jsx"));
 const CompliancePage = lazy(() => import("./CompliancePage.jsx"));
 const AlertsPage = lazy(() => import("./AlertsPage.jsx"));
 const AlarmsPage = lazy(() => import("./AlarmsPage.jsx"));
+const AccountPage = lazy(() => import("./AccountPage.jsx"));
 
 function PageFallback() {
   return (
@@ -72,11 +75,17 @@ function usePreference(key, defaultValue) {
 
 export default function App() {
   const [activeHref, setActiveHref] = useHashRoute();
+  // Landed here straight from /api/auth/callback denying a login with no
+  // role assigned - no session exists, so the identity-check effect below
+  // must not run for this route, or it immediately bounces back to
+  // Keycloak before the page (and its Log out button) can ever render.
+  const deniedMatch = activeHref.match(/^#\/access-denied\/?(.*)$/);
   const [devices, setDevices] = useState([]);
   const [commandTree, setCommandTree] = useState([]);
   const [flashes, setFlashes] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [configured, setConfigured] = useState(null); // null = still checking
+  const [user, setUser] = useState(null); // {username, role}, null = still checking
   const [preselectDeviceId, setPreselectDeviceId] = useState(null);
   const [devicePrefill, setDevicePrefill] = useState(null);
 
@@ -138,8 +147,24 @@ export default function App() {
     })();
   }, []);
 
+  // Identity check - getCurrentUser() is the one call api.js doesn't
+  // auto-redirect on a 401 for (see api.js), so a logged-out visit lands
+  // here and this effect does the redirect itself, only once setup is
+  // confirmed done (no point sending someone to Keycloak before there's
+  // even a deployment to log in to).
   useEffect(() => {
-    if (!configured) return;
+    if (!configured || deniedMatch) return;
+    (async () => {
+      try {
+        setUser(await getCurrentUser());
+      } catch (e) {
+        window.location.href = "/api/auth/login";
+      }
+    })();
+  }, [configured, deniedMatch]);
+
+  useEffect(() => {
+    if (!configured || !user || deniedMatch) return;
     (async () => {
       try {
         const [devs, cmds] = await Promise.all([getDevices(), getCommands()]);
@@ -151,7 +176,7 @@ export default function App() {
         setLoaded(true);
       }
     })();
-  }, [configured, pushFlash]);
+  }, [configured, user, deniedMatch, pushFlash]);
 
   // "#/alarms/6da766d164443d00" -> section "alarms", param "6da766d164443d00".
   // Only the Alarms page takes a path parameter today; everything else is a
@@ -168,6 +193,7 @@ export default function App() {
     "alerts",
     "alarms",
     "settings",
+    "account",
   ];
   const page = KNOWN_PAGES.includes(section) ? section : "console";
   const pageTitles = {
@@ -182,6 +208,7 @@ export default function App() {
     alerts: "Alerts",
     alarms: "Alarms",
     settings: "Settings",
+    account: "My Account",
   };
   // A deep-linked alarm gets its own breadcrumb level, so someone who
   // arrives from a pasted link can see where they are and get back to the
@@ -202,8 +229,16 @@ export default function App() {
     return <SetupWizard onConfigured={() => setConfigured(true)} />;
   }
 
+  if (deniedMatch) {
+    return <AccessDeniedPage username={deniedMatch[1] ? decodeURIComponent(deniedMatch[1]) : null} />;
+  }
+
+  if (!user) {
+    return null; // identity check in flight, or about to redirect to Keycloak
+  }
+
   return (
-    <>
+    <AuthProvider user={user}>
       <div id="top-nav">
         <TopNavigation
           identity={{ href: "#/console", title: "Switchboard", logo: undefined }}
@@ -227,6 +262,19 @@ export default function App() {
               type: "button",
               text: mode === Mode.Dark ? "Light mode" : "Dark mode",
               onClick: () => setMode(mode === Mode.Dark ? Mode.Light : Mode.Dark),
+            },
+            {
+              type: "menu-dropdown",
+              text: `${user.username} (${user.role})`,
+              iconName: "user-profile",
+              items: [
+                { id: "account", text: "My account" },
+                { id: "logout", text: "Log out" },
+              ],
+              onItemClick: (e) => {
+                if (e.detail.id === "logout") logout();
+                else if (e.detail.id === "account") setActiveHref("#/account");
+              },
             },
           ]}
         />
@@ -284,6 +332,8 @@ export default function App() {
                 <ResultsPage pushFlash={pushFlash} />
               ) : page === "settings" ? (
                 <SettingsPage pushFlash={pushFlash} />
+              ) : page === "account" ? (
+                <AccountPage user={user} />
               ) : page === "topology" ? (
                 <TopologyPage pushFlash={pushFlash} onOpenConsole={openConsoleFor} onAddDevice={openAddDevice} />
               ) : page === "trends" ? (
@@ -315,6 +365,6 @@ export default function App() {
           )
         }
       />
-    </>
+    </AuthProvider>
   );
 }

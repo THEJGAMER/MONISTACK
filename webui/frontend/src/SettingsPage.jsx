@@ -10,11 +10,16 @@ import Alert from "@cloudscape-design/components/alert";
 import Spinner from "@cloudscape-design/components/spinner";
 
 import { getSettings, updateSettings } from "./api.js";
+import { useHasRole } from "./AuthContext.jsx";
 
 export default function SettingsPage({ pushFlash }) {
+  // Saving is admin-tier server-side (require_role("admin") on the PUT
+  // route in app.py) - viewers/operators can still see the page (GET is
+  // any-authenticated-user) but the form is read-only for them.
+  const canEdit = useHasRole("admin");
   const [loading, setLoading] = useState(true);
   const [current, setCurrent] = useState(null);
-  const [form, setForm] = useState({ webui_user: "", webui_pass: "", database_url: "", loki_url: "" });
+  const [form, setForm] = useState({ database_url: "", loki_url: "" });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
 
@@ -23,7 +28,7 @@ export default function SettingsPage({ pushFlash }) {
       try {
         const data = await getSettings();
         setCurrent(data);
-        setForm({ webui_user: data.webui_user, webui_pass: "", database_url: "", loki_url: data.loki_url || "" });
+        setForm({ database_url: "", loki_url: data.loki_url || "" });
       } catch (e) {
         pushFlash("error", `Could not load settings: ${e.message}`);
       } finally {
@@ -42,15 +47,13 @@ export default function SettingsPage({ pushFlash }) {
     setError(null);
     try {
       await updateSettings({
-        webui_user: form.webui_user,
-        webui_pass: form.webui_pass || null,
         database_url: form.database_url.trim() || null,
         loki_url: form.loki_url,
       });
       pushFlash("success", "Settings saved.");
       const data = await getSettings();
       setCurrent(data);
-      setForm({ webui_user: data.webui_user, webui_pass: "", database_url: "", loki_url: data.loki_url || "" });
+      setForm({ database_url: "", loki_url: data.loki_url || "" });
     } catch (err) {
       setError(err.message);
     } finally {
@@ -67,30 +70,20 @@ export default function SettingsPage({ pushFlash }) {
           {current.db_error} — devices, results, and status polling won't work until this is fixed below.
         </Alert>
       )}
+      {!canEdit && (
+        <Alert type="info">You need the admin role to change these settings. Contact an admin if something here needs updating.</Alert>
+      )}
       <form onSubmit={handleSubmit}>
         <Form
           actions={
-            <Button variant="primary" formAction="submit" loading={saving}>
-              Save changes
-            </Button>
+            canEdit && (
+              <Button variant="primary" formAction="submit" loading={saving}>
+                Save changes
+              </Button>
+            )
           }
         >
           <SpaceBetween size="l">
-            <Container header={<Header variant="h2">Admin login</Header>}>
-              <SpaceBetween size="m">
-                <FormField label="Username">
-                  <Input value={form.webui_user} onChange={(e) => setField("webui_user", e.detail.value)} />
-                </FormField>
-                <FormField label="Password" description="Leave blank to keep the current password.">
-                  <Input
-                    type="password"
-                    value={form.webui_pass}
-                    onChange={(e) => setField("webui_pass", e.detail.value)}
-                    placeholder="••••••••"
-                  />
-                </FormField>
-              </SpaceBetween>
-            </Container>
             <Container header={<Header variant="h2">Data sources</Header>}>
               <SpaceBetween size="m">
                 <FormField
@@ -102,10 +95,15 @@ export default function SettingsPage({ pushFlash }) {
                     value={form.database_url}
                     onChange={(e) => setField("database_url", e.detail.value)}
                     placeholder="postgresql://user:password@host:5432/switchboard"
+                    disabled={!canEdit}
                   />
                 </FormField>
                 <FormField label="Loki URL" description="Feeds the Syslog page and Alarm History.">
-                  <Input value={form.loki_url} onChange={(e) => setField("loki_url", e.detail.value)} />
+                  <Input
+                    value={form.loki_url}
+                    onChange={(e) => setField("loki_url", e.detail.value)}
+                    disabled={!canEdit}
+                  />
                 </FormField>
               </SpaceBetween>
             </Container>

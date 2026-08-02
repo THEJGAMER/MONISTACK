@@ -209,9 +209,18 @@ function CommentBody({ text }) {
         ]}
       />
       {view === "markdown" ? (
-        <MiniMarkdown source={text} />
+        <div className="markdown-box">
+          <MiniMarkdown source={text} codeStyle="snippet" />
+        </div>
       ) : (
-        <Box variant="code" display="block" className="terminal-output">
+        // Plain source text, not a fake terminal window - reported live as
+        // wrong for this context (a comment isn't device CLI output, so a
+        // black terminal box with title-bar dots read as bizarre here).
+        // Reuses .markdown-code-block, the same plain theme-aware style
+        // Markdown's own code fences now use, so Raw and rendered-fence
+        // text look consistent with each other rather than one being a
+        // terminal and the other not.
+        <Box variant="code" display="block" className="markdown-code-block">
           {text}
         </Box>
       )}
@@ -283,9 +292,13 @@ function CommunicationTab({ alarm, onChanged, pushFlash }) {
               rows={5}
             />
           ) : (
-            <Container variant="stacked">
-              {body.trim() ? <MiniMarkdown source={body} /> : <Box color="text-body-secondary">Nothing to preview yet.</Box>}
-            </Container>
+            <div className="markdown-box">
+              {body.trim() ? (
+                <MiniMarkdown source={body} codeStyle="snippet" />
+              ) : (
+                <Box color="text-body-secondary">Nothing to preview yet.</Box>
+              )}
+            </div>
           )}
         </FormField>
         <Box>
@@ -303,7 +316,7 @@ function CommunicationTab({ alarm, onChanged, pushFlash }) {
               <Header
                 variant="h3"
                 actions={
-                  c.author === alarm.current_user && (
+                  (c.author === alarm.current_user || alarm.current_role === "admin") && (
                     <Button variant="inline-link" onClick={() => remove(c.id)}>
                       Delete
                     </Button>

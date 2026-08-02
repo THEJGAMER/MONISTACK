@@ -13,8 +13,6 @@ import Box from "@cloudscape-design/components/box";
 import { submitSetup } from "./api.js";
 
 const EMPTY = {
-  webui_user: "admin",
-  webui_pass: "",
   database_url: "",
   loki_url: "",
 };
@@ -42,7 +40,7 @@ export default function SetupWizard({ onConfigured }) {
     }
   }
 
-  const canSubmit = form.webui_user.trim() && form.webui_pass && form.database_url.trim();
+  const canSubmit = form.database_url.trim();
 
   return (
     <AppLayout
@@ -55,6 +53,7 @@ export default function SetupWizard({ onConfigured }) {
             <Header variant="h1">Set up Switchboard</Header>
             <Box color="text-body-secondary">
               This deployment hasn't been configured yet. These settings can be changed later from the Settings page.
+              Sign-in is handled separately via your organization's Keycloak SSO - no login credentials to set up here.
             </Box>
           </Box>
           <Box margin={{ horizontal: "auto" }} maxWidth="500px">
@@ -66,20 +65,6 @@ export default function SetupWizard({ onConfigured }) {
                   </Button>
                 }
               >
-                <Container header={<Header variant="h2">Admin login</Header>}>
-                  <SpaceBetween size="m">
-                    <FormField label="Username" description="Used to sign in to this console (HTTP basic auth).">
-                      <Input value={form.webui_user} onChange={(e) => setField("webui_user", e.detail.value)} />
-                    </FormField>
-                    <FormField label="Password">
-                      <Input
-                        type="password"
-                        value={form.webui_pass}
-                        onChange={(e) => setField("webui_pass", e.detail.value)}
-                      />
-                    </FormField>
-                  </SpaceBetween>
-                </Container>
                 <Container header={<Header variant="h2">Data sources</Header>}>
                   <SpaceBetween size="m">
                     <FormField

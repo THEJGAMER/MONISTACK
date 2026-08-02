@@ -26,6 +26,16 @@ async function api(path, opts, timeoutMs = DEFAULT_TIMEOUT_MS) {
     clearTimeout(timer);
   }
   if (!res.ok) {
+    if (res.status === 401 && path !== "/api/auth/me") {
+      // No/expired session - bounce to Keycloak rather than surface a raw
+      // 401 to a page that has no login form of its own to show. Excludes
+      // /api/auth/me itself: App.jsx's own startup check calls that and
+      // needs to see the 401 to decide whether to redirect at all (a
+      // logged-out visit to a not-yet-configured deployment shouldn't
+      // bounce to a login page before setup has even happened).
+      window.location.href = "/api/auth/login";
+      return new Promise(() => {}); // navigating away, never resolves
+    }
     const body = await res.json().catch(() => ({}));
     throw new Error(body.detail || `HTTP ${res.status}`);
   }
@@ -155,8 +165,23 @@ export const getTrendData = (deviceId, metric, port, hours = 168) => {
 };
 
 // Unauthenticated - checked before login even applies, so the SPA can show
-// a setup wizard on a fresh deploy instead of a basic-auth prompt.
+// a setup wizard on a fresh deploy instead of bouncing to Keycloak.
 export const getSetupStatus = () => api("/api/setup/status");
+
+// { username, role } for the current session, or throws on 401 (see api()'s
+// special-case above - this is the one call that's allowed to see a 401
+// rather than being auto-redirected, since App.jsx uses it to decide
+// whether to redirect at all).
+export const getCurrentUser = () => api("/api/auth/me");
+
+// A real page navigation, not a fetch - logout has to redirect through
+// Keycloak's end_session_endpoint (a different origin) to actually end its
+// SSO session, not just clear our own cookie (see api_auth_logout's
+// docstring - without this, the very next login silently re-authenticates
+// with no prompt, which looked exactly like "logout doesn't work").
+export const logout = () => {
+  window.location.href = "/api/auth/logout";
+};
 
 export const submitSetup = (body) =>
   api("/api/setup", {

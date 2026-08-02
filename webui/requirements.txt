@@ -4,3 +4,25 @@ paramiko>=3.4,<6
 pyyaml>=6,<7
 psycopg2-binary>=2.9,<3
 prometheus-client>=0.20,<1
+# OIDC login against Keycloak (2026-08-02, replacing shared HTTP Basic
+# Auth) - handles PKCE, state/nonce, JWKS fetch/cache, and ID token
+# validation correctly rather than hand-rolling JWT verification, the
+# wrong place to save code on something security-critical.
+authlib>=1.3,<2
+# authlib.integrations.starlette_client needs an async HTTP client for the
+# token/JWKS requests - not bundled either (confirmed live:
+# ModuleNotFoundError without it).
+httpx>=0.27,<1
+# Used directly (not just transitively via authlib) to validate
+# Back-Channel Logout tokens against Keycloak's JWKS - declared explicitly
+# rather than relying on it staying an authlib transitive dependency.
+joserfc>=1.0,<2
+# Starlette's Request.form() needs this even for a plain
+# application/x-www-form-urlencoded body (confirmed live: AssertionError
+# without it) - required to receive Keycloak's Back-Channel Logout POST,
+# which per spec is form-encoded, not JSON.
+python-multipart>=0.0.9,<1
+# Starlette's SessionMiddleware needs this for the signed session cookie -
+# not bundled by default (confirmed live: ModuleNotFoundError without it),
+# despite being Starlette's own recommended session mechanism.
+itsdangerous>=2.1,<3

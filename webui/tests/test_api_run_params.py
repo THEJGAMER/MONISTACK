@@ -6,13 +6,13 @@ device's own server-generated valid values (see devices.py's
 the device over SSH, not just eventually fail against the switch.
 
 Imports `app` directly rather than spinning up the real stack (no
-Postgres, no live device needed) - `require_auth_and_db` is overridden via
-FastAPI's own dependency-injection mechanism, and `DEVICES_BY_ID`/
-`_session_locks`/`_get_session` (plain module globals `app.py` reads at
-request time) are monkeypatched with a fake device and a session stub that
-raises if it's ever reached, so a passing test actually proves the
-rejection happens in `api_run` itself, not that the fake SSH layer
-happened to also fail.
+Postgres, no live device needed) - `require_operator` (the RBAC dependency
+`/api/run` actually requires - see app.py) is overridden via FastAPI's own
+dependency-injection mechanism, and `DEVICES_BY_ID`/`_session_locks`/
+`_get_session` (plain module globals `app.py` reads at request time) are
+monkeypatched with a fake device and a session stub that raises if it's
+ever reached, so a passing test actually proves the rejection happens in
+`api_run` itself, not that the fake SSH layer happened to also fail.
 """
 import threading
 
@@ -62,7 +62,7 @@ def client(monkeypatch):
         raise AssertionError("a rejected param must never reach _get_session/SSH")
 
     monkeypatch.setattr(app_module, "_get_session", _unreachable)
-    app_module.app.dependency_overrides[app_module.require_auth_and_db] = lambda: "test-user"
+    app_module.app.dependency_overrides[app_module.require_operator] = lambda: "test-user"
     yield TestClient(app_module.app)
     app_module.app.dependency_overrides.clear()
 

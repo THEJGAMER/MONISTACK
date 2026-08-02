@@ -8,14 +8,17 @@ earlier pass tried to fake the look with plain HTML/CSS; no amount of
 color-matching got it right, because the fidelity comes from the real
 component behavior, not the palette). Runs at http://localhost:8080 (via
 the `webui` service in the top-level `docker-compose.yml`), protected by
-HTTP basic auth. Every command run also gets a best-effort one-line summary
-above the raw output.
+per-user OIDC login against an external Keycloak instance (see "Login:
+OIDC against Keycloak" below) - not a shared password. Every command run
+also gets a best-effort one-line summary above the raw output.
 
 A brand new deployment (empty `webui-data` volume, no `.env` overrides)
 boots straight into a **setup wizard** instead of crashing on missing
-config: admin login, the Postgres connection string, and (optionally) a
-Loki URL, all editable later from the in-app **Settings** page. See
-"Deployment config" below.
+config: the Postgres connection string, and (optionally) a Loki URL, both
+editable later from the in-app **Settings** page. See "Deployment config"
+below. Login itself is not part of the wizard - it's OIDC, configured via
+env vars (see below), not something a wizard step can set up on your
+behalf since it depends on your own Keycloak instance.
 
 Four pages, switched via the left nav - **Console**, **Devices**,
 **Saved Results**, and **Settings**. Syslog and the front-panel visual used to be their own
@@ -91,28 +94,155 @@ asserted absent from every command string on every platform. (An earlier
 version of this README claimed the rule was already test-enforced before
 this test existed; it wasn't - see `ROADMAP.md` §0.2 for that history.)
 
+## Login: OIDC against Keycloak
+
+Per-user login via the OAuth2 Authorization Code flow with PKCE, against an
+external Keycloak instance you already run - this app never creates or
+manages Keycloak itself, only trusts it. Replaces the old shared HTTP
+Basic Auth (`WEBUI_USER`/`WEBUI_PASS`) entirely; there is no local-account
+fallback.
+
+**Env vars (`.env`, not GUI-configurable - see "Deployment config" for why
+these are treated differently from the Postgres/Loki settings):**
+
+- `OIDC_ISSUER_URL` - your Keycloak realm base, e.g.
+  `https://keycloak.example.com/realms/master`.
+- `OIDC_CLIENT_ID` - defaults to `switchboard`.
+- `OIDC_CLIENT_SECRET` - from the confidential client you create below.
+- `OIDC_REDIRECT_URI` - must exactly match the redirect URI registered on
+  the Keycloak client: `<the URL you use to reach Switchboard>/api/auth/callback`.
+- `SESSION_SECRET_KEY` - signs the session cookie. Set this explicitly in
+  any real deployment; if unset, a random key is generated per process
+  start, which just means every container restart logs everyone out.
+- `SESSION_COOKIE_SECURE` - defaults `false`. Only set `true` once this app
+  is actually served over HTTPS (a separate, still-open piece of work) -
+  forcing it before then breaks every login, since the browser won't send
+  a `Secure` cookie back over plain HTTP.
+- `SESSION_TTL_HOURS` - defaults `12`. How long a login lasts. Logout
+  clears the browser's cookie but, being a signed cookie rather than a
+  server-side revocable session, can't force-invalidate a copy of it
+  before this expiry - a bounded, accepted trade-off (no worse an exposure
+  window than the shared Basic Auth password it replaces).
+
+**Keycloak-side setup required** (this app can't create any of this
+itself, since Keycloak is external/BYO):
+
+1. Create a **confidential client** named `switchboard` (or match whatever
+   you set `OIDC_CLIENT_ID` to).
+2. Enable **Standard Flow** (Authorization Code), leave **Direct Access
+   Grants** off, and require **PKCE** (S256).
+3. Set **Valid Redirect URIs** to exactly `OIDC_REDIRECT_URI` above -
+   `<your Switchboard URL>/api/auth/callback`. Also set **Valid Post
+   Logout Redirect URIs** to your Switchboard URL itself (e.g.
+   `http://localhost:8080/*`) - Keycloak versions with RP-Initiated Logout
+   enforce this separately from the login redirect URI, and without it
+   logout appears to silently fail: the app's own session cookie clears
+   fine, but Keycloak's SSO session doesn't, so the next login
+   re-authenticates instantly with no prompt (confirmed live - this was
+   an actual bug hit and fixed during development, not a hypothetical).
+4. Copy the client's **secret** into `OIDC_CLIENT_SECRET`.
+5. Create three **client roles** on this client: `viewer`, `operator`,
+   `admin`, and assign them to whichever users/groups should have each
+   tier (see "RBAC" below for what each tier can do). A user with **none**
+   of these assigned is denied at login (403, no session created at all) -
+   a valid Keycloak account is not the same as being granted anything in
+   this app. This is stricter than a typical "unassigned defaults to
+   read-only" pattern, and deliberately so for this deployment.
+
+**Deliberate choice: this deployment uses Keycloak's built-in `master`
+realm**, not a dedicated realm. The `master` realm is meant for Keycloak's
+own administrative accounts, not application clients - using it for a
+regular app is a real anti-pattern in general (it couples this app's users
+to Keycloak's own admin realm, and a Keycloak upgrade or realm-level change
+made for admin-account reasons could have unexpected side effects here).
+This was flagged explicitly and the choice to use `master` anyway was made
+deliberately for this small, personal deployment where the operational
+overhead of a second realm wasn't worth it. Anyone reusing this setup at
+larger scale should create a dedicated realm instead.
+
+### RBAC: three tiers, enforced server-side
+
+`viewer < operator < admin`, read from the Keycloak **client roles** above
+(`resource_access[client_id].roles` in the ID token, not realm roles) -
+see `auth.py`'s `role_from_claims()`. Every mutating route in `app.py`
+declares its own minimum tier via `Depends(require_role(...))`; the
+frontend hides/disables the corresponding buttons too, but that's cosmetic
+- the server enforces independently either way, the same model this app
+already used for the comment-author-only delete rule.
+
+- **viewer** - read-only: browse devices, results, alarms, topology,
+  trends, syslog, compliance results.
+- **operator** - viewer, plus: run commands (`/api/run`, bulk run), device
+  connectivity test/status refresh, alarm actions (ack/unack/resolve/
+  comment/page-now/delay-page/narg), silence create/expire, schedule
+  create/update/delete/run-now, save/delete results. Can delete their own
+  comments, not anyone else's.
+  - **admin** - operator, plus: device CRUD, `/api/settings` changes,
+  alert-rule edits, interface-alert config edits, compliance config edits,
+  topology baseline management, viewing the audit log, and can delete any
+  comment (not just their own).
+
+### Back-Channel Logout
+
+Sessions here are signed cookies with no server-side session table (see
+"No session/cookie/CORS/reverse-proxy infrastructure exists today" in the
+original design notes) - there's normally nothing to look up to force-end
+one early. **Back-Channel Logout** (OIDC Back-Channel Logout 1.0) is the
+one case that needs exactly that: Keycloak calls this app directly,
+server-to-server, whenever a session ends any way *other* than clicking
+this app's own Log out button - an admin revoking a session in the
+Keycloak console, logging out from another app that shares the same SSO
+session, etc. Without it, a session ended that way would keep a working
+Switchboard cookie until it naturally expires (`SESSION_TTL_HOURS`).
+
+Implemented as `POST /api/auth/backchannel-logout` (`app.py`), which
+validates the `logout_token` Keycloak sends (signature via JWKS, issuer,
+audience, a genuine backchannel-logout event, freshness, and explicitly
+the *absence* of a nonce - see `auth.verify_logout_token`'s docstring for
+the full checklist) and then adds the session's Keycloak `sid` to a small
+in-memory revocation list that `require_auth` checks on every request.
+
+**To enable it, on the Keycloak side:**
+1. Client → `switchboard` → Settings → Logout section → **Backchannel
+   logout URL**: `<your Switchboard URL>/api/auth/backchannel-logout`.
+2. **Backchannel logout session required**: on (this is what makes
+   Keycloak actually include a `sid` in the logout token).
+
+**The part that's easy to miss:** that URL must be reachable *from
+Keycloak's own server*, not from your browser. If Switchboard is only
+reachable at `http://localhost:8080` from your machine and Keycloak runs
+on a different host entirely, Keycloak's server has no way to call back
+in - `localhost` from Keycloak's perspective means Keycloak's own
+container/host, not yours. This isn't a bug in this app; it's a network
+reachability requirement of the spec itself. Back-Channel Logout only
+works once Switchboard is exposed at an address Keycloak can actually
+reach (a LAN hostname/IP, a reverse tunnel, or a public URL) - front-
+channel login/logout (the normal browser flow) has no such requirement
+and works fine at `localhost` regardless.
+
 ## Deployment config: the Settings page, not just `.env`
 
 `webui/settings.py` holds the handful of things that differ per
-deployment - admin login, the Postgres DSN, the Loki URL - as a small JSON
-file (`webui-data/settings.json`, `hash_password()`'d, never plaintext) on
-the same Docker volume that already held `devices_store.json`/
-`switchboard.db` pre-Postgres. It's read once at startup and again on every
-Settings-page save; `app.py`'s `_apply_settings()`/`_load_database()`
-validate a new Postgres DSN by actually connecting before committing any
-globals, so a typo'd save can't half-apply or drop the working connection.
+deployment - the Postgres DSN, the Loki URL - as a small JSON file
+(`webui-data/settings.json`) on the same Docker volume that already held
+`devices_store.json`/`switchboard.db` pre-Postgres. It's read once at
+startup and again on every Settings-page save; `app.py`'s
+`_apply_settings()`/`_load_database()` validate a new Postgres DSN by
+actually connecting before committing any globals, so a typo'd save can't
+half-apply or drop the working connection. Login (OIDC) is deliberately
+*not* part of this file - see "Login: OIDC against Keycloak" above for why
+that's env-var-only instead.
 
-Precedence: `settings.json` wins if present. `WEBUI_USER`/`WEBUI_PASS`/
-`DATABASE_URL`/`LOKI_URL` in `.env` are only consulted to *seed* that file
-on the very first boot of a fresh volume (`settings.bootstrap_from_env()`)
-- handy for anyone who'd rather keep configuring per-deployment values the
-old docker-compose way instead of clicking through the wizard. Once
-`settings.json` exists, later `.env` edits have no effect; use the Settings
-page instead. If neither is present, the app boots anyway (`CONFIGURED =
-False`) and serves the setup wizard - unauthenticated `/api/setup` is the
-only way in at that point, and it locks itself out (403) the moment setup
-completes, so it can't be used to reconfigure a live deployment without a
-Settings-page login.
+Precedence: `settings.json` wins if present. `DATABASE_URL`/`LOKI_URL` in
+`.env` are only consulted to *seed* that file on the very first boot of a
+fresh volume (`settings.bootstrap_from_env()`) - handy for anyone who'd
+rather keep configuring per-deployment values the old docker-compose way
+instead of clicking through the wizard. Once `settings.json` exists, later
+`.env` edits have no effect; use the Settings page instead. If neither is
+present, the app boots anyway (`CONFIGURED = False`) and serves the setup
+wizard - unauthenticated `/api/setup` is the only way in at that point,
+and it locks itself out (403) the moment setup completes, so it can't be
+used to reconfigure a live deployment without an admin login.
 
 If Postgres is unreachable using the *stored* settings (e.g. the box is
 down), the app still starts and login still works - `CONFIGURED` stays
@@ -502,7 +632,9 @@ configured for it yet, same deliberate gap as the Juniper device).
   Switch Status tab's Refresh button), `/api/commands`, `/api/run`
   (auto-saves on every call), `/api/results` (GET/POST, GET takes optional
   `?device_id=` filter), `/api/results/{filename}` (GET/DELETE),
-  `/api/syslog`. Every route requires basic auth.
+  `/api/syslog`. Every route requires a logged-in OIDC session; mutating
+  routes additionally require the operator or admin tier (see "RBAC"
+  above).
 - `results_store.py` — saved results, backed by `db.py` (see "Storage"
   above). Each row keeps a pre-rendered Markdown snapshot plus an
   `auto_saved` flag.
@@ -843,7 +975,8 @@ PSU reads as a real fault in both the table and the alarm list.
 
 ## Note
 
-`WEBUI_USER`/`WEBUI_PASS` in `.env` currently still hold the placeholder
-`admin` / `changeme-webui` used to build and test this - change those
-before leaving this reachable on the network, same as the switch password
-it sits in front of.
+Login is per-user OIDC against Keycloak now (see "Login: OIDC against
+Keycloak" above) - there's no shared app password left to leave at a
+placeholder value. `OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI` in `.env` do
+need filling in with real values from your Keycloak client before login
+will work at all (login 503s with a clear message until then).

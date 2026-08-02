@@ -18,6 +18,7 @@ import Box from "@cloudscape-design/components/box";
 import Alert from "@cloudscape-design/components/alert";
 
 import { createDevice, deleteDevice, getDeviceForEdit, testDevice, updateDevice } from "./api.js";
+import { useHasRole } from "./AuthContext.jsx";
 import { useClientPagination } from "./useClientPagination.js";
 
 const PLATFORM_OPTIONS = [
@@ -80,6 +81,10 @@ function toRequestBody(form, editId) {
 }
 
 export default function DevicesPage({ devices, refreshDevices, pushFlash, prefill, onPrefillConsumed }) {
+  // Device CRUD is admin-tier server-side (see require_role("admin") on
+  // these routes in app.py) - hiding the buttons here is cosmetic, the
+  // server enforces it independently either way.
+  const canEdit = useHasRole("admin");
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState(null); // null = adding a new device
   const [loadingEdit, setLoadingEdit] = useState(false);
@@ -208,9 +213,11 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash, prefil
             variant="h2"
             description="Switches and other network devices Switchboard can run commands against."
             actions={
-              <Button variant="primary" onClick={openAddModal}>
-                Add device
-              </Button>
+              canEdit && (
+                <Button variant="primary" onClick={openAddModal}>
+                  Add device
+                </Button>
+              )
             }
           >
             Devices
@@ -247,7 +254,7 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash, prefil
               id: "actions",
               header: "",
               cell: (d) =>
-                d.source === "added" ? (
+                d.source === "added" && canEdit ? (
                   <SpaceBetween size="xs" direction="horizontal">
                     <Button variant="inline-link" onClick={() => openEditModal(d)}>
                       Edit

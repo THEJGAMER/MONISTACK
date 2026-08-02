@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import quote, urlencode, urlsplit
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -19,15 +20,16 @@ from typing import Optional
 import psycopg2
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
 
 import junos_parsers
 import alert_acks
 import audit
+import auth
 import occurrences
 import paging
 from alertmanager_client import AlertmanagerClient, AlertmanagerError
@@ -89,49 +91,153 @@ PENDING_HOLDS = {}
 ALERT_RULES_FILE = os.environ.get("ALERT_RULES_FILE", str(BASE_DIR / "data" / "prometheus-alerts.yml"))
 PROMETHEUS_RELOAD_URL = os.environ.get("PROMETHEUS_RELOAD_URL", "http://prometheus:9090/-/reload")
 
-# Deployment config (Postgres DSN, Loki URL, webui login) lives in a small
-# JSON file on the webui-data volume, editable from the in-app Settings
-# page - see settings.py for why this can't just live in Postgres too.
-# Falls back to env vars on a brand new volume so existing docker-compose
-# deployments keep working unchanged; if neither is present the app still
-# boots (rather than crashing) and serves a setup wizard instead of the
-# normal UI until someone configures it.
-WEBUI_USER = None
-WEBUI_PASS_HASH = None
+# Deployment config (Postgres DSN, Loki URL) lives in a small JSON file on
+# the webui-data volume, editable from the in-app Settings page - see
+# settings.py for why this can't just live in Postgres too. Falls back to
+# env vars on a brand new volume so existing docker-compose deployments
+# keep working unchanged; if neither is present the app still boots
+# (rather than crashing) and serves a setup wizard instead of the normal UI
+# until someone configures it.
 LOKI_URL = None
 DATABASE_URL = None
 CONFIGURED = False
 DB_ERROR = None
 
-security = HTTPBasic(auto_error=False)
+# Per-user identity via OIDC against an external, BYO Keycloak instance -
+# replaces the old single shared HTTP Basic Auth credential (ROADMAP Phase
+# 1 "the gate on anyone other than you using this"). Keycloak itself is not
+# part of this stack; these just point at wherever it already runs (see
+# webui/README.md for the exact client/role setup required on that end).
+# Deliberately env-var only, not Settings-page-editable like the DSN above:
+# this is infrastructure config (which identity provider to trust), not a
+# per-deployment operational knob, and shouldn't be changeable by whoever
+# is merely logged in as an admin *inside* the app.
+OIDC_ISSUER_URL = os.environ.get("OIDC_ISSUER_URL")
+OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "switchboard")
+OIDC_CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET")
+OIDC_REDIRECT_URI = os.environ.get("OIDC_REDIRECT_URI")
+# Signs the session cookie (Starlette's SessionMiddleware) - not the same
+# secret as the OIDC client secret. Must be set explicitly in production;
+# a random per-process fallback just means every restart invalidates all
+# sessions, which is safe (if mildly annoying) rather than a security hole.
+SESSION_SECRET_KEY = os.environ.get("SESSION_SECRET_KEY") or secrets.token_hex(32)
+SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
+SESSION_TTL_HOURS = float(os.environ.get("SESSION_TTL_HOURS", "12"))
+
+oidc_client = None
+if OIDC_ISSUER_URL and OIDC_CLIENT_SECRET:
+    oidc_client = auth.build_oauth_client(OIDC_ISSUER_URL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET)
+else:
+    log.warning("OIDC_ISSUER_URL/OIDC_CLIENT_SECRET not set - login will not work until configured")
 
 
-def _check_auth(credentials):
-    if not CONFIGURED:
-        raise HTTPException(status_code=503, detail="Switchboard is not configured yet")
-    if credentials is None or not secrets.compare_digest(credentials.username, WEBUI_USER) or not settings_store.verify_password(
-        credentials.password, WEBUI_PASS_HASH
-    ):
-        raise HTTPException(status_code=401, detail="Invalid credentials", headers={"WWW-Authenticate": "Basic"})
+def _session_expired(session):
+    expires_at = session.get("expires_at")
+    return not expires_at or datetime.now(timezone.utc).timestamp() > expires_at
 
 
-def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)):
-    _check_auth(credentials)
-    return credentials.username
+# Sessions here are signed cookies with no server-side table (see the
+# plan's SessionMiddleware correction) - there's nothing to look up to
+# force-end one early. Back-Channel Logout (api_auth_backchannel_logout
+# below) is the one case that needs exactly that: Keycloak calls us
+# directly, server-to-server, when a session ends anywhere (admin-revoked,
+# logged out from another app sharing this SSO session, etc.), and the
+# only way to honor that against a stateless cookie is a small in-memory
+# revocation list keyed by Keycloak's own session id (sid claim, stored in
+# our session at login). Bounded by pruning anything older than the
+# longest a session could legitimately still be alive for.
+_revoked_sids = {}
+_revoked_sids_lock = threading.Lock()
 
 
-def require_auth_and_db(credentials: Optional[HTTPBasicCredentials] = Depends(security)):
-    _check_auth(credentials)
+def _revoke_sid(sid):
+    now = time.time()
+    with _revoked_sids_lock:
+        _revoked_sids[sid] = now
+        cutoff = now - SESSION_TTL_HOURS * 3600
+        for stale_sid in [s for s, revoked_at in _revoked_sids.items() if revoked_at < cutoff]:
+            del _revoked_sids[stale_sid]
+
+
+def _is_sid_revoked(sid):
+    with _revoked_sids_lock:
+        return sid in _revoked_sids
+
+
+def require_auth(request: Request):
+    session = request.session
+    # A role is required here, not just a username - api_auth_callback
+    # refuses to create a session at all for a Keycloak login with no
+    # recognized client role, but this is the actual enforcement backstop:
+    # even a read-only route must not treat "logged in" and "has a role"
+    # as the same thing (confirmed live: without this check, a
+    # username-only session could still list every device - a real gap,
+    # not hypothetical).
+    if not session.get("username") or not session.get("role") or _session_expired(session):
+        raise HTTPException(status_code=401, detail="Not logged in")
+    if session.get("sid") and _is_sid_revoked(session["sid"]):
+        # Keycloak told us (via backchannel logout) this session already
+        # ended - the cookie is still validly signed but no longer honored.
+        raise HTTPException(status_code=401, detail="Session was ended")
+    return session["username"]
+
+
+def require_auth_and_db(request: Request):
+    user = require_auth(request)
     if STORE is None:
         raise HTTPException(
             status_code=503,
             detail=f"Database unavailable ({DB_ERROR}). Fix the connection on the Settings page.",
         )
-    return credentials.username
+    return user
+
+
+def require_role(min_role):
+    """Dependency factory - same session lookup as require_auth_and_db,
+    plus a role floor. `viewer < operator < admin`, checked against the
+    role captured in the session at login time (from Keycloak client
+    roles - see auth.role_from_claims)."""
+    def _dep(request: Request, user: str = Depends(require_auth_and_db)):
+        # `user` comes through Depends() rather than a direct call, so
+        # tests overriding require_auth_and_db via
+        # app.dependency_overrides (see test_api_run_params.py) still work
+        # for every route this wraps - FastAPI resolves overrides through
+        # the whole sub-dependency graph, not just top-level Depends().
+        # No default here deliberately - a session missing a role entirely
+        # (shouldn't happen; api_auth_callback refuses to create one
+        # without a real role) must fail role_meets, not silently pass as
+        # viewer.
+        role = request.session.get("role")
+        if not auth.role_meets(role, min_role):
+            raise HTTPException(status_code=403, detail=f"requires {min_role} role, you have {role}")
+        return user
+    return _dep
+
+
+# Named once, not called inline as `Depends(require_operator)` at
+# every route - FastAPI's dependency_overrides (used by tests, e.g.
+# test_api_run_params.py) keys on the exact callable object, and a fresh
+# closure from a fresh require_role(...) call wouldn't match one used
+# elsewhere.
+require_operator = require_role("operator")
+require_admin = require_role("admin")
 
 
 app = FastAPI(title="Switchboard")
 app.add_middleware(GZipMiddleware, minimum_size=500)
+# SameSite=Lax + JSON-only mutating bodies is this app's CSRF defense (no
+# CORS middleware exists or is added, so a cross-site form POST has nowhere
+# to succeed) - see webui/README.md for the full reasoning. Secure is only
+# enabled once SESSION_COOKIE_SECURE=true, i.e. once TLS is actually
+# terminating in front of this app (a separate, still-open ROADMAP item);
+# forcing it before then would break every login.
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET_KEY,
+    session_cookie="switchboard_session",
+    same_site="lax",
+    https_only=SESSION_COOKIE_SECURE,
+)
 
 
 # Safety nets, not the primary error path: most routes already catch
@@ -761,13 +867,11 @@ def _apply_settings(settings_dict):
     wizard or Settings page saves a new config. Raises on a bad Postgres
     DSN; callers decide how to surface that (500 at boot vs. a 400 back to
     the wizard/settings form)."""
-    global WEBUI_USER, WEBUI_PASS_HASH, LOKI_URL, DATABASE_URL, CONFIGURED, DB_ERROR, LOKI
+    global LOKI_URL, DATABASE_URL, CONFIGURED, DB_ERROR, LOKI
     # Validate the DSN before committing any globals, so a failed update
-    # (e.g. a typo'd Postgres URL) can't half-apply - login credentials
-    # and the previously-working DB connection are left untouched.
+    # (e.g. a typo'd Postgres URL) can't half-apply - the previously-working
+    # DB connection is left untouched.
     _load_database(settings_dict["database_url"])
-    WEBUI_USER = settings_dict["webui_user"]
-    WEBUI_PASS_HASH = settings_dict["webui_pass_hash"]
     LOKI_URL = settings_dict.get("loki_url") or settings_store.DEFAULT_LOKI_URL
     DATABASE_URL = settings_dict["database_url"]
     LOKI = LokiClient(LOKI_URL)
@@ -786,8 +890,6 @@ if _initial_settings is not None:
         _apply_settings(_initial_settings)
     except Exception as e:
         log.error("startup: could not connect using stored settings: %s", e)
-        WEBUI_USER = _initial_settings["webui_user"]
-        WEBUI_PASS_HASH = _initial_settings["webui_pass_hash"]
         LOKI_URL = _initial_settings.get("loki_url") or settings_store.DEFAULT_LOKI_URL
         DATABASE_URL = _initial_settings["database_url"]
         CONFIGURED = True
@@ -869,15 +971,11 @@ def _validate_device_request(req, existing=None):
 
 
 class SetupRequest(BaseModel):
-    webui_user: str
-    webui_pass: str
     database_url: str
     loki_url: Optional[str] = None
 
 
 class SettingsUpdateRequest(BaseModel):
-    webui_user: str
-    webui_pass: Optional[str] = None  # blank = keep current
     database_url: Optional[str] = None  # blank = keep current
     loki_url: Optional[str] = None
 
@@ -936,19 +1034,16 @@ def metrics_endpoint():
 @app.post("/api/setup")
 def api_setup(req: SetupRequest):
     """First-run only - deliberately unauthenticated, since there's no
-    login yet to authenticate with, but locked out entirely once
-    CONFIGURED so it can't be used to reconfigure a running deployment
-    without a Settings-page login."""
+    login yet to authenticate with (login is now handled by the external
+    Keycloak instance, configured via env vars, not through this wizard),
+    but locked out entirely once CONFIGURED so it can't be used to
+    reconfigure a running deployment without an admin login."""
     if CONFIGURED:
         raise HTTPException(status_code=403, detail="Switchboard is already configured")
-    if not req.webui_user.strip() or not req.webui_pass:
-        raise HTTPException(status_code=400, detail="a login username and password are required")
     if not req.database_url.strip():
         raise HTTPException(status_code=400, detail="a Postgres connection string is required")
 
     new_settings = {
-        "webui_user": req.webui_user.strip(),
-        "webui_pass_hash": settings_store.hash_password(req.webui_pass),
         "database_url": req.database_url.strip(),
         "loki_url": (req.loki_url or "").strip() or settings_store.DEFAULT_LOKI_URL,
     }
@@ -957,14 +1052,13 @@ def api_setup(req: SetupRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not connect to Postgres: {e}")
     settings_store.save(new_settings)
-    log.info("initial setup completed (webui_user=%s)", new_settings["webui_user"])
+    log.info("initial setup completed")
     return {"ok": True}
 
 
 @app.get("/api/settings")
 def api_get_settings(user: str = Depends(require_auth)):
     return {
-        "webui_user": WEBUI_USER,
         "database_url_display": settings_store.redact_dsn(DATABASE_URL) if DATABASE_URL else None,
         "loki_url": LOKI_URL,
         "db_error": DB_ERROR,
@@ -972,13 +1066,8 @@ def api_get_settings(user: str = Depends(require_auth)):
 
 
 @app.put("/api/settings")
-def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_auth)):
-    if not req.webui_user.strip():
-        raise HTTPException(status_code=400, detail="a login username is required")
-
+def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_admin)):
     new_settings = {
-        "webui_user": req.webui_user.strip(),
-        "webui_pass_hash": settings_store.hash_password(req.webui_pass) if req.webui_pass else WEBUI_PASS_HASH,
         "database_url": (req.database_url or "").strip() or DATABASE_URL,
         "loki_url": (req.loki_url or "").strip() or settings_store.DEFAULT_LOKI_URL,
     }
@@ -991,13 +1080,212 @@ def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_
     return {"ok": True}
 
 
+# Light per-IP throttle on the token-exchange endpoint - defense in depth,
+# not the primary brute-force protection (that's Keycloak's job now, same
+# as any OIDC-fronted app). In-memory, same proportionate spirit as other
+# in-process state in this file (e.g. PENDING_HOLDS above) - losing it on
+# restart just resets the window, not a security regression.
+_auth_attempts = {}
+_auth_attempts_lock = threading.Lock()
+
+
+def _check_callback_rate_limit(ip):
+    now = time.monotonic()
+    with _auth_attempts_lock:
+        attempts = [t for t in _auth_attempts.get(ip, []) if now - t < 60]
+        attempts.append(now)
+        _auth_attempts[ip] = attempts
+        if len(attempts) > 10:
+            raise HTTPException(status_code=429, detail="too many login attempts, try again shortly")
+
+
+@app.get("/api/auth/login")
+async def api_auth_login(request: Request):
+    if oidc_client is None:
+        raise HTTPException(status_code=503, detail="OIDC is not configured (OIDC_ISSUER_URL/OIDC_CLIENT_SECRET missing)")
+    redirect_uri = OIDC_REDIRECT_URI or str(request.url_for("api_auth_callback"))
+    return await oidc_client.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/api/auth/callback")
+async def api_auth_callback(request: Request):
+    """Server-to-server code exchange + ID token validation (signature via
+    JWKS, iss/aud/exp/nonce) all handled by Authlib - see auth.py's
+    docstring for why that's not hand-rolled here."""
+    if oidc_client is None:
+        raise HTTPException(status_code=503, detail="OIDC is not configured")
+    _check_callback_rate_limit(request.client.host if request.client else "unknown")
+    try:
+        token = await oidc_client.authorize_access_token(request)
+    except Exception as e:
+        log.warning("OIDC callback failed: %s", e)
+        raise HTTPException(status_code=401, detail="OIDC login failed")
+    claims = token.get("userinfo") or {}
+    # Also check the /userinfo endpoint directly, not just the ID token - a
+    # Keycloak client-role mapper can be scoped to one and not the other
+    # independently, so a setup that only emits resource_access on one of
+    # the two still works here rather than failing depending on which one
+    # got configured (confirmed live: this exact gap is what caused
+    # role_from_claims to see nothing at all during initial setup).
+    try:
+        userinfo_endpoint_claims = await oidc_client.userinfo(token=token)
+    except Exception as e:
+        userinfo_endpoint_claims = None
+        log.warning("could not call /userinfo endpoint: %s", e)
+    if userinfo_endpoint_claims and userinfo_endpoint_claims.get("resource_access") and not claims.get("resource_access"):
+        claims = {**claims, "resource_access": userinfo_endpoint_claims["resource_access"]}
+    username = claims.get("preferred_username") or claims.get("email") or claims.get("sub")
+    if not username:
+        raise HTTPException(status_code=401, detail="OIDC token had no usable identity claim")
+    role = auth.role_from_claims(claims, OIDC_CLIENT_ID)
+    if role is None:
+        # No session is created at all - a valid Keycloak login is not the
+        # same as being granted anything in this app. Denied outright
+        # rather than falling back to viewer, so "no role assigned" reads
+        # as "no access", not "read-only access by default". Redirects to
+        # a real page (not a bare JSON 403) so there's an actual logout
+        # button to escape the loop instead of a dead end.
+        if AUDIT is not None:
+            AUDIT.record(username, "auth.denied", detail={"reason": "no client role assigned"})
+        log.warning("user=%s authenticated via OIDC but has no switchboard client role - denying", username)
+        return RedirectResponse(url=f"/#/access-denied/{quote(username)}")
+    request.session["username"] = username
+    request.session["email"] = claims.get("email")
+    request.session["role"] = role
+    # The raw client-role claim this role was computed from, not just the
+    # end result - lets the Account page show exactly which roles were
+    # assigned, which is the actual question when someone's permissions
+    # look wrong.
+    request.session["roles_claim"] = list(
+        ((claims.get("resource_access") or {}).get(OIDC_CLIENT_ID) or {}).get("roles") or []
+    )
+    request.session["login_at"] = datetime.now(timezone.utc).isoformat()
+    request.session["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=SESSION_TTL_HOURS)).timestamp()
+    # Kept only for RP-initiated logout's id_token_hint (see api_auth_logout)
+    # - without it, clearing our own session cookie doesn't end Keycloak's
+    # own SSO session, so an immediate re-login silently succeeds with no
+    # prompt (confirmed live: this was exactly why logout looked broken
+    # before this was added).
+    request.session["id_token"] = token.get("id_token")
+    # Keycloak's own SSO session id - lets a Back-Channel Logout call (see
+    # api_auth_backchannel_logout) revoke exactly this session later
+    # without needing a server-side session table for anything else.
+    request.session["sid"] = claims.get("sid")
+    if AUDIT is not None:
+        AUDIT.record(username, "auth.login", detail={"role": role})
+    log.info("user=%s logged in via OIDC (role=%s)", username, role)
+    return RedirectResponse(url="/")
+
+
+@app.get("/api/auth/logout")
+async def api_auth_logout(request: Request):
+    """Clearing our own session cookie alone isn't a real logout - Keycloak
+    keeps its own SSO session in the browser, so the very next
+    /api/auth/login would silently re-authenticate with no prompt at all
+    (confirmed live - this was the exact bug reported: "logout doesn't
+    work"). RP-Initiated Logout (the end_session_endpoint from OIDC
+    discovery) is what actually ends that SSO session too; the browser is
+    redirected there, not fetched, since a page navigation is what's
+    needed to hit a different origin and come back.
+    """
+    username = request.session.get("username")
+    id_token = request.session.get("id_token")
+    request.session.clear()
+    if username and AUDIT is not None:
+        AUDIT.record(username, "auth.logout")
+    if oidc_client is None:
+        return RedirectResponse(url="/")
+    try:
+        metadata = await oidc_client.load_server_metadata()
+        end_session_endpoint = metadata.get("end_session_endpoint")
+    except Exception as e:
+        log.warning("could not load OIDC server metadata for logout: %s", e)
+        end_session_endpoint = None
+    if not end_session_endpoint:
+        # No RP-initiated logout support on this issuer - our own session is
+        # already cleared above, which is the best we can do.
+        return RedirectResponse(url="/")
+    # Keycloak's SSO session cookie is scoped to wherever OIDC_REDIRECT_URI
+    # points, so post-logout lands back at that same origin.
+    origin = urlsplit(OIDC_REDIRECT_URI).scheme + "://" + urlsplit(OIDC_REDIRECT_URI).netloc + "/"
+    params = {"client_id": OIDC_CLIENT_ID, "post_logout_redirect_uri": origin}
+    if id_token:
+        params["id_token_hint"] = id_token
+    return RedirectResponse(url=f"{end_session_endpoint}?{urlencode(params)}")
+
+
+@app.post("/api/auth/backchannel-logout")
+async def api_auth_backchannel_logout(request: Request):
+    """OIDC Back-Channel Logout 1.0 receiver - Keycloak calls this directly,
+    server-to-server (no browser, no cookie), whenever a session ends any
+    way other than clicking this app's own Log out button: an admin
+    revoking a session in Keycloak, logging out from another app sharing
+    the same SSO session, etc. Without this, only our own /api/auth/logout
+    ends a session here - anyone whose Keycloak session ended some other
+    way would keep a working Switchboard cookie until it naturally expires
+    (SESSION_TTL_HOURS).
+
+    Requires two things on the Keycloak side to ever actually fire: the
+    switchboard client's "Backchannel logout URL" set to this exact route,
+    and - the easy part to miss - that URL must be reachable from
+    Keycloak's own server, not the user's browser. If Switchboard is only
+    reachable at a private/localhost address from your machine and
+    Keycloak runs elsewhere, Keycloak's server has no way to call back in;
+    this isn't a bug here, it's the spec's own network requirement.
+    """
+    if oidc_client is None:
+        raise HTTPException(status_code=503, detail="OIDC is not configured")
+    form = await request.form()
+    logout_token = form.get("logout_token")
+    if not logout_token:
+        raise HTTPException(status_code=400, detail="missing logout_token")
+    try:
+        metadata = await oidc_client.load_server_metadata()
+        jwks_uri = metadata.get("jwks_uri")
+        if not jwks_uri:
+            raise ValueError("issuer metadata has no jwks_uri")
+        sid, sub = await auth.verify_logout_token(logout_token, OIDC_ISSUER_URL, OIDC_CLIENT_ID, jwks_uri)
+    except Exception as e:
+        log.warning("rejected backchannel logout token: %s", e)
+        raise HTTPException(status_code=400, detail="invalid logout_token")
+    if sid:
+        _revoke_sid(sid)
+    log.info("backchannel logout: sid=%s sub=%s", sid, sub)
+    if AUDIT is not None:
+        AUDIT.record(sub or "unknown", "auth.backchannel_logout", detail={"sid": sid})
+    # Spec requires 200 with no body on success - Keycloak treats anything
+    # else as this endpoint having failed to process the logout.
+    return Response(status_code=200)
+
+
+@app.get("/api/auth/me")
+def api_auth_me(request: Request, user: str = Depends(require_auth)):
+    """Backs both the TopNav's username/role display and the Account page
+    (see AccountPage.jsx) - the latter needs more than just
+    username/role: the raw roles_claim so someone can see *why* they got
+    the role they got, and account_url so the app can point at Keycloak's
+    own self-service console without the frontend needing to know the
+    issuer URL itself. Passwords/MFA/sessions are deliberately not
+    manageable here - that's Keycloak's job, linked out to, not
+    reimplemented."""
+    return {
+        "username": user,
+        "email": request.session.get("email"),
+        "role": request.session.get("role"),
+        "roles_claim": request.session.get("roles_claim", []),
+        "login_at": request.session.get("login_at"),
+        "expires_at": request.session.get("expires_at"),
+        "account_url": f"{OIDC_ISSUER_URL.rstrip('/')}/account" if OIDC_ISSUER_URL else None,
+    }
+
+
 @app.get("/api/devices")
 def api_devices(user: str = Depends(require_auth_and_db)):
     return [d.to_public_dict() for d in DEVICES]
 
 
 @app.post("/api/devices")
-def api_create_device(req: DeviceCreateRequest, user: str = Depends(require_auth_and_db)):
+def api_create_device(req: DeviceCreateRequest, user: str = Depends(require_admin)):
     _validate_device_request(req)
     with _registry_lock:
         device_id = _slugify(req.name)
@@ -1042,7 +1330,7 @@ def api_get_device_for_edit(device_id: str, user: str = Depends(require_auth_and
 
 
 @app.put("/api/devices/{device_id}")
-def api_update_device(device_id: str, req: DeviceCreateRequest, user: str = Depends(require_auth_and_db)):
+def api_update_device(device_id: str, req: DeviceCreateRequest, user: str = Depends(require_admin)):
     device = DEVICES_BY_ID.get(device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -1089,7 +1377,7 @@ def api_update_device(device_id: str, req: DeviceCreateRequest, user: str = Depe
 
 
 @app.delete("/api/devices/{device_id}")
-def api_delete_device(device_id: str, user: str = Depends(require_auth_and_db)):
+def api_delete_device(device_id: str, user: str = Depends(require_admin)):
     device = DEVICES_BY_ID.get(device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -1120,7 +1408,7 @@ def api_device_status(device_id: str, interfaces: bool = False, user: str = Depe
 
 
 @app.post("/api/devices/{device_id}/status/refresh")
-def api_device_status_refresh(device_id: str, user: str = Depends(require_auth_and_db)):
+def api_device_status_refresh(device_id: str, user: str = Depends(require_operator)):
     """Forces an immediate status poll instead of waiting for the next
     background cycle - backs the "Refresh" button on the Switch Status
     tab."""
@@ -1206,7 +1494,7 @@ def api_device_trend_data(
 
 
 @app.post("/api/devices/test")
-def api_test_device(req: DeviceCreateRequest, user: str = Depends(require_auth_and_db)):
+def api_test_device(req: DeviceCreateRequest, user: str = Depends(require_operator)):
     """Try connecting with the given draft device details, without saving
     anything. Best-effort: a failure here doesn't block Save, since the
     login handshake this checks only has real support for `os9`/`junos`
@@ -1325,7 +1613,7 @@ def _run_and_save(device, category_id, command_id, params, user, auto_saved=True
 
 
 @app.post("/api/run")
-def api_run(req: RunRequest, user: str = Depends(require_auth_and_db)):
+def api_run(req: RunRequest, user: str = Depends(require_operator)):
     device = DEVICES_BY_ID.get(req.device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -1350,7 +1638,7 @@ class BulkRunRequest(BaseModel):
 
 
 @app.post("/api/bulk-run")
-def api_bulk_run(req: BulkRunRequest, user: str = Depends(require_auth_and_db)):
+def api_bulk_run(req: BulkRunRequest, user: str = Depends(require_operator)):
     """Runs the same allowlisted command across several devices at once
     (ROADMAP 3.6 "bulk operations"), for a collated view of e.g. "show
     version" across the whole fleet in one shot. One device's failure
@@ -1396,7 +1684,7 @@ class SaveResultRequest(BaseModel):
 
 
 @app.post("/api/results")
-def api_save_result(req: SaveResultRequest, user: str = Depends(require_auth_and_db)):
+def api_save_result(req: SaveResultRequest, user: str = Depends(require_operator)):
     device = DEVICES_BY_ID.get(req.device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -1508,7 +1796,7 @@ def api_list_schedules(user: str = Depends(require_auth_and_db)):
 
 
 @app.post("/api/schedules")
-def api_create_schedule(req: ScheduleCreateRequest, user: str = Depends(require_auth_and_db)):
+def api_create_schedule(req: ScheduleCreateRequest, user: str = Depends(require_operator)):
     device = DEVICES_BY_ID.get(req.device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -1522,7 +1810,7 @@ def api_create_schedule(req: ScheduleCreateRequest, user: str = Depends(require_
 
 
 @app.put("/api/schedules/{schedule_id}")
-def api_update_schedule(schedule_id: str, req: ScheduleUpdateRequest, user: str = Depends(require_auth_and_db)):
+def api_update_schedule(schedule_id: str, req: ScheduleUpdateRequest, user: str = Depends(require_operator)):
     if SCHEDULES.get(schedule_id) is None:
         raise HTTPException(status_code=404, detail="unknown schedule")
     if req.interval_minutes is not None and req.interval_minutes < 5:
@@ -1531,14 +1819,14 @@ def api_update_schedule(schedule_id: str, req: ScheduleUpdateRequest, user: str 
 
 
 @app.delete("/api/schedules/{schedule_id}")
-def api_delete_schedule(schedule_id: str, user: str = Depends(require_auth_and_db)):
+def api_delete_schedule(schedule_id: str, user: str = Depends(require_operator)):
     if not SCHEDULES.delete(schedule_id):
         raise HTTPException(status_code=404, detail="unknown schedule")
     return {"ok": True}
 
 
 @app.post("/api/schedules/{schedule_id}/run")
-def api_run_schedule_now(schedule_id: str, user: str = Depends(require_auth_and_db)):
+def api_run_schedule_now(schedule_id: str, user: str = Depends(require_operator)):
     sched = SCHEDULES.get(schedule_id)
     if sched is None:
         raise HTTPException(status_code=404, detail="unknown schedule")
@@ -1572,7 +1860,7 @@ def api_get_compliance_config(user: str = Depends(require_auth_and_db)):
 
 
 @app.put("/api/compliance/config")
-def api_update_compliance_config(req: ComplianceConfigRequest, user: str = Depends(require_auth_and_db)):
+def api_update_compliance_config(req: ComplianceConfigRequest, user: str = Depends(require_admin)):
     data = json.dumps({"expected_vlans": req.expected_vlans})
     DB.execute(
         "INSERT INTO compliance_config (id, data) VALUES ('default', %s) "
@@ -1599,7 +1887,7 @@ def api_run_compliance(user: str = Depends(require_auth_and_db)):
 
 
 @app.delete("/api/results/{filename}")
-def api_delete_result(filename: str, user: str = Depends(require_auth_and_db)):
+def api_delete_result(filename: str, user: str = Depends(require_operator)):
     if not RESULTS.delete(filename):
         raise HTTPException(status_code=404, detail="unknown result")
     return {"ok": True}
@@ -1919,7 +2207,7 @@ def _require_occurrence(occurrence_id):
 
 
 @app.post("/api/alarms/{occurrence_id}/ack")
-def api_ack_occurrence(occurrence_id: int, req: NoteRequest, user: str = Depends(require_auth_and_db)):
+def api_ack_occurrence(occurrence_id: int, req: NoteRequest, user: str = Depends(require_operator)):
     """Acknowledges one occurrence: records who/when/why without
     suppressing anything. Scoped to this occurrence deliberately - taking
     today's flap says nothing about the next one, and the log should show
@@ -1933,7 +2221,7 @@ def api_ack_occurrence(occurrence_id: int, req: NoteRequest, user: str = Depends
 
 
 @app.post("/api/alarms/{occurrence_id}/unack")
-def api_unack_occurrence(occurrence_id: int, user: str = Depends(require_auth_and_db)):
+def api_unack_occurrence(occurrence_id: int, user: str = Depends(require_operator)):
     occurrence = _require_occurrence(occurrence_id)
     if not OCCURRENCES.unack(occurrence_id):
         raise HTTPException(status_code=404, detail="that alarm is not acknowledged")
@@ -2030,7 +2318,7 @@ def api_get_audit_log(
     limit: int = 200,
     action_prefix: Optional[str] = None,
     fingerprint: Optional[str] = None,
-    user: str = Depends(require_auth_and_db),
+    user: str = Depends(require_admin),
 ):
     return AUDIT.list(limit=limit, action_prefix=action_prefix, fingerprint=fingerprint)
 
@@ -2115,7 +2403,7 @@ def api_list_alarms(limit: int = 200, signature: Optional[str] = None, user: str
 
 
 @app.get("/api/alarms/{occurrence_id}")
-def api_get_alarm(occurrence_id: int, user: str = Depends(require_auth_and_db)):
+def api_get_alarm(occurrence_id: int, request: Request, user: str = Depends(require_auth_and_db)):
     """One occurrence in full: its own timeline, its own discussion, and a
     list of *earlier* occurrences of the same alarm - linked, not merged,
     so an external ticketing system fed from this can decide for itself
@@ -2205,6 +2493,7 @@ def api_get_alarm(occurrence_id: int, user: str = Depends(require_auth_and_db)):
         # So the UI knows which comments offer a delete control. The server
         # enforces the same rule independently (see api_delete_comment).
         "current_user": user,
+        "current_role": request.session.get("role"),
     }
 
 
@@ -2215,7 +2504,7 @@ def api_list_comments(occurrence_id: int, user: str = Depends(require_auth_and_d
 
 
 @app.post("/api/alarms/{occurrence_id}/comments")
-def api_add_comment(occurrence_id: int, req: CommentRequest, user: str = Depends(require_auth_and_db)):
+def api_add_comment(occurrence_id: int, req: CommentRequest, user: str = Depends(require_operator)):
     occurrence = _require_occurrence(occurrence_id)
     body = (req.body or "").strip()
     if not body:
@@ -2227,15 +2516,16 @@ def api_add_comment(occurrence_id: int, req: CommentRequest, user: str = Depends
 
 
 @app.delete("/api/alarms/{occurrence_id}/comments/{comment_id}")
-def api_delete_comment(occurrence_id: int, comment_id: int, user: str = Depends(require_auth_and_db)):
+def api_delete_comment(occurrence_id: int, comment_id: int, request: Request, user: str = Depends(require_auth_and_db)):
     """Authors can delete their own comments (a typo in a conversation is
-    worth fixing); nobody can delete anyone else's, and the deletion itself
-    is audited, so the record of what happened survives the message."""
+    worth fixing); nobody else can delete them except an admin (RBAC
+    bypass on this one existing rule), and the deletion itself is audited,
+    so the record of what happened survives the message."""
     occurrence = _require_occurrence(occurrence_id)
     comment = OCCURRENCES.get_comment(occurrence_id, comment_id)
     if comment is None:
         raise HTTPException(status_code=404, detail="unknown comment")
-    if comment["author"] != user:
+    if comment["author"] != user and request.session.get("role") != "admin":
         raise HTTPException(status_code=403, detail="you can only delete your own comments")
     OCCURRENCES.delete_comment(comment_id)
     AUDIT.record(user, "alert.comment_deleted", occurrence["alertname"], {"note": comment["body"]},
@@ -2248,7 +2538,7 @@ class DelayRequest(BaseModel):
 
 
 @app.post("/api/alarms/{occurrence_id}/page-now")
-def api_page_now(occurrence_id: int, user: str = Depends(require_auth_and_db)):
+def api_page_now(occurrence_id: int, user: str = Depends(require_operator)):
     """Skips the remaining investigation window - lifts the hold so
     Alertmanager pages on its next dispatch."""
     occurrence = _require_occurrence(occurrence_id)
@@ -2263,7 +2553,7 @@ def api_page_now(occurrence_id: int, user: str = Depends(require_auth_and_db)):
 
 
 @app.post("/api/alarms/{occurrence_id}/delay-page")
-def api_delay_page(occurrence_id: int, req: DelayRequest, user: str = Depends(require_auth_and_db)):
+def api_delay_page(occurrence_id: int, req: DelayRequest, user: str = Depends(require_operator)):
     """Pushes the page further out while investigating. Replaces the
     existing hold rather than stacking a second one - silences are
     additive in Alertmanager, so layering them would make "page now"
@@ -2288,7 +2578,7 @@ def api_delay_page(occurrence_id: int, req: DelayRequest, user: str = Depends(re
 
 
 @app.post("/api/alarms/{occurrence_id}/narg")
-def api_narg(occurrence_id: int, req: NoteRequest, user: str = Depends(require_auth_and_db)):
+def api_narg(occurrence_id: int, req: NoteRequest, user: str = Depends(require_operator)):
     """NARG - paging off for this alarm. The alarm stays recorded, stays
     visible and still resolves normally; only the pager is stopped. Not
     open-ended (see paging.hold_indefinitely): the hold lapses after 24h
@@ -2306,7 +2596,7 @@ def api_narg(occurrence_id: int, req: NoteRequest, user: str = Depends(require_a
 
 
 @app.post("/api/alarms/{occurrence_id}/enable-paging")
-def api_enable_paging(occurrence_id: int, user: str = Depends(require_auth_and_db)):
+def api_enable_paging(occurrence_id: int, user: str = Depends(require_operator)):
     """Undoes NARG - lifts the hold and lets the alarm page again."""
     occurrence = _require_occurrence(occurrence_id)
     PAGER.release(occurrence["silence_id"])
@@ -2318,7 +2608,7 @@ def api_enable_paging(occurrence_id: int, user: str = Depends(require_auth_and_d
 
 
 @app.post("/api/alarms/{occurrence_id}/resolve")
-def api_resolve_alarm(occurrence_id: int, user: str = Depends(require_auth_and_db)):
+def api_resolve_alarm(occurrence_id: int, user: str = Depends(require_operator)):
     """Manually resolves the alarm behind this occurrence by posting an
     `endsAt` to Alertmanager for its exact label set, which sends the
     normal resolved notification through every receiver (so a PagerDuty
@@ -2372,7 +2662,7 @@ class SilenceCreateRequest(BaseModel):
 
 
 @app.post("/api/silences")
-def api_create_silence(req: SilenceCreateRequest, user: str = Depends(require_auth_and_db)):
+def api_create_silence(req: SilenceCreateRequest, user: str = Depends(require_operator)):
     if not req.matchers:
         raise HTTPException(status_code=400, detail="at least one matcher is required")
     if req.duration_hours <= 0:
@@ -2396,7 +2686,7 @@ def api_create_silence(req: SilenceCreateRequest, user: str = Depends(require_au
 
 
 @app.delete("/api/silences/{silence_id}")
-def api_delete_silence(silence_id: str, user: str = Depends(require_auth_and_db)):
+def api_delete_silence(silence_id: str, user: str = Depends(require_operator)):
     try:
         ALERTMANAGER.delete_silence(silence_id)
     except AlertmanagerError as e:
@@ -2570,7 +2860,7 @@ class AlertRuleUpdateRequest(BaseModel):
 
 
 @app.put("/api/alert-rules/{name}")
-def api_update_alert_rule(name: str, req: AlertRuleUpdateRequest, user: str = Depends(require_auth_and_db)):
+def api_update_alert_rule(name: str, req: AlertRuleUpdateRequest, user: str = Depends(require_admin)):
     try:
         updated = ALERT_RULES.update(
             name,
@@ -2644,7 +2934,7 @@ class InterfaceAlertUpdateRequest(BaseModel):
 
 
 @app.put("/api/interface-alerts/{device_id}")
-def api_update_interface_alert(device_id: str, req: InterfaceAlertUpdateRequest, user: str = Depends(require_auth_and_db)):
+def api_update_interface_alert(device_id: str, req: InterfaceAlertUpdateRequest, user: str = Depends(require_admin)):
     device = DEVICES_BY_ID.get(device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="unknown device")
@@ -2860,7 +3150,7 @@ def api_topology(user: str = Depends(require_auth_and_db)):
 
 
 @app.post("/api/topology/baseline")
-def api_save_topology_baseline(user: str = Depends(require_auth_and_db)):
+def api_save_topology_baseline(user: str = Depends(require_admin)):
     """"Relearn" - overwrites the whole baseline with exactly what's live
     right now, discarding any previously-accepted drift."""
     result = _fetch_live_topology()
@@ -2876,7 +3166,7 @@ class TopologyBaselineAcceptRequest(BaseModel):
 
 
 @app.post("/api/topology/baseline/accept")
-def api_accept_topology_drift(req: TopologyBaselineAcceptRequest, user: str = Depends(require_auth_and_db)):
+def api_accept_topology_drift(req: TopologyBaselineAcceptRequest, user: str = Depends(require_admin)):
     """Manually folds specific drift into the baseline (e.g. "yes, that
     link was intentionally moved") without discarding the rest of the
     baseline the way a full relearn would."""
@@ -2886,7 +3176,7 @@ def api_accept_topology_drift(req: TopologyBaselineAcceptRequest, user: str = De
 
 
 @app.delete("/api/topology/baseline")
-def api_clear_topology_baseline(user: str = Depends(require_auth_and_db)):
+def api_clear_topology_baseline(user: str = Depends(require_admin)):
     TOPOLOGY_STORE.clear()
     log.info("user=%s cleared the topology baseline", user)
     return {"ok": True}
@@ -2921,10 +3211,9 @@ else:
 
 
 @app.get("/")
-def index(credentials: Optional[HTTPBasicCredentials] = Depends(security)):
-    # Unauthenticated (and un-cached) until setup is complete, so the SPA
-    # can boot and show the setup wizard - once CONFIGURED, this behaves
-    # exactly like the old always-authenticated index route.
-    if CONFIGURED:
-        _check_auth(credentials)
+def index():
+    # Always unauthenticated - the SPA itself calls /api/auth/me on load
+    # and redirects to /api/auth/login on a 401 (see api.js). Gating index.html
+    # itself behind a session would be a chicken-and-egg problem: the
+    # redirect-to-Keycloak logic lives in the JS this route serves.
     return FileResponse(str(FRONTEND_DIST / "index.html"), headers={"Cache-Control": "no-cache"})
