@@ -28,13 +28,18 @@ webui (`common/`), **both methods need a full repo checkout** - not just
 the `exporter/` and `packaging/` directories on their own like before this
 restructure.
 
+Every command block below `cd`s to an absolute path (`~/MONISTACK/...`)
+rather than a relative one - safe to copy-paste in sequence from one
+persistent shell, or to run out of order, without needing to track which
+directory the previous block left you in.
+
 ## Method A - venv + systemd (`install.sh`)
 
 On the LXC:
 
 ```bash
-git clone <your-fork-or-repo-url> MONISTACK
-cd MONISTACK/packaging
+cd ~ && git clone <your-fork-or-repo-url> MONISTACK
+cd ~/MONISTACK/packaging
 sudo ./install.sh
 ```
 
@@ -72,7 +77,7 @@ LXC template is the safest way to guarantee compatibility - the binary
 bundles native crypto libraries that don't travel well across distros):
 
 ```bash
-cd packaging
+cd ~/MONISTACK/packaging
 ./build_binary.sh
 ```
 
@@ -117,6 +122,6 @@ that platform).
 ## Removing it
 
 ```bash
-sudo packaging/uninstall.sh            # leaves /etc/s4048-exporter/exporter.env in place
-sudo packaging/uninstall.sh --purge    # also deletes the config dir (holds the switch password) and the service user
+sudo ~/MONISTACK/packaging/uninstall.sh            # leaves /etc/s4048-exporter/exporter.env in place
+sudo ~/MONISTACK/packaging/uninstall.sh --purge    # also deletes the config dir (holds the switch password) and the service user
 ```

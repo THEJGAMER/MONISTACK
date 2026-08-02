@@ -14,7 +14,27 @@ COMMON_SRC="$SCRIPT_DIR/../common"
 BUILD_VENV="$SCRIPT_DIR/.build-venv"
 DIST_DIR="$SCRIPT_DIR"
 
+# python3-venv: same "import venv succeeds but pip doesn't get installed"
+# gotcha as install.sh - always ensured, not just checked for.
+# binutils: PyInstaller needs objdump on Linux to analyze bundled native
+# libraries (cryptography/bcrypt/libssl); without it this fails partway
+# through with "ERROR: On Linux, objdump is required" (confirmed live on
+# a fresh minimal Debian/Ubuntu LXC, which doesn't ship it by default).
+if [[ $EUID -eq 0 ]]; then
+  apt-get update -qq
+  apt-get install -y -qq python3-venv python3-pip binutils
+else
+  echo "==> Ensuring python3-venv/python3-pip/binutils are installed (needs sudo)"
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq python3-venv python3-pip binutils
+fi
+
 python3 -m venv "$BUILD_VENV"
+if [[ ! -x "$BUILD_VENV/bin/pip" ]]; then
+  echo "venv at $BUILD_VENV has no pip - python3-venv likely failed to install above." >&2
+  echo "Try: rm -rf $BUILD_VENV && re-run this script." >&2
+  exit 1
+fi
 "$BUILD_VENV/bin/pip" install --upgrade -q pip
 "$BUILD_VENV/bin/pip" install -q pyinstaller -r "$EXPORTER_SRC/requirements.txt"
 

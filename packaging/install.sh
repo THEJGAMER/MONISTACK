@@ -26,11 +26,18 @@ if [[ ! -f "$COMMON_SRC/db.py" ]]; then
   exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import venv" >/dev/null 2>&1; then
-  echo "==> Installing python3-venv"
-  apt-get update -qq
-  apt-get install -y -qq python3-venv python3-pip
-fi
+# `import venv` succeeding is NOT a reliable signal that venv creation
+# will actually work - on Debian/Ubuntu, the venv module is part of the
+# standard library and imports fine even without the python3-venv OS
+# package, but without that package ensurepip has nothing to bootstrap
+# from, so `python3 -m venv` silently creates a venv with no pip in it at
+# all (confirmed live: venv/bin/pip simply didn't exist afterward, no
+# error at venv-creation time to catch it). Always ensure the real
+# package is installed - apt skips it near-instantly if already present,
+# so this costs nothing on repeat runs.
+echo "==> Ensuring python3-venv/python3-pip are installed"
+apt-get update -qq
+apt-get install -y -qq python3-venv python3-pip
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   echo "==> Creating service user $SERVICE_USER"
@@ -45,6 +52,12 @@ cp "$EXPORTER_SRC"/parsers.py "$EXPORTER_SRC"/exporter.py "$EXPORTER_SRC"/requir
 if [[ ! -d "$INSTALL_DIR/venv" ]]; then
   echo "==> Creating venv"
   python3 -m venv "$INSTALL_DIR/venv"
+fi
+if [[ ! -x "$INSTALL_DIR/venv/bin/pip" ]]; then
+  echo "venv at $INSTALL_DIR/venv has no pip - python3-venv likely failed to" >&2
+  echo "install above, or a broken venv was left over from a previous run." >&2
+  echo "Try: rm -rf $INSTALL_DIR/venv && re-run this script." >&2
+  exit 1
 fi
 "$INSTALL_DIR/venv/bin/pip" install --upgrade -q pip
 "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/app/requirements.txt"
