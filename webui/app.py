@@ -223,6 +223,31 @@ require_operator = require_role("operator")
 require_admin = require_role("admin")
 
 
+def require_role_no_db(min_role):
+    """Same as require_role, but built on require_auth, not
+    require_auth_and_db - a role check that doesn't itself require the
+    database to be reachable. Exists for exactly one route: PUT
+    /api/settings. require_admin (built on require_auth_and_db) 503s
+    whenever STORE is None, i.e. whenever the DB connection is broken -
+    which is precisely the situation this route exists to fix. Wiring it
+    through require_admin recreates the circular dependency
+    require_auth/require_auth_and_db's own split was originally
+    introduced to avoid for this exact page (see the design notes on
+    SessionMiddleware vs. a DB-backed session store) - confirmed live: a
+    real admin, with a real broken DATABASE_URL, got a 503 trying to fix
+    it, unable to recover without direct file/DB access. This must never
+    happen again for this route."""
+    def _dep(request: Request, user: str = Depends(require_auth)):
+        role = request.session.get("role")
+        if not auth.role_meets(role, min_role):
+            raise HTTPException(status_code=403, detail=f"requires {min_role} role, you have {role}")
+        return user
+    return _dep
+
+
+require_admin_no_db = require_role_no_db("admin")
+
+
 app = FastAPI(title="Switchboard")
 app.add_middleware(GZipMiddleware, minimum_size=500)
 # SameSite=Lax + JSON-only mutating bodies is this app's CSRF defense (no
@@ -1066,7 +1091,7 @@ def api_get_settings(user: str = Depends(require_auth)):
 
 
 @app.put("/api/settings")
-def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_admin)):
+def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_admin_no_db)):
     new_settings = {
         "database_url": (req.database_url or "").strip() or DATABASE_URL,
         "loki_url": (req.loki_url or "").strip() or settings_store.DEFAULT_LOKI_URL,
