@@ -121,67 +121,20 @@ label was.
 - The temp password used to set this up was shared in plaintext in chat;
   worth rotating it on the switch once you're done validating the stack.
 
-## Installing on an LXC (no Docker)
+## Deploying on an LXC
 
-`packaging/` has everything needed to run just the exporter natively as a
-systemd service inside an LXC container — no Docker required. Point your
-Prometheus (running wherever) at `<lxc-ip>:9101`.
+Two full walkthroughs, depending on what you need:
 
-Two install methods, pick one:
+- **[docs/deploy-lxc-docker.md](docs/deploy-lxc-docker.md)** — the whole
+  stack (webui + exporter + Prometheus + Alertmanager + Grafana) via
+  `docker compose`, in one LXC.
+- **[docs/deploy-lxc-exporter.md](docs/deploy-lxc-exporter.md)** — just the
+  exporter, native, no Docker, as a systemd service (`packaging/`) - for
+  when Prometheus/Grafana already exist elsewhere. Point them at
+  `<lxc-ip>:9101`.
 
-| | needs on the LXC | how it runs |
-|---|---|---|
-| `install.sh` (recommended) | Python 3 (already on Debian/Ubuntu LXC templates) | venv under `/opt/s4048-exporter`, systemd service |
-| `install-binary.sh` | nothing — single compiled executable | binary under `/opt/s4048-exporter`, systemd service |
-
-Both install to the same layout:
-- App/binary: `/opt/s4048-exporter/`
-- Config (credentials): `/etc/s4048-exporter/exporter.env` (mode 600, owned by the service user)
-- systemd unit: `/etc/systemd/system/s4048-exporter.service`, running as a dedicated unprivileged `s4048-exporter` user
-
-### Method A — venv + systemd (`install.sh`)
-
-Copy this whole repo (or at least `exporter/` and `packaging/`) onto the LXC, then:
-
-```
-cd packaging
-sudo ./install.sh
-sudo nano /etc/s4048-exporter/exporter.env   # fill in SWITCH_HOST / SWITCH_USER / SWITCH_PASS
-sudo systemctl restart s4048-exporter
-```
-
-### Method B — standalone binary (`install-binary.sh`)
-
-No Python needed on the target at all. Build once (on a machine matching the
-LXC's OS/arch — building it inside a throwaway copy of the same LXC template
-is the safest way to guarantee compatibility, since the binary bundles
-native crypto libraries):
-
-```
-cd packaging
-./build_binary.sh          # produces ./s4048-exporter
-```
-
-Then copy `s4048-exporter`, `install-binary.sh`, and `exporter.env.example`
-onto the target LXC and run:
-
-```
-sudo ./install-binary.sh
-sudo nano /etc/s4048-exporter/exporter.env
-sudo systemctl restart s4048-exporter
-```
-
-### Either way
-
-```
-journalctl -u s4048-exporter -f      # watch it poll
-curl http://localhost:9101/metrics   # confirm metrics
-```
-
-To remove: `sudo packaging/uninstall.sh` (add `--purge` to also delete the
-config dir — which holds the switch password — and the service user).
-
-Both install paths were smoke-tested against the live switch during
-development: the venv path via the Docker image (same `exporter.py`), and
-the standalone binary by running it directly with real credentials and
-confirming `show processes cpu` / transceiver metrics came back correctly.
+Both install paths for the exporter-only route were smoke-tested against
+the live switch during development: the venv path via the Docker image
+(same `exporter.py`), and the standalone binary by running it directly with
+real credentials and confirming `show processes cpu` / transceiver metrics
+came back correctly.
