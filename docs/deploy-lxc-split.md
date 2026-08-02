@@ -9,7 +9,10 @@ Dockerfiles and volume definitions instead of hand-writing raw `docker run`
 commands per service.
 
 For the simpler single-LXC path, see
-[deploy-lxc-docker.md](deploy-lxc-docker.md). For just the exporter with no
+[deploy-lxc-docker.md](deploy-lxc-docker.md), or
+[deploy-lxc-4lxcs.md](deploy-lxc-4lxcs.md) for a middle ground that avoids
+this guide's one real gotcha (see below) by keeping `webui` and
+`prometheus` together. For just the exporter with no
 Docker at all, see [deploy-lxc-exporter.md](deploy-lxc-exporter.md).
 
 ## The real cost of splitting: no more compose service-name DNS
@@ -86,9 +89,10 @@ into - the above assumes root's home for brevity.)
 
 If you don't want to run NFS at all, the alternative is not deploying
 `webui` and `prometheus` on separate LXCs specifically - keep those two
-together (matching the "app vs. monitoring" or "grouped by concern" splits)
-and only separate the others, since this specific coupling is the one part
-of the stack that isn't a clean network boundary today.
+together and only separate the others, since this specific coupling is the
+one part of the stack that isn't a clean network boundary today. See
+[deploy-lxc-4lxcs.md](deploy-lxc-4lxcs.md) for exactly that split, worked
+through in full.
 
 ## Per-LXC setup
 

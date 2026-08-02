@@ -123,7 +123,7 @@ label was.
 
 ## Deploying on an LXC
 
-Three full walkthroughs, depending on what you need:
+Four full walkthroughs, depending on what you need:
 
 - **[docs/deploy-lxc-docker.md](docs/deploy-lxc-docker.md)** — the whole
   stack (webui + exporter + Prometheus + Alertmanager + Grafana) via
@@ -132,6 +132,10 @@ Three full walkthroughs, depending on what you need:
   services, but each on its own LXC for maximum isolation - covers what
   breaks (compose's built-in service-name DNS) and how each piece is
   reconnected across real IPs instead.
+- **[docs/deploy-lxc-4lxcs.md](docs/deploy-lxc-4lxcs.md)** — a middle
+  ground: `webui` and `prometheus` share one LXC (they're coupled at the
+  filesystem level via the Rules tab's `alerts.yml`, so keeping them
+  together avoids needing NFS), the rest each get their own.
 - **[docs/deploy-lxc-exporter.md](docs/deploy-lxc-exporter.md)** — just the
   exporter, native, no Docker, as a systemd service (`packaging/`) - for
   when Prometheus/Grafana already exist elsewhere. Point them at

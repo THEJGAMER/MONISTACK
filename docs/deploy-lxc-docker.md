@@ -8,7 +8,9 @@ For a lighter option (just the exporter, no Docker, talking to a
 Prometheus/Grafana you already have elsewhere), see
 [deploy-lxc-exporter.md](deploy-lxc-exporter.md) instead. For maximum
 isolation (each service on its own LXC instead of sharing one), see
-[deploy-lxc-split.md](deploy-lxc-split.md).
+[deploy-lxc-split.md](deploy-lxc-split.md), or
+[deploy-lxc-4lxcs.md](deploy-lxc-4lxcs.md) for a middle ground (`webui` and
+`prometheus` share one LXC, the rest each get their own).
 
 Exercised against this repo's actual layout after the 2026-08-02
 restructure (shared `common/` module, per-user OIDC login, multi-device
