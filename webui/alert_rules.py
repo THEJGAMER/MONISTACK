@@ -46,6 +46,14 @@ _SEED_RULES = [
         "severity": "warning",
         "summary_template": "Fan {{ $labels.fan }} down (unit {{ $labels.unit }}, bay {{ $labels.bay }})",
         "description_template": "show environment reports this fan as down.",
+        # Superseded by hardware_alerting.py's syslog+poll HardwareAlarm
+        # path (faster detection, and doesn't need the 120s "for:" window
+        # since reconcile_via_poll already only reacts to a fresh sample -
+        # see ROADMAP). Seeded disabled on fresh deployments so the same
+        # physical fault doesn't produce two separate alerts; kept in the
+        # table (not deleted) so it's one checkbox to bring back if
+        # HardwareAlarm is ever disabled instead.
+        "enabled": False,
     },
     {
         "name": "S4048PSUDown",
@@ -54,6 +62,7 @@ _SEED_RULES = [
         "severity": "critical",
         "summary_template": "PSU {{ $labels.unit }}/{{ $labels.bay }} down",
         "description_template": "show environment reports this power supply as down - if the other PSU is also degraded this is a single point of failure.",
+        "enabled": False,
     },
     {
         "name": "S4048TransceiverAlarm",
@@ -88,9 +97,10 @@ class AlertRuleStore:
             self.db.execute(
                 """INSERT INTO alert_rules
                    (name, expr, for_seconds, severity, summary_template, description_template, enabled, updated_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, 1, %s)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT (name) DO NOTHING""",
-                (r["name"], r["expr"], r["for_seconds"], r["severity"], r["summary_template"], r["description_template"], now),
+                (r["name"], r["expr"], r["for_seconds"], r["severity"], r["summary_template"], r["description_template"],
+                 1 if r.get("enabled", True) else 0, now),
             )
 
     def list(self):

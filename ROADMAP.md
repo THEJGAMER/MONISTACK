@@ -1166,6 +1166,74 @@ The gate on anyone other than you using this.
       that the parser's ordinary up/up case is unaffected by the new
       branch. 49 tests pass; exporter and Prometheus target health both
       confirmed clean post-deploy.
+- [x] **2026-08-02**: Fan/PSU alerting rebuilt as syslog-primary with an
+      SSH-poll fallback (`webui/hardware_alerting.py`), replacing the
+      Prometheus-rule path (`S4048FanDown`/`S4048PSUDown`) entirely after
+      it was reported working for interface-down but not for fan/PSU -
+      even after this same day's earlier latency and silent-drop fixes
+      above, a rule-evaluation-only design still meant every fault waited
+      on a poll+scrape+evaluate cycle. Explicitly revisits and reverses
+      the "considered and rejected" call in this file's earlier
+      2026-08-02 latency entry, which rejected a syslog-fed direct-post
+      path specifically because matching Prometheus's own `instance`/
+      `job` labels for shared occurrence identity looked fragile - this
+      implementation sidesteps that by using its own distinct alertname
+      (`HardwareAlarm`, not `S4048FanDown`/`S4048PSUDown`) rather than
+      trying to impersonate Prometheus's labels, mirroring
+      `interface_alerting.py`'s already-proven three-loop shape (fast
+      Loki-poll syslog check, slow SSH-poll reconcile as the fallback for
+      a missed or never-configured syslog source, Alertmanager-backed
+      reseed on restart since in-memory state isn't persisted).
+
+      `_classify_alarm` (previously private to `app.py`, used only for
+      Alarm History) moved into the new module and is now shared by both
+      the history view and live alerting - still deliberately a second,
+      independent implementation of `syslog/vector.yaml`'s own VRL
+      alarm-normalization block, not merged into one, for the same reason
+      recorded elsewhere in this file: two independently-verified
+      implementations survive a Vector regression silently breaking the
+      pipeline, which has happened before.
+
+      Because the two alerting paths (Prometheus-rule vs. syslog+poll)
+      would otherwise both fire on the same physical fault with different
+      label sets and never dedupe against each other, `S4048FanDown`/
+      `S4048PSUDown` are now seeded **disabled** by default
+      (`alert_rules.py`'s `_SEED_RULES`) rather than deleted - the Rules
+      tab's existing `enabled` toggle already exists for exactly this,
+      and it's one checkbox to bring them back if `HardwareAlarm` is ever
+      disabled instead. Applied to the already-seeded local stack live via
+      the real `AlertRuleStore.update()` + `write_and_reload()` path (not
+      a hand-edit) and confirmed via `GET /api/v1/rules` against the
+      actual running Prometheus that only `S4048DeviceDown`,
+      `S4048InterfaceFlapping`, and `S4048TransceiverAlarm` remain loaded.
+
+      A real key-ordering bug (`reconcile_via_poll` building keys as
+      `(device_id, kind, bay, unit)` against `check_via_syslog`'s
+      `(device_id, kind, unit, bay)`) was caught by 2 of 12 new unit tests
+      failing on first run, before it ever reached a live deploy - fixed
+      by correcting the construction order. A second real bug was found
+      only via live verification, not the tests: Junos devices'
+      `fan2_status` is always `None` (Junos reports one fan per entry, not
+      Dell's paired fan1/fan2), and the original `!= "up"` check on both
+      fields treated `None != "up"` as a fault, false-firing on every
+      healthy Junos fan - confirmed live (`ex3300-juniper`'s fans in
+      `GET /api/v2/alerts`), fixed by filtering `None` out before
+      checking. Separately confirmed (reading `status_poller.py`'s two
+      poll functions in full) that a *failed* SSH poll never resets
+      `status.env` - only the success path assigns real data - so a
+      device going unreachable mid-fault can't cause `reconcile_via_poll`
+      to misread "poll failed" as "nothing faulted" and spuriously
+      resolve a still-real alert.
+
+      Verified live end-to-end against the real running webui/
+      Alertmanager (not just unit tests): a synthetic PSU-down event
+      pushed directly into Loki's push API (sidestepping a confirmed,
+      separate, pre-existing Vector RFC3164 TAG-parsing quirk that a raw
+      crafted UDP packet doesn't replicate - not a bug in either the
+      already-tested VRL or this new code) produced a real `HardwareAlarm`
+      alert with correct labels/summary in Alertmanager; a matching
+      recovery event resolved it. 12 new tests
+      (`test_hardware_alerting.py`), all passing.
 - [x] **2026-08-02**: Made the Prometheus `for:` confirmation window (the
       "pending" time shown on the Alerts/Alarms pages) editable per rule
       from the Rules tab, alongside the existing severity/enabled/page-

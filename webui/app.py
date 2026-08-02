@@ -46,6 +46,7 @@ from results_store import ResultsStore
 from scheduler import ScheduleStore
 import alert_rules
 import compliance
+import hardware_alerting
 import interface_alerting
 from ssh_client import SwitchSSH, SwitchSSHError
 from status_poller import StatusPoller
@@ -330,6 +331,11 @@ INTERFACE_ALERT_CHECKER = interface_alerting.InterfaceAlertChecker()
 # and reconcile_via_poll's docstring - a real restart-mid-outage bug that
 # left a resolved-in-reality alert paging for ~10 extra minutes).
 INTERFACE_ALERT_CHECKER.reseed_from_alertmanager(ALERTMANAGER)
+# Same in-memory, not-reset-on-DB-reconfigure treatment as
+# INTERFACE_ALERT_CHECKER above, for the same reason - see
+# hardware_alerting.py's HardwareAlertChecker docstring.
+HARDWARE_ALERT_CHECKER = hardware_alerting.HardwareAlertChecker()
+HARDWARE_ALERT_CHECKER.reseed_from_alertmanager(ALERTMANAGER)
 DEVICES = []
 DEVICES_BY_ID = {}
 LOKI = None
@@ -609,6 +615,53 @@ def _interface_alert_reconcile_loop():
 
 
 threading.Thread(target=_interface_alert_reconcile_loop, daemon=True, name="interface-alert-reconciler").start()
+
+
+def _env_and_polled_at_for(device_id):
+    """Like _port_state_and_polled_at_for, but the whole environment
+    (fans/psus) rather than one interface - hardware_alerting.py's
+    reconcile_via_poll needs both the raw show-environment shape and the
+    freshness timestamp for the same stale-read-hazard reasons
+    interface_alerting.py's reconcile_via_poll does."""
+    status = STATUS.get(device_id)
+    if status is None:
+        return None, None
+    return status.get("env"), status.get("last_polled")
+
+
+# Fan/PSU hardware alerting - same syslog-primary/poll-fallback shape as
+# interface alerting above, minus the immediate/delayed mode split (no
+# per-entity opt-in table here - see hardware_alerting.py for why). Only
+# two loops are needed, not three: reconcile_via_poll here does both the
+# fire and resolve/restart-recovery jobs interface_alerting.py splits
+# across check_once and reconcile_via_poll, since there's no "confirmed
+# down for N seconds" delayed-mode concept to keep separate.
+def _hardware_alert_syslog_loop():
+    while True:
+        time.sleep(3)
+        if LOKI is None:
+            continue
+        try:
+            HARDWARE_ALERT_CHECKER.check_via_syslog(LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
+        except Exception:
+            log.exception("hardware alert syslog check failed")
+
+
+threading.Thread(target=_hardware_alert_syslog_loop, daemon=True, name="hardware-alert-syslog-checker").start()
+
+
+def _hardware_alert_reconcile_loop():
+    while True:
+        time.sleep(10)
+        try:
+            HARDWARE_ALERT_CHECKER.reconcile_via_poll(
+                list(DEVICES_BY_ID.keys()), _env_and_polled_at_for, _device_name_for, ALERTMANAGER
+            )
+        except Exception:
+            log.exception("hardware alert reconcile check failed")
+
+
+threading.Thread(target=_hardware_alert_reconcile_loop, daemon=True, name="hardware-alert-reconciler").start()
 
 
 def _place_hold(labels, signature=None):
@@ -1962,46 +2015,6 @@ def api_syslog(
     return events[:limit]
 
 
-def _classify_alarm(detail: str) -> dict:
-    """Python mirror of syslog/vector.yaml's alarm-normalization VRL block.
-
-    This is a deliberate second implementation, not a refactor to share
-    code with Vector: relying solely on Vector to have tagged an event at
-    ingestion time means a Vector regression (missing category, unshipped
-    config change, etc - this exact thing happened once already, see
-    syslog/README.md changelog) silently empties this whole feature with
-    no error anywhere. Classifying again here from the raw `facility`/
-    `detail` fields - which the interpreter has reliably extracted since
-    day one - means Alarm History keeps working even if Vector's own
-    alarm_severity/alarm_component fields are missing or wrong, and also
-    lets it recover alarm history for events ingested before the Vector
-    fix landed, which otherwise has no alarm_severity at all."""
-    detail_lower = detail.lower()
-    severity = None
-    active = None
-    if "cleared" in detail_lower:
-        active = False
-    elif "major alarm" in detail_lower:
-        severity, active = "critical", True
-    elif "minor alarm" in detail_lower:
-        severity, active = "minor", True
-    elif "is down" in detail_lower or "is removed" in detail_lower:
-        severity, active = "minor", True
-    elif "is up" in detail_lower or "is inserted" in detail_lower:
-        active = False
-
-    component = None
-    if severity is not None or active is False:
-        component = detail
-        component = re.sub(r"(?i)^(major|minor)\s+alarm\s+cleared\s*:?\s*", "", component)
-        component = re.sub(r"(?i)^(major alarm:\s*|minor alarm\s*:\s*)", "", component)
-        component = re.sub(r"(?i)\s+is\s+(up|down|inserted|removed)\s*$", "", component)
-        component = re.sub(r"(?i)\s+(alarm\s+)?reported(\s+in\s+unit\s+\d+)?\s+is\s+cleared\s*$", "", component)
-        component = component.strip()
-
-    return {"alarm_severity": severity, "alarm_active": active, "alarm_component": component}
-
-
 @app.get("/api/devices/{device_id}/alarm-history")
 def api_alarm_history(
     device_id: str,
@@ -2011,7 +2024,10 @@ def api_alarm_history(
 ):
     """Historical hardware alarms for this device, read from Loki.
 
-    Alarm classification is done here in Python via `_classify_alarm`,
+    Alarm classification is done via `hardware_alerting._classify_alarm`
+    (shared with the live syslog-based fan/PSU alerting in that module -
+    see its docstring for why this stayed a second implementation rather
+    than trusting Vector, not a third one when live alerting was added),
     from each event's `facility`/`detail` fields, rather than trusted from
     whatever `alarm_severity`/`alarm_component` syslog/vector.yaml's
     `interpret_switch_event` transform may have already stamped on the
@@ -2053,7 +2069,7 @@ def api_alarm_history(
     alarm_events = []
     for e in events:
         detail = e.get("detail") or e.get("message") or ""
-        classified = _classify_alarm(detail)
+        classified = hardware_alerting._classify_alarm(detail)
         if classified["alarm_severity"] is None and classified["alarm_active"] is not False:
             continue  # not alarm-relevant text (e.g. fan-speed-% telemetry)
         e.update(classified)
@@ -2659,6 +2675,10 @@ def api_resolve_alarm(occurrence_id: int, user: str = Depends(require_operator))
 
     if labels.get("alertname") == "InterfaceDown":
         INTERFACE_ALERT_CHECKER.forget(labels.get("device_id"), labels.get("port"))
+    elif labels.get("alertname") == hardware_alerting.ALERTNAME:
+        HARDWARE_ALERT_CHECKER.forget(
+            labels.get("device_id"), labels.get("kind"), labels.get("unit"), labels.get("bay")
+        )
 
     AUDIT.record(user, "alert.resolve", occurrence["alertname"], None, occurrence["signature"], occurrence_id)
     log.info("user=%s manually resolved alarm %s", user, occurrence_id)
