@@ -65,6 +65,56 @@ html, body {
   overflow: auto;
 }
 
+/* Rendered Markdown (comments, composer preview) gets its own subtle grey
+   panel - the light-grey-box-with-a-thin-outline treatment AWS Console
+   itself uses for rendered Markdown/readme content (CloudFormation change
+   set descriptions, Systems Manager runbooks), not a plain Container's
+   plain white body. Keyed off `body.awsui-dark-mode` - the real class this
+   app's own applyMode(mode) call (App.jsx) toggles on <body>, confirmed by
+   reading global-styles' own source rather than guessed - so this switches
+   correctly with the app's existing Light/Dark mode control instead of
+   silently staying light-mode-only colors in dark mode. */
+.markdown-box {
+  background: #f2f3f3;
+  border: 1px solid #d5dbdb;
+  border-radius: 8px;
+  padding: 12px 16px;
+}
+body.awsui-dark-mode .markdown-box {
+  background: #16191f;
+  border-color: #3b4149;
+}
+
+/* ```code fences``` inside a comment's rendered Markdown - deliberately
+   NOT .terminal-output (see MiniMarkdown.jsx's codeStyle prop for why: a
+   comment's fence is something a person typed, not device CLI output, and
+   the fake-terminal treatment there was reported live as wrong for this
+   context). Plain, theme-aware, closer to how Discord/GitHub render an
+   inline fenced block - no title bar, no forced-black background.
+   `!important` is required for the same reason .terminal-output needs it:
+   Cloudscape's own `Box variant="code"` ships an anti-override rule
+   (`:not(#\9)`, ~1,3,0 specificity) that forces a transparent background
+   and default text color, which a plain (0,1,0) class rule can't beat
+   through source order alone. */
+.markdown-code-block {
+  display: block;
+  background: #f2f3f5 !important;
+  color: #2e3338 !important;
+  font-family: ui-monospace, Menlo, Consolas, monospace !important;
+  font-size: 12.5px !important;
+  line-height: 1.5 !important;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 10px 12px;
+  border-radius: 6px;
+  max-height: 60vh;
+  overflow: auto;
+}
+body.awsui-dark-mode .markdown-code-block {
+  background: #2b2d31 !important;
+  color: #dbdee1 !important;
+}
+
 .terminal-output::before {
   content: "";
   position: absolute;
