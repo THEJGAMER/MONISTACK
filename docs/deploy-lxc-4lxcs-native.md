@@ -170,7 +170,19 @@ curl -fsSL -o /tmp/prometheus.tar.gz \
   https://github.com/prometheus/prometheus/releases/download/v2.55.1/prometheus-2.55.1.linux-amd64.tar.gz
 tar xzf /tmp/prometheus.tar.gz -C /tmp
 mv /tmp/prometheus-2.55.1.linux-amd64 /opt/prometheus
+chown -R prometheus:prometheus /opt/prometheus
+
+# Prometheus writes into its own --storage.tsdb.path at startup (not just
+# the TSDB itself - also a small mmap'd active-query-log file,
+# queries.active, created directly inside this directory). mkdir and
+# chown are done together, right here, specifically because splitting
+# them apart from the systemd unit further down is exactly what causes a
+# real, confirmed-live failure: "panic: Unable to create mmap-ed active
+# query log" / "permission denied" on queries.active, with systemd then
+# endlessly restart-looping on it (Restart=on-failure never fixes a
+# permissions problem, it just retries the same failure forever).
 mkdir -p /var/lib/prometheus
+chown -R prometheus:prometheus /var/lib/prometheus
 ```
 
 Copy this repo's `prometheus/prometheus.yml` over the tarball's default
@@ -201,9 +213,11 @@ scrape_configs:
 ```
 
 ```bash
+# /opt/prometheus was already chowned to prometheus:prometheus above -
+# this file just needs to be readable by that user, which root:root 644
+# (cp's default) already satisfies, so no re-chown needed here.
 cp <edited-prometheus.yml> /opt/prometheus/prometheus.yml
 touch /opt/switchboard/data/prometheus-alerts.yml
-chown prometheus:prometheus /opt/prometheus -R
 chown switchboard:switchboard-shared /opt/switchboard/data/prometheus-alerts.yml
 chmod 664 /opt/switchboard/data/prometheus-alerts.yml
 ```
@@ -232,11 +246,21 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-chown -R prometheus:prometheus /var/lib/prometheus
 systemctl daemon-reload
 systemctl enable --now prometheus
 curl http://localhost:9090/-/healthy
 curl -s http://localhost:9090/api/v1/targets | python3 -m json.tool   # both scrape targets "up"
+```
+
+If it fails to start with `permission denied` on anything under
+`/var/lib/prometheus` (confirmed live: this happens if the `mkdir`/`chown`
+pair above got missed or run out of order), the fix is exactly that pair,
+re-run, then `systemctl restart prometheus`:
+
+```bash
+chown -R prometheus:prometheus /var/lib/prometheus
+systemctl restart prometheus
+systemctl status prometheus --no-pager   # confirm it's actually staying up, not just restarting
 ```
 
 `--web.enable-lifecycle` is required - it's what makes `/-/reload` (which
