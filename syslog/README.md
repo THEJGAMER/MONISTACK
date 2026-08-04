@@ -18,11 +18,14 @@ LXC — treat this file as the source of truth and push changes to the LXC
    delivery can't produce out-of-order timestamps within a single Loki
    stream, which Loki rejects.
 3. **`interpret_switch_event`** (new — this is "the interpreter") — parses
-   the `%FACILITY-SEVERITY-MNEMONIC: detail` pattern Dell OS9 embeds in
-   every message and adds:
-   - `facility`, `severity_num`, `mnemonic` — the parsed pieces
+   each vendor's own message shape (Dell OS9's `%FACILITY-SEVERITY-MNEMONIC:
+   detail`, or Junos's `process[pid]: TAG: detail`) and adds:
+   - `vendor` — `"dell_os9"` / `"junos"` / `null` if neither shape matched
+   - `facility`, `severity_num` (Dell only), `mnemonic` — the parsed pieces
+     (for Junos, `facility` is the daemon name - `mib2d`/`chassisd`/`sshd`/etc
+     upper-cased - there's no Dell-style facility code to parse instead)
    - `event_category` — `auth` / `interface` / `spanning-tree` / `hardware` / `routing` / `other`, mapped from `facility`
-   - `interface` — e.g. `"TenGigabitEthernet 1/37"`, extracted from the message text when present
+   - `interface` — e.g. `"TenGigabitEthernet 1/37"` (Dell) or `"xe-0/0/0"` (Junos), extracted from the message text when present
    - `link_state` — `"up"` / `"down"` / `null`
    - `link_event` — `true` when `link_state` isn't null, so you can filter on this one boolean instead of guessing keywords
 
@@ -36,6 +39,20 @@ check), so the interface/link-state extraction is written generically
 against message *text* (interface name + "up"/"down" wording) rather than
 hardcoded to one mnemonic string, so it should hold even if the exact
 mnemonic differs from the `IFM-6-IFM_UP` guess used in the synthetic test.
+
+**Junos (EX3300) support**: the CLI/config-session shape (`mgd[pid]:
+UI_CMDLINE_READ_LINE: ...`) is verified against real traffic - it's the
+bulk of what's arrived from the EX3300 (192.168.4.1) since its syslog was
+pointed here. The interface link-state (`mib2d`/`SNMP_TRAP_LINK_DOWN`/`UP`)
+and hardware-alarm (`chassisd`/`CHASSISD_SNMP_TRAP7`) parsing is **not**
+live-verified - no real link flap or FRU fault has occurred on the EX3300
+since syslog was configured - written from Juniper's own documented
+standard message IDs/wording rather than a captured sample, same as the
+Dell link-state mnemonic caveat above. Confirm against a real event (pull
+a transceiver, or an actual PSU/fan fault) once one occurs; see
+`syslog/tests/test_vrl.py`'s `*_not_live_verified` test cases, which
+mirror this same caveat and should be revisited (or at minimum have their
+names updated) once a real message is captured.
 
 ## Sinks — currently unchanged, needs your decision
 

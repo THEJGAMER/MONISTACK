@@ -58,22 +58,47 @@ transforms:
       # stream (Loki rejects those).
       .timestamp = now()
 
-  # --- Dell OS9 syslog interpreter -----------------------------------
-  # Turns the free-text `%FACILITY-SEVERITY-MNEMONIC: detail` message Dell
-  # switches emit into structured fields, so consumers can filter/alert on
-  # e.g. "interface link-state changes" without regexing raw text again.
+  # --- Switch syslog interpreter --------------------------------------
+  # Turns each vendor's own free-text message shape into the same set of
+  # structured fields, so consumers (webui's syslog view, hardware_alerting.py)
+  # don't need to know which vendor sent a given line:
+  #   - Dell OS9: "%FACILITY-SEVERITY-MNEMONIC: detail" (verified live,
+  #     see below).
+  #   - Junos (EX3300): "process[pid]: TAG: detail", e.g. confirmed live
+  #     from the real EX3300 (192.168.4.1 - see webui's syslog view):
+  #     "mgd[44954]: UI_CMDLINE_READ_LINE: User 'root', command 'exit '".
+  #     Junos has no per-message severity digit or "%" prefix at all, so
+  #     this needs its own regex, not a tweak of Dell's.
+  # Both shapes produce the same facility/mnemonic/detail/event_category/
+  # link_state/alarm_* fields below - a message either matches Dell's
+  # shape, or Junos's, or neither (falls back to raw .message in .detail,
+  # event_category "other").
   interpret_switch_event:
     type: remap
     inputs:
       - process_syslog
     source: |
-      parsed, err = parse_regex(.message, r'%(?P<facility>[A-Z0-9]+)-(?P<severity_num>\d)-(?P<mnemonic>[A-Z0-9_-]+):\s*(?P<detail>.*)$')
-      if err == null {
-        .facility = parsed.facility
-        .severity_num = to_int(parsed.severity_num) ?? null
-        .mnemonic = parsed.mnemonic
-        .detail = parsed.detail
+      dell, dell_err = parse_regex(.message, r'%(?P<facility>[A-Z0-9]+)-(?P<severity_num>\d)-(?P<mnemonic>[A-Z0-9_-]+):\s*(?P<detail>.*)$')
+      junos, junos_err = parse_regex(.message, r'^(?P<process>[a-zA-Z0-9_-]+)\[\d+\]:\s*(?P<tag>[A-Z][A-Z0-9_]*):\s*(?P<detail>.*)$')
+      if dell_err == null {
+        .vendor = "dell_os9"
+        .facility = dell.facility
+        .severity_num = to_int(dell.severity_num) ?? null
+        .mnemonic = dell.mnemonic
+        .detail = dell.detail
+      } else if junos_err == null {
+        # Junos has no "%FACILITY" concept - the closest real equivalent
+        # is which daemon logged the line (mib2d for SNMP/interface
+        # traps, chassisd/alarmd for hardware, sshd for auth, mgd for
+        # CLI/config sessions - all real Junos process names), so that's
+        # used as .facility the same way Dell's own facility code is,
+        # letting one category_map below serve both vendors.
+        .vendor = "junos"
+        .facility = upcase(to_string(junos.process))
+        .mnemonic = junos.tag
+        .detail = junos.detail
       } else {
+        .vendor = null
         .detail = .message
       }
 
@@ -83,7 +108,13 @@ transforms:
         "IFMGR": "interface", "LACP": "interface",
         "STP": "spanning-tree", "RPM": "hardware", "ENVMON": "hardware",
         "OSTATE": "hardware", "CHMGR": "hardware",
-        "FIB": "routing", "OSPF": "routing", "BGP": "routing"
+        "FIB": "routing", "OSPF": "routing", "BGP": "routing",
+        # Junos process-name facilities (see above) - MGD (CLI/config
+        # sessions, confirmed live as the bulk of real EX3300 traffic so
+        # far) deliberately has no entry, falling back to "other" same as
+        # an unrecognized Dell facility would.
+        "MIB2D": "interface", "CHASSISD": "hardware", "ALARMD": "hardware",
+        "SSHD": "auth", "RPD": "routing", "KMD": "auth"
       }
       .event_category = "other"
       if exists(.facility) {
@@ -100,6 +131,17 @@ transforms:
         if_type_str = to_string(iface.if_type)
         if_num_str = to_string(iface.if_num)
         .interface = if_type_str + " " + if_num_str
+      } else {
+        # Junos's own SNMP link traps report the interface as "ifName
+        # xe-0/0/0" rather than Dell's "Te 1/47" wording - not verified
+        # against a real EX3300 link flap yet (none has occurred since
+        # syslog was pointed here), written from Juniper's documented
+        # SNMP_TRAP_LINK_DOWN/UP message shape rather than a live capture,
+        # same caveat as the mnemonic check below.
+        jiface, jiferr = parse_regex(detail_str, r'(?i)ifname\s+(?P<name>[a-z0-9./-]+)')
+        if jiferr == null {
+          .interface = to_string(jiface.name)
+        }
       }
 
       detail_lower = downcase(detail_str)
@@ -113,11 +155,18 @@ transforms:
       # PSU/fan events as "link events" while missing every real one.
       # Scoping to event_category == "interface" (computed above) fixes
       # both: only interface-facility messages can set link_state now.
+      #
+      # The Junos SNMP_TRAP_LINK_DOWN/UP mnemonic check is written from
+      # Juniper's own documented standard message IDs (mib2d emits these
+      # on every real link transition), not a live capture - flagged the
+      # same as the interface-name extraction above: should be confirmed
+      # against a real EX3300 link flap once one occurs, same discipline
+      # as this file's other not-yet-observed cases.
       .link_state = null
       if .event_category == "interface" {
-        if contains(detail_lower, "changed interface state to down") || contains(detail_lower, "link down") {
+        if contains(detail_lower, "changed interface state to down") || contains(detail_lower, "link down") || .mnemonic == "SNMP_TRAP_LINK_DOWN" {
           .link_state = "down"
-        } else if contains(detail_lower, "changed interface state to up") || contains(detail_lower, "link up") {
+        } else if contains(detail_lower, "changed interface state to up") || contains(detail_lower, "link up") || .mnemonic == "SNMP_TRAP_LINK_UP" {
           .link_state = "up"
         }
       }
@@ -139,36 +188,54 @@ transforms:
       #   "... is down"/"is removed" (no explicit alarm text) -> minor, active
       #   "... is up"/"is inserted"   -> not an alarm (recovery)
       #   anything else (e.g. fan-speed-% telemetry, no fault language) -> not an alarm
+      #
+      # Scoped to event_category == "hardware" (unlike Dell's own
+      # historical version of this block, which checked every message's
+      # text regardless of category) specifically so Junos's much more
+      # generic down/up/removed/inserted wording - plausible in routing
+      # or auth log lines too - can reuse the same keyword checks below
+      # without misreading an unrelated message as a hardware alarm; this
+      # also matches the reasoning already applied to link_state above.
+      # Junos's own chassisd/alarmd wording for a real FRU fault hasn't
+      # been captured live yet (same caveat as link_state/interface
+      # above) - "offline"/"removed"/"power off" and "online"/"inserted"/
+      # "power on" are Juniper's commonly-documented phrasing for FRU
+      # transitions, generalized rather than pinned to one exact string,
+      # so a close-but-not-identical real message still matches.
       .alarm_severity = null
       .alarm_active = null
       .alarm_component = null
-      # "cleared" must be checked before the "major/minor alarm" text
-      # match below - Dell's own recovery messages ("Major alarm
-      # cleared: ...") contain the literal substring "major alarm", so
-      # without this ordering a recovery gets misread as a brand-new
-      # active critical alarm (verified against real captured
-      # "... alarm cleared ..." / "... alarm cleared : ..." text).
-      if contains(detail_lower, "cleared") {
-        .alarm_active = false
-      } else if contains(detail_lower, "major alarm") {
-        .alarm_severity = "critical"
-        .alarm_active = true
-      } else if contains(detail_lower, "minor alarm") {
-        .alarm_severity = "minor"
-        .alarm_active = true
-      } else if contains(detail_lower, "is down") || contains(detail_lower, "is removed") {
-        .alarm_severity = "minor"
-        .alarm_active = true
-      } else if contains(detail_lower, "is up") || contains(detail_lower, "is inserted") {
-        .alarm_active = false
-      }
-      if .alarm_severity != null || .alarm_active == false {
-        component = detail_str
-        component = replace(component, r'(?i)^(major|minor)\s+alarm\s+cleared\s*:?\s*', "")
-        component = replace(component, r'(?i)^(major alarm:\s*|minor alarm\s*:\s*)', "")
-        component = replace(component, r'(?i)\s+is\s+(up|down|inserted|removed)\s*$', "")
-        component = replace(component, r'(?i)\s+(alarm\s+)?reported(\s+in\s+unit\s+\d+)?\s+is\s+cleared\s*$', "")
-        .alarm_component = strip_whitespace(component)
+      if .event_category == "hardware" {
+        # "cleared" must be checked before the "major/minor alarm" text
+        # match below - Dell's own recovery messages ("Major alarm
+        # cleared: ...") contain the literal substring "major alarm", so
+        # without this ordering a recovery gets misread as a brand-new
+        # active critical alarm (verified against real captured
+        # "... alarm cleared ..." / "... alarm cleared : ..." text).
+        if contains(detail_lower, "cleared") {
+          .alarm_active = false
+        } else if contains(detail_lower, "major alarm") {
+          .alarm_severity = "critical"
+          .alarm_active = true
+        } else if contains(detail_lower, "minor alarm") {
+          .alarm_severity = "minor"
+          .alarm_active = true
+        } else if contains(detail_lower, "is down") || contains(detail_lower, "is removed") || contains(detail_lower, "offline") || contains(detail_lower, "removed") || contains(detail_lower, "power off") {
+          .alarm_severity = "minor"
+          .alarm_active = true
+        } else if contains(detail_lower, "is up") || contains(detail_lower, "is inserted") || contains(detail_lower, "online") || contains(detail_lower, "inserted") || contains(detail_lower, "power on") {
+          .alarm_active = false
+        }
+        if .alarm_severity != null || .alarm_active == false {
+          component = detail_str
+          component = replace(component, r'(?i)^(major|minor)\s+alarm\s+cleared\s*:?\s*', "")
+          component = replace(component, r'(?i)^(major alarm:\s*|minor alarm\s*:\s*)', "")
+          component = replace(component, r'(?i)^snmp\s+trap\s+generated\s*:\s*', "")
+          component = replace(component, r'(?i)\s+is\s+(up|down|inserted|removed)\s*$', "")
+          component = replace(component, r'(?i)\s+(alarm\s+)?reported(\s+in\s+unit\s+\d+)?\s+is\s+cleared\s*$', "")
+          component = replace(component, r'(?i)\s+(went\s+)?(offline|online)\s*$', "")
+          .alarm_component = strip_whitespace(component)
+        }
       }
 
 sinks:

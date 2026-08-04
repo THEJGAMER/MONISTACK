@@ -79,6 +79,55 @@ TEST_CASES = [
         "%FOO-6-BAR: some unrelated message",
         {"event_category": "other", "alarm_severity": None, "alarm_active": None},
     ),
+    (
+        # Real captured message (via the webui's live syslog view, from
+        # the real EX3300 at 192.168.4.1) - Junos's syslog shape is
+        # totally different from Dell's ("process[pid]: TAG: detail", no
+        # "%FACILITY-N-" prefix at all), and this is ordinary CLI/config
+        # session chatter, not an alert - it must land in event_category
+        # "other" like an unrecognized Dell facility would, not error out
+        # or get miscategorized.
+        "junos_cli_session_chatter_is_not_an_alert",
+        "mgd[44954]: UI_CMDLINE_READ_LINE: User 'root', command 'exit '",
+        {"vendor": "junos", "facility": "MGD", "event_category": "other", "alarm_severity": None, "alarm_active": None},
+    ),
+    (
+        # NOT a live capture (no real EX3300 link flap has occurred yet -
+        # see vector.yaml's own comment on this case) - written from
+        # Juniper's documented standard SNMP_TRAP_LINK_DOWN message shape.
+        "junos_link_down_not_live_verified",
+        "mib2d[1234]: SNMP_TRAP_LINK_DOWN: ifIndex 507, ifAdminStatus up(1), ifOperStatus down(2), ifName xe-0/0/0",
+        {
+            "vendor": "junos", "facility": "MIB2D", "event_category": "interface",
+            "interface": "xe-0/0/0", "link_state": "down", "link_event": True,
+        },
+    ),
+    (
+        "junos_link_up_not_live_verified",
+        "mib2d[1234]: SNMP_TRAP_LINK_UP: ifIndex 507, ifAdminStatus up(1), ifOperStatus up(1), ifName xe-0/0/0",
+        {"vendor": "junos", "event_category": "interface", "interface": "xe-0/0/0", "link_state": "up"},
+    ),
+    (
+        # Also not a live capture - Juniper's commonly-documented FRU
+        # trap wording ("Power Supply N went offline/online"), not one
+        # exact string pinned from a real device.
+        "junos_hardware_alarm_not_live_verified",
+        "chassisd[890]: CHASSISD_SNMP_TRAP7: SNMP trap generated: Power Supply 1 went offline",
+        {
+            "vendor": "junos", "facility": "CHASSISD", "event_category": "hardware",
+            "alarm_severity": "minor", "alarm_active": True, "alarm_component": "Power Supply 1",
+        },
+    ),
+    (
+        "junos_hardware_alarm_recovery_not_live_verified",
+        "chassisd[890]: CHASSISD_SNMP_TRAP7: SNMP trap generated: Power Supply 1 went online",
+        {"vendor": "junos", "alarm_severity": None, "alarm_active": False, "alarm_component": "Power Supply 1"},
+    ),
+    (
+        "junos_auth_event_not_live_verified",
+        "sshd[123]: SSHD_LOGIN_FAILED: Login failed for user admin",
+        {"vendor": "junos", "facility": "SSHD", "event_category": "auth", "alarm_severity": None, "alarm_active": None},
+    ),
 ]
 
 
