@@ -104,17 +104,38 @@ build on.
       of them have retention either. Needs: age- and/or count-based
       retention, a prune job (mirroring `trending.py`'s), and a documented
       policy - now covering all four tables, not just `results`.
-- [ ] **No DB backup - the original wording is stale, the concern isn't.**
-      This used to say `switchboard.db` lives on a single Docker volume -
-      that's no longer true. The app moved to Postgres on a remote host
-      (`192.168.0.146`, see `.env`'s `DATABASE_URL` and `db.py`'s own
-      docstring on the migration) mid-project, so there's no local SQLite
-      file to `sqlite3 .backup` anymore. Checked live: no backup script of
-      any kind exists in this repo. The real question is now organizational
-      as much as technical - does whoever runs that Postgres host already
-      have it covered (routine `pg_dump`/volume snapshots), or does this
-      app need to own that responsibility itself against a database it
-      doesn't host? Needs an answer before it needs code.
+- [x] **No DB backup - answered 2026-08-06: covered outside this repo, no
+      code needed.** This used to say `switchboard.db` lives on a single
+      Docker volume - that's no longer true. The app moved to Postgres on a
+      remote host (`192.168.0.146`, see `.env`'s `DATABASE_URL` and
+      `db.py`'s own docstring on the migration) mid-project, so there's no
+      local SQLite file to `sqlite3 .backup` anymore, and no backup script
+      of any kind exists in this repo.
+
+      The item asked whether that's this app's responsibility or the
+      Postgres host's, and said it needed an answer before it needed code.
+      The answer: **the LXC hosting Postgres is backed up to Google Drive**
+      as a whole-machine backup, owned by whoever runs that host. So this
+      app deliberately does *not* grow its own backup job - a second,
+      uncoordinated backup of a database it doesn't own would be worse than
+      none: two schedules, two retention policies, and a false sense that
+      the app's copy is authoritative when the host's is.
+
+      One caveat worth recording rather than assuming, since it's the
+      difference between a backup that restores and one that doesn't: a
+      whole-machine backup of a *running* Postgres captures its data
+      directory mid-write unless it's taken from a filesystem/VM snapshot
+      or a real `pg_basebackup`. If the Google Drive job is a plain file
+      copy of a live `/var/lib/postgresql`, the restore may need crash
+      recovery and can fail. Worth confirming once with a real restore
+      drill; not worth building anything here for.
+
+      Related, and the thing that actually prompted this being settled: the
+      2026-08-06 junk-occurrence purge needed a backup before deleting
+      ~20,800 rows, and had to hand-roll a JSON dump of the three affected
+      tables because nothing existed. That's a fine pattern for a one-off
+      destructive change and is what should be done again next time -
+      per-change, not a standing job.
 - [x] **DB schema migrations - done, in practice, just not the way this
       item pictured it (confirmed live 2026-08-02).** Originally worried
       `CREATE TABLE IF NOT EXISTS` was the only mechanism, which would make
