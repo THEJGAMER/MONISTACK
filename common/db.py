@@ -287,6 +287,71 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_occurrence ON audit_log(occurrence_id);
 -- live; both were empty at the point of the switch.
 DROP TABLE IF EXISTS alert_acks;
 DROP TABLE IF EXISTS alert_comments;
+
+-- Every command run against a device, by whom, and what happened - the
+-- record that per-user OIDC login was supposed to make possible but which
+-- nothing actually wrote until this table existed (runs were logged to
+-- stdout and nowhere else; `results` didn't even carry an actor).
+--
+-- Deliberately separate from audit_log, which also gets a "command.run"
+-- entry for the same event. They answer different questions and are read
+-- by different people: audit_log is the admin-only, append-only "who did
+-- what, can I trust this record" trail with a uniform shape across every
+-- action type; this is a per-user working history ("what did I run on
+-- that switch an hour ago, run it again") that needs the structured
+-- device/category/command/params columns to support filtering and
+-- one-click re-run, which a generic detail-JSON column can't do without
+-- reparsing every row.
+--
+-- Failures are recorded too (status='error'), not just successes - "I ran
+-- it and it blew up" is exactly the thing worth finding again later, and
+-- omitting it would make the history quietly lie about what was tried.
+CREATE TABLE IF NOT EXISTS command_history (
+    id BIGSERIAL PRIMARY KEY,
+    ts TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    device_name TEXT,
+    category_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    command TEXT NOT NULL,
+    params TEXT,
+    status TEXT NOT NULL,
+    error TEXT,
+    duration_ms INTEGER,
+    result_filename TEXT,
+    source TEXT NOT NULL DEFAULT 'console'
+);
+CREATE INDEX IF NOT EXISTS idx_command_history_actor_ts ON command_history(actor, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_command_history_ts ON command_history(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_command_history_device ON command_history(device_id, ts DESC);
+
+-- A user's pinned commands. device_id is nullable on purpose: most useful
+-- favourites are "run this anywhere" (show version), but a port-specific
+-- one (transceiver diagnostics on Te 1/37) only means anything against
+-- the device that has that port, so both shapes have to be expressible.
+CREATE TABLE IF NOT EXISTS command_favorites (
+    id BIGSERIAL PRIMARY KEY,
+    actor TEXT NOT NULL,
+    label TEXT,
+    device_id TEXT,
+    category_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    params TEXT,
+    created_at TEXT NOT NULL
+);
+-- One row per (user, device-or-any, command, params) - favouriting the
+-- same thing twice is a no-op rather than a duplicate row. COALESCE on the
+-- nullable columns because NULL never equals NULL in a unique index, which
+-- would let "any device"/"no params" favourites duplicate freely.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_command_favorites_unique
+    ON command_favorites(actor, COALESCE(device_id, ''), category_id, command_id, COALESCE(params, ''));
+CREATE INDEX IF NOT EXISTS idx_command_favorites_actor ON command_favorites(actor, created_at DESC);
+
+-- Who ran the command that produced a saved result. Nullable because rows
+-- saved before this column existed genuinely have no attribution - showing
+-- "-" for those is honest, backfilling a guess would not be.
+ALTER TABLE results ADD COLUMN IF NOT EXISTS actor TEXT;
 """
 
 

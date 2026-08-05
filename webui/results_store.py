@@ -35,7 +35,8 @@ class ResultsStore:
     def __init__(self, db):
         self.db = db
 
-    def save(self, device_id, device_name, host, category_id, command_id, command, summary, output, auto_saved=False):
+    def save(self, device_id, device_name, host, category_id, command_id, command, summary, output,
+             auto_saved=False, actor=None):
         now = datetime.now(timezone.utc)
         timestamp = now.strftime("%Y%m%d-%H%M%S") + f"-{now.microsecond // 1000:03d}"
         filename = f"{timestamp}_{_slug(device_name)}-{category_id}-{command_id}.md"
@@ -44,11 +45,11 @@ class ResultsStore:
         self.db.execute(
             """INSERT INTO results
                (filename, device_id, device_name, host, category_id, command_id, command, summary, output,
-                markdown, auto_saved, created_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                markdown, auto_saved, created_at, actor)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 filename, device_id, device_name, host, category_id, command_id, command, summary, output,
-                markdown, 1 if auto_saved else 0, generated_at,
+                markdown, 1 if auto_saved else 0, generated_at, actor,
             ),
         )
         return {"filename": filename, "generated_at": generated_at}
@@ -73,7 +74,7 @@ class ResultsStore:
         total = total_row["n"] if total_row else 0
 
         rows = self.db.query(
-            f"SELECT filename, device_id, command, auto_saved, created_at, length(markdown) AS size "
+            f"SELECT filename, device_id, command, auto_saved, created_at, actor, length(markdown) AS size "
             f"FROM results {where_sql} ORDER BY filename DESC LIMIT %s OFFSET %s",
             tuple(params) + (limit, offset),
         )
@@ -85,6 +86,7 @@ class ResultsStore:
                     "title": f"{r['device_id']} — {r['command']}",
                     "device_id": r["device_id"],
                     "auto_saved": bool(r["auto_saved"]),
+                    "actor": r["actor"],
                     "size": r["size"],
                     "saved_at": time.strftime(
                         "%Y-%m-%dT%H:%M:%SZ", time.strptime(r["created_at"][:19], "%Y-%m-%dT%H:%M:%S")
@@ -102,7 +104,7 @@ class ResultsStore:
         rendered Markdown, which isn't useful as structured export data."""
         return self.db.query_one(
             "SELECT filename, device_id, device_name, host, category_id, command_id, command, summary, "
-            "output, auto_saved, created_at FROM results WHERE filename = %s",
+            "output, auto_saved, created_at, actor FROM results WHERE filename = %s",
             (filename,),
         )
 

@@ -95,6 +95,28 @@ export const listResults = ({ deviceId, q, page = 1, pageSize = 10 } = {}) => {
   if (q) params.set("q", q);
   return api(`/api/results?${params.toString()}`);
 };
+// Command history / favourites (ROADMAP Phase 4). History is the caller's
+// own by default; `allUsers` is admin-only server-side.
+export const listCommandHistory = ({ deviceId, status, q, limit = 100, offset = 0, allUsers = false } = {}) => {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (deviceId) params.set("device_id", deviceId);
+  if (status) params.set("status", status);
+  if (q) params.set("q", q);
+  if (allUsers) params.set("all_users", "true");
+  return api(`/api/command-history?${params.toString()}`);
+};
+export const getRecentCommands = (limit = 10) => api(`/api/command-history/recent?limit=${limit}`);
+export const clearCommandHistory = () => api("/api/command-history", { method: "DELETE" });
+
+export const listFavorites = () => api("/api/favorites");
+export const addFavorite = (body) =>
+  api("/api/favorites", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+export const deleteFavorite = (id) => api(`/api/favorites/${id}`, { method: "DELETE" });
+
 export const getResult = (filename) => api(`/api/results/${filename}`);
 export const deleteResult = (filename) => api(`/api/results/${filename}`, { method: "DELETE" });
 export const exportResultUrl = (filename, format) => `/api/results/${encodeURIComponent(filename)}/export?format=${format}`;

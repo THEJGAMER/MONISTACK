@@ -38,13 +38,14 @@ import metrics
 import opnsense_parsers
 import parsers
 import settings as settings_store
-from commands import COMMAND_TREES, find_command
+from commands import COMMAND_TREES, command_exists, find_command
 from db import Database
 from devices import DeviceConfigError, StoredDevice, load_devices
 from loki_client import LokiClient, LokiError
 from results_store import ResultsStore
 from scheduler import ScheduleStore
 import alert_rules
+import command_history
 import compliance
 import hardware_alerting
 import interface_alerting
@@ -319,6 +320,8 @@ TOPOLOGY_STORE = None
 SCHEDULES = None
 ALERT_RULES = None
 INTERFACE_ALERT_RULES = None
+COMMAND_HISTORY = None
+FAVORITES = None
 OCCURRENCES = None
 AUDIT = None
 # Not reset on DB reconfigure like the stores above - it's just in-memory
@@ -898,7 +901,7 @@ def _load_database(dsn):
     so callers (setup wizard, Settings save) can report a clear error
     without disturbing whatever was working before the attempt."""
     global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES
-    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID
+    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
@@ -908,10 +911,13 @@ def _load_database(dsn):
     new_interface_alert_rules = interface_alerting.InterfaceAlertConfigStore(new_db)
     new_occurrences = occurrences.OccurrenceStore(new_db)
     new_audit = audit.AuditLog(new_db)
+    new_command_history = command_history.CommandHistoryStore(new_db)
+    new_favorites = command_history.CommandFavoritesStore(new_db)
     DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES = (
         new_db, new_store, new_results, new_topology_store, new_schedules, new_alert_rules, new_interface_alert_rules
     )
     OCCURRENCES, AUDIT = new_occurrences, new_audit
+    COMMAND_HISTORY, FAVORITES = new_command_history, new_favorites
 
     _migrate_legacy_json_devices()
     _migrate_legacy_sqlite()
@@ -1664,13 +1670,19 @@ def _run_raw(device, category_id, command_id, params):
         return switch.run(cmd)
 
 
-def _run_and_save(device, category_id, command_id, params, user, auto_saved=True):
+def _run_and_save(device, category_id, command_id, params, user, auto_saved=True, source="console"):
     """Shared by /api/run, bulk-run, and the scheduler - resolves the
     allowlisted command, runs it over the device's locked SSH session, and
     auto-saves the result the same way every code path expects. Raises
     CommandLookupError/SwitchSSHError/DeviceConfigError; callers decide
     whether to turn that into an HTTP error (single-device) or a per-device
-    error entry (bulk/scheduled)."""
+    error entry (bulk/scheduled).
+
+    This is also where command history is recorded, precisely because it's
+    the one point all three run paths already funnel through - recording
+    in the routes instead would have meant three call sites and a fourth
+    one silently missing it the next time a run path is added. Failures
+    are recorded as well as successes (see command_history.py)."""
     cmd = _resolve_command(device, category_id, command_id, params)
     log.info("user=%s device=%s running: %s", user, device.id, cmd)
 
@@ -1680,13 +1692,33 @@ def _run_and_save(device, category_id, command_id, params, user, auto_saved=True
         with _session_locks[device.id]:
             switch = _get_session(device)
             output = switch.run(cmd)
+    except Exception as e:
+        if COMMAND_HISTORY is not None:
+            COMMAND_HISTORY.record(
+                user, device.id, device.name, category_id, command_id, cmd, params=params,
+                status=command_history.STATUS_ERROR, error=str(e),
+                duration_ms=int((time.monotonic() - start) * 1000), source=source,
+            )
+        raise
     finally:
         metrics.command_run_duration_seconds.labels(device_id=device.id).observe(time.monotonic() - start)
 
+    duration_ms = int((time.monotonic() - start) * 1000)
     summary = summarize(device.platform, category_id, command_id, output)
     saved = RESULTS.save(
-        device.id, device.name, device.host, category_id, command_id, cmd, summary, output, auto_saved=auto_saved
+        device.id, device.name, device.host, category_id, command_id, cmd, summary, output,
+        auto_saved=auto_saved, actor=user,
     )
+    if COMMAND_HISTORY is not None:
+        COMMAND_HISTORY.record(
+            user, device.id, device.name, category_id, command_id, cmd, params=params,
+            status=command_history.STATUS_OK, duration_ms=duration_ms,
+            result_filename=saved["filename"], source=source,
+        )
+    if AUDIT is not None:
+        # The audit trail's own entry for the same event - see
+        # command_history.py's module docstring for why both exist.
+        AUDIT.record(user, "command.run", device.id, cmd)
     return {"command": cmd, "output": output, "summary": summary, "saved_as": saved["filename"]}
 
 
@@ -2878,6 +2910,94 @@ def api_get_alert_history(limit: int = 200, user: str = Depends(require_auth_and
             "ack": _ack_in_effect_at(timeline, fingerprint, r["received_at"]),
         })
     return out
+
+
+@app.get("/api/command-history")
+def api_command_history(
+    request: Request,
+    device_id: Optional[str] = None,
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    all_users: bool = False,
+    user: str = Depends(require_auth_and_db),
+):
+    """This user's own command history by default. `all_users=true` is
+    admin-only - history is personal, and letting any authenticated user
+    read the whole fleet's would turn a convenience feature into an
+    accidental disclosure of what everyone else has been doing. Admins can
+    already see this via the audit log, so this isn't a new capability for
+    them, just a more useful shape of it."""
+    actor = user
+    if all_users:
+        if request.session.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="admin role required to view all users' history")
+        actor = None
+    items, total = COMMAND_HISTORY.list(
+        actor=actor, device_id=device_id, status=status, q=q, limit=limit, offset=offset
+    )
+    return {"items": items, "total": total}
+
+
+@app.get("/api/command-history/recent")
+def api_command_history_recent(limit: int = 10, user: str = Depends(require_auth_and_db)):
+    """Distinct recent commands for the Console's quick re-run list."""
+    return COMMAND_HISTORY.recent_commands(user, limit=limit)
+
+
+@app.delete("/api/command-history")
+def api_clear_command_history(user: str = Depends(require_auth_and_db)):
+    """Clears only the caller's own history. The audit_log entry for each
+    run is untouched and admin-visible - this deliberately can't be used
+    to erase the record of what someone ran."""
+    COMMAND_HISTORY.clear(user)
+    AUDIT.record(user, "command.history_cleared")
+    return {"ok": True}
+
+
+class FavoriteRequest(BaseModel):
+    category_id: str
+    command_id: str
+    device_id: Optional[str] = None
+    params: Optional[dict] = None
+    label: Optional[str] = None
+
+
+@app.get("/api/favorites")
+def api_list_favorites(user: str = Depends(require_auth_and_db)):
+    return FAVORITES.list(user)
+
+
+@app.post("/api/favorites")
+def api_add_favorite(req: FavoriteRequest, user: str = Depends(require_auth_and_db)):
+    """Validates the command actually exists before pinning it - a
+    favourite pointing at a command that was never in the tree would fail
+    confusingly at run time instead of here. Device is optional (an
+    "any device" favourite), so validation uses the named device's tree
+    when given and any platform's when not."""
+    if req.device_id:
+        device = DEVICES_BY_ID.get(req.device_id)
+        if device is None:
+            raise HTTPException(status_code=404, detail="unknown device")
+        try:
+            _resolve_command(device, req.category_id, req.command_id, req.params or {})
+        except CommandLookupError as e:
+            raise HTTPException(status_code=e.status_code, detail=str(e))
+    elif not command_exists(req.category_id, req.command_id):
+        raise HTTPException(status_code=404, detail="unknown command")
+
+    fav = FAVORITES.add(
+        user, req.category_id, req.command_id,
+        device_id=req.device_id, params=req.params, label=req.label,
+    )
+    return fav
+
+
+@app.delete("/api/favorites/{favorite_id}")
+def api_delete_favorite(favorite_id: int, user: str = Depends(require_auth_and_db)):
+    FAVORITES.delete(user, favorite_id)
+    return {"ok": True}
 
 
 @app.get("/api/alert-rules")

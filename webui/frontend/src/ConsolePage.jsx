@@ -27,6 +27,11 @@ import {
   deleteResult,
   getSyslog,
   getAlarmHistory,
+  listCommandHistory,
+  clearCommandHistory,
+  listFavorites,
+  addFavorite,
+  deleteFavorite,
 } from "./api.js";
 import { resultToMarkdown } from "./markdown.js";
 import MiniMarkdown from "./MiniMarkdown.jsx";
@@ -125,6 +130,9 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
   const [alarmHistory, setAlarmHistory] = useState([]);
   const [alarmHistoryLoading, setAlarmHistoryLoading] = useState(false);
   const [boardItems, setBoardItems] = useState(loadBoardLayout);
+  const [history, setHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [favorites, setFavorites] = useState([]);
 
   function handleBoardItemsChange({ detail }) {
     setBoardItems(detail.items);
@@ -217,6 +225,29 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
     }
   }
 
+  // History is deliberately not scoped to the selected device: "what did I
+  // run recently" is usually asked *across* devices (you remember the
+  // command, not which switch you were on). The table has a device column
+  // and its own filter for narrowing.
+  async function refreshHistory() {
+    setHistoryLoading(true);
+    try {
+      const res = await listCommandHistory({ limit: 200 });
+      setHistory(res.items);
+    } catch {
+      setHistory([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refreshHistory();
+    listFavorites()
+      .then(setFavorites)
+      .catch(() => setFavorites([]));
+  }, []);
+
   async function refreshSyslog(deviceId, category, limit) {
     setSyslogLoading(true);
     try {
@@ -296,6 +327,35 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
   const { pageItems: syslogPage, paginationProps: syslogPagination } = useClientPagination(filteredSyslog, 8);
   const { pageItems: alarmHistoryPage, paginationProps: alarmHistoryPagination } = useClientPagination(alarmHistory, 8);
 
+  // The shared run path. Split out of handleRun so the Favourites and
+  // History lists can re-run something by id without duplicating the
+  // request/flash/refresh handling - they have a category/command/params
+  // triple but no command-tree `item` object to hand over.
+  async function runResolved({ categoryId, commandId, params, label, runKey }) {
+    if (!selected) return;
+    setRunning(runKey);
+    setRunError(null);
+    try {
+      const res = await runCommand({
+        device_id: selected.id, category_id: categoryId, command_id: commandId, params,
+      });
+      setResult({ ...res, deviceName: selected.name, host: selected.host, categoryId, commandId });
+      // Every run is auto-saved server-side now - just reflect that here.
+      refreshRecentResults(selected.id);
+      refreshHistory();
+    } catch (e) {
+      setResult(null);
+      setRunError(`${label}: ${e.message}`);
+      // A failed run is still recorded server-side (see command_history.py),
+      // so the History tab has to be refreshed on this path too - otherwise
+      // the one kind of entry most worth finding again is the one the UI
+      // silently omits until the next successful run.
+      refreshHistory();
+    } finally {
+      setRunning(null);
+    }
+  }
+
   async function handleRun(cat, item) {
     if (!selected) return;
     const key = `${cat.id}:${item.id}`;
@@ -308,19 +368,85 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
       }
       params[item.param] = value;
     }
+    await runResolved({
+      categoryId: cat.id, commandId: item.id, params, label: item.label, runKey: key,
+    });
+  }
 
-    setRunning(key);
-    setRunError(null);
+  /** Re-run a favourite or a history entry against the selected device. */
+  async function handleRerun(entry, runKey) {
+    const cat = platformCommandTree.find((c) => c.id === entry.category_id);
+    const item = cat?.items.find((i) => i.id === entry.command_id);
+    if (!item) {
+      pushFlash(
+        "error",
+        `"${entry.command_id}" isn't available on ${selected?.platform ?? "this platform"}.`,
+      );
+      return;
+    }
+    await runResolved({
+      categoryId: entry.category_id,
+      commandId: entry.command_id,
+      params: entry.params || {},
+      label: item.label,
+      runKey,
+    });
+  }
+
+  function favoriteFor(categoryId, commandId, params) {
+    const wanted = JSON.stringify(params || {});
+    return favorites.find(
+      (f) =>
+        f.category_id === categoryId &&
+        f.command_id === commandId &&
+        JSON.stringify(f.params || {}) === wanted &&
+        (f.device_id || null) === (selected?.id || null),
+    );
+  }
+
+  async function toggleFavorite(cat, item) {
+    if (!selected) return;
+    const key = `${cat.id}:${item.id}`;
+    const params = {};
+    if (item.param) {
+      const value = paramSelections[key];
+      if (!value) {
+        pushFlash("error", `Choose a value for ${item.param} first, so the favourite knows what to run.`);
+        return;
+      }
+      params[item.param] = value;
+    }
+    const existing = favoriteFor(cat.id, item.id, params);
     try {
-      const res = await runCommand({ device_id: selected.id, category_id: cat.id, command_id: item.id, params });
-      setResult({ ...res, deviceName: selected.name, host: selected.host, categoryId: cat.id, commandId: item.id });
-      // Every run is auto-saved server-side now - just reflect that here.
-      refreshRecentResults(selected.id);
+      if (existing) {
+        await deleteFavorite(existing.id);
+      } else {
+        await addFavorite({
+          device_id: selected.id, category_id: cat.id, command_id: item.id, params, label: item.label,
+        });
+      }
+      setFavorites(await listFavorites());
     } catch (e) {
-      setResult(null);
-      setRunError(`${item.label}: ${e.message}`);
-    } finally {
-      setRunning(null);
+      pushFlash("error", `Could not update favourites: ${e.message}`);
+    }
+  }
+
+  async function removeFavorite(fav) {
+    try {
+      await deleteFavorite(fav.id);
+      setFavorites(await listFavorites());
+    } catch (e) {
+      pushFlash("error", `Could not remove favourite: ${e.message}`);
+    }
+  }
+
+  async function handleClearHistory() {
+    try {
+      await clearCommandHistory();
+      setHistory([]);
+      pushFlash("success", "Command history cleared.");
+    } catch (e) {
+      pushFlash("error", `Could not clear history: ${e.message}`);
     }
   }
 
@@ -488,6 +614,20 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
                             <Button loading={running === key} onClick={() => handleRun(cat, item)}>
                               Run
                             </Button>
+                            <Button
+                              variant="icon"
+                              iconName={
+                                favoriteFor(cat.id, item.id, item.param ? { [item.param]: paramSelections[key] } : {})
+                                  ? "star-filled"
+                                  : "star"
+                              }
+                              ariaLabel={
+                                favoriteFor(cat.id, item.id, item.param ? { [item.param]: paramSelections[key] } : {})
+                                  ? `Remove ${item.label} from favourites`
+                                  : `Add ${item.label} to favourites`
+                              }
+                              onClick={() => toggleFavorite(cat, item)}
+                            />
                           </SpaceBetween>
                         </Box>
                       );
@@ -496,6 +636,111 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
                 </ExpandableSection>
               ))}
             </SpaceBetween>
+            ),
+          },
+          {
+            id: "favorites",
+            label: `Favourites${favorites.length ? ` (${favorites.length})` : ""}`,
+            content: !selected ? (
+              <Box color="text-status-inactive">Select a device first.</Box>
+            ) : favorites.length === 0 ? (
+              <Box color="text-status-inactive">
+                No favourites yet - star a command on the Commands tab to pin it here.
+              </Box>
+            ) : (
+              <Table
+                variant="embedded"
+                items={favorites}
+                trackBy="id"
+                columnDefinitions={[
+                  { id: "label", header: "Command", cell: (f) => f.label || f.command_id },
+                  {
+                    id: "params",
+                    header: "Params",
+                    cell: (f) =>
+                      Object.keys(f.params || {}).length
+                        ? Object.entries(f.params).map(([k, v]) => `${k}=${v}`).join(", ")
+                        : "-",
+                  },
+                  { id: "device", header: "Device", cell: (f) => f.device_id || "any" },
+                  {
+                    id: "actions",
+                    header: "Actions",
+                    cell: (f) => (
+                      <SpaceBetween size="xs" direction="horizontal">
+                        <Button
+                          loading={running === `fav:${f.id}`}
+                          onClick={() => handleRerun(f, `fav:${f.id}`)}
+                        >
+                          Run
+                        </Button>
+                        <Button variant="icon" iconName="close" ariaLabel="Remove favourite"
+                                onClick={() => removeFavorite(f)} />
+                      </SpaceBetween>
+                    ),
+                  },
+                ]}
+              />
+            ),
+          },
+          {
+            id: "history",
+            label: "History",
+            content: (
+              <SpaceBetween size="s">
+                <SpaceBetween size="xs" direction="horizontal" alignItems="center">
+                  <Button iconName="refresh" onClick={refreshHistory} loading={historyLoading}>
+                    Refresh
+                  </Button>
+                  <Button onClick={handleClearHistory} disabled={history.length === 0}>
+                    Clear my history
+                  </Button>
+                  <Box color="text-status-inactive" fontSize="body-s">
+                    Your own runs, newest first. Clearing this does not affect the admin audit log.
+                  </Box>
+                </SpaceBetween>
+                <Table
+                  variant="embedded"
+                  loading={historyLoading}
+                  loadingText="Loading history"
+                  items={history}
+                  trackBy="id"
+                  empty={<Box color="text-status-inactive">Nothing run yet.</Box>}
+                  columnDefinitions={[
+                    { id: "ts", header: "When", cell: (h) => formatTime(h.ts) },
+                    { id: "device", header: "Device", cell: (h) => h.device_name || h.device_id },
+                    { id: "command", header: "Command", cell: (h) => <Box variant="code">{h.command}</Box> },
+                    {
+                      id: "status",
+                      header: "Status",
+                      cell: (h) =>
+                        h.status === "ok" ? (
+                          <StatusIndicator type="success">ok</StatusIndicator>
+                        ) : (
+                          <StatusIndicator type="error">{h.error || "error"}</StatusIndicator>
+                        ),
+                    },
+                    {
+                      id: "duration",
+                      header: "Took",
+                      cell: (h) => (h.duration_ms == null ? "-" : `${(h.duration_ms / 1000).toFixed(2)}s`),
+                    },
+                    {
+                      id: "actions",
+                      header: "Actions",
+                      cell: (h) => (
+                        <Button
+                          disabled={!selected || h.device_id !== selected.id}
+                          loading={running === `hist:${h.id}`}
+                          onClick={() => handleRerun(h, `hist:${h.id}`)}
+                        >
+                          Run again
+                        </Button>
+                      ),
+                    },
+                  ]}
+                />
+              </SpaceBetween>
             ),
           },
           {

@@ -240,3 +240,17 @@ def find_command(category_id, command_id, platform="os9"):
             if item["id"] == command_id:
                 return item
     return None
+
+
+def command_exists(category_id, command_id):
+    """True if this command exists in *any* platform's tree. Used when
+    pinning a favourite with no device attached ("run this anywhere"),
+    where there's no single platform to validate against - the real
+    per-platform check still happens at run time via find_command, so this
+    is a "don't let obvious typos be saved" guard, not a security
+    boundary (the allowlist enforcement is unchanged and still in
+    _resolve_command)."""
+    return any(
+        find_command(category_id, command_id, platform) is not None
+        for platform in COMMAND_TREES
+    )
