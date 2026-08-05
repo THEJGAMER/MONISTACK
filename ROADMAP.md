@@ -1506,6 +1506,61 @@ The gate on anyone other than you using this.
       own, and a bulk delete of real operational history is the user's
       call, not a cleanup to slip into a bug fix.
 
+- [x] **2026-08-06**: Tested and validated the whole alerting/paging/
+      alarming path end to end, after noting `interface_alerting.py` was
+      the largest untested module in the app - 470 lines, zero tests,
+      carrying every InterfaceDown page. 49 new tests (34 interface
+      alerting, 15 paging); the alerting subsystem now has 98 across six
+      modules, and the suite is 185 total.
+
+      **A real bug fell out of it, and the way it was found is the point.**
+      The first 27 interface-alerting tests all passed immediately, which
+      proves little on its own - so each critical guard was
+      mutation-tested by deliberately breaking it to confirm a test
+      actually failed. Two mutations survived. One turned out to be
+      unreachable dead code (the test was fine). The other was real: the
+      freshness check in `reconcile_via_poll` could be deleted entirely
+      and every test still passed, because `_alerting` already guards the
+      re-fire direction and resolve is naturally idempotent.
+
+      Testing the *docstring's claim* rather than the code's behaviour
+      then exposed the actual defect. `reconcile_via_poll` promises "a
+      snapshot from before the alert even started can never trigger this".
+      It didn't hold: firing an alert **clears** `_last_seen_poll_at`,
+      which leaves the next reconcile tick with no baseline, so it accepts
+      the first snapshot it sees regardless of age. The realistic case is
+      exactly the dangerous one - a syslog "down" fires within ~3s while
+      the SSH poller's last good cycle can be ~30s old and still read
+      "up", so reconcile resolved a live outage seconds after it had been
+      correctly detected. That is precisely the stale-read hazard the
+      whole fire/resolve split was designed around, reintroduced through
+      the back door.
+
+      Fixed with an explicit episode stamp (`_alert_started_at`, set
+      wherever an episode begins, cleared on every resolve path so it
+      can't block the next one) and a `_poll_predates_alert` guard that
+      rejects poll results older than the alert. Unparseable timestamps
+      mean "no opinion" rather than "block", so an unexpected format can
+      never wedge an alert unresolvable. Reseeded alerts use the alert's
+      real `startsAt`, since that episode genuinely began before this
+      process did. The fix is itself mutation-verified: reverting the
+      guard fails the new test.
+
+      Paging's 15 tests pin the module's stated safety principle - "pages
+      sooner than you wanted" is a safe failure, "silently never pages" is
+      not - so every error path is checked to fail *open*: a broken
+      Alertmanager yields no hold rather than an exception into the alarm
+      loop, a zero/negative delay creates no silence at all, and NARG is a
+      finite 24h hold rather than an open-ended one that loses the alarm.
+
+      Validated live against the real Alertmanager, not just in fakes: an
+      alert posted through the real client became `active`, a real hold
+      moved it to `suppressed` (which is what proves `matchers_for` builds
+      a silence that actually matches - a subset matcher fails silently by
+      matching nothing), `release` returned it to `active`, and a resolve
+      cleared it. All five stages passed; test alert and silence cleaned
+      up afterwards, zero residue.
+
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added
       a real Juniper EX3300-48P (root SSH, verified live), with its own

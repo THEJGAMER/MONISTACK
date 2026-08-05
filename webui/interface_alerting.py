@@ -75,6 +75,21 @@ class InterfaceAlertConfigStore:
         }
 
 
+def _parse_ts(value):
+    """Best-effort parse of an ISO timestamp that may end in 'Z' or an
+    explicit offset. Returns None if it can't be read, and callers treat
+    that as "no opinion" rather than blocking, so an unexpected format can
+    never wedge an alert permanently."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
 class InterfaceAlertChecker:
     """Holds the in-memory down-tracking state across ticks - deliberately
     not persisted: a webui restart re-observes real current state on the
@@ -98,6 +113,12 @@ class InterfaceAlertChecker:
         self._last_posted = {}  # (device_id, port) -> monotonic time of last fire/heartbeat POST
         self._last_syslog_ts_ns = 0  # dedup cursor for check_via_syslog
         self._last_seen_poll_at = {}  # (device_id, port) -> last status_poller "last_polled" considered
+        # (device_id, port) -> wall-clock ISO time the current alerting
+        # episode began. reconcile_via_poll compares the poller's own
+        # `last_polled` against this so it can only ever resolve on a
+        # snapshot that genuinely postdates the alert - see
+        # _poll_predates_alert.
+        self._alert_started_at = {}
 
     def check_once(self, configs, get_port_state, device_name_for, alertmanager):
         """Owns delayed-mode timing end to end (its down_since tracking is
@@ -137,6 +158,7 @@ class InterfaceAlertChecker:
                     self._alerting.discard(key)
                     self._last_posted.pop(key, None)
                     self._last_seen_poll_at.pop(key, None)
+                    self._alert_started_at.pop(key, None)
                 continue
 
             state = get_port_state(cfg["device_id"], cfg["port"])
@@ -149,6 +171,7 @@ class InterfaceAlertChecker:
                     self._alerting.add(key)
                     self._last_posted[key] = now
                     self._last_seen_poll_at.pop(key, None)
+                    self._mark_episode_start(key)
                 elif is_down and key in self._alerting:
                     self._maybe_heartbeat(key, cfg, alertmanager, device_name_for, now)
                 elif not is_down:
@@ -161,6 +184,7 @@ class InterfaceAlertChecker:
                     self._resolve(cfg, alertmanager, device_name_for)
                     self._alerting.discard(key)
                     self._last_posted.pop(key, None)
+                    self._alert_started_at.pop(key, None)
                 continue
 
             if key not in self._down_since:
@@ -172,8 +196,41 @@ class InterfaceAlertChecker:
                     self._fire(cfg, alertmanager, device_name_for, down_for)
                     self._alerting.add(key)
                     self._last_posted[key] = now
+                    self._mark_episode_start(key)
                 else:
                     self._maybe_heartbeat(key, cfg, alertmanager, device_name_for, now)
+
+    def _mark_episode_start(self, key):
+        """Stamps when this alerting episode began, so reconcile_via_poll
+        can reject poll snapshots older than the alert itself."""
+        self._alert_started_at[key] = datetime.now(timezone.utc)
+
+    def _poll_predates_alert(self, key, polled_at):
+        """True when this poll result was taken *before* the current alert
+        started, meaning it cannot possibly show the recovery it appears to.
+
+        This is the guard that makes reconcile_via_poll's documented
+        promise ("a snapshot from before the alert even started can never
+        trigger this") actually true. It wasn't: clearing
+        `_last_seen_poll_at` when an alert fires leaves the next reconcile
+        tick with no baseline at all, so the first snapshot it sees is
+        accepted regardless of age - and the realistic case is exactly the
+        dangerous one. A syslog "down" fires within ~3s, while the SSH
+        poller's last successful cycle can be up to ~30s old and still says
+        "up", so reconcile would resolve a live outage seconds after it was
+        correctly detected. Caught by testing the docstring's claim rather
+        than the code's behaviour.
+
+        An unparseable timestamp returns False (no opinion) rather than
+        blocking, so an unexpected format can't wedge an alert forever -
+        the `_last_seen_poll_at` freshness check still applies."""
+        started = self._alert_started_at.get(key)
+        if started is None:
+            return False
+        polled = _parse_ts(polled_at)
+        if polled is None:
+            return False
+        return polled <= started
 
     def _maybe_heartbeat(self, key, cfg, alertmanager, device_name_for, now):
         """Re-POSTs an already-firing alert's labels periodically, purely
@@ -258,12 +315,14 @@ class InterfaceAlertChecker:
                 self._alerting.add(key)
                 self._last_posted[key] = now
                 self._last_seen_poll_at.pop(key, None)
+                self._mark_episode_start(key)
             else:
                 self._down_since.pop(key, None)
                 self._resolve(cfg, alertmanager, device_name_for)
                 self._alerting.discard(key)
                 self._last_posted.pop(key, None)
                 self._last_seen_poll_at.pop(key, None)
+                self._alert_started_at.pop(key, None)
         self._last_syslog_ts_ns = newest_seen
 
     def reconcile_via_poll(self, configs, get_state_and_polled_at, device_name_for, alertmanager):
@@ -314,6 +373,12 @@ class InterfaceAlertChecker:
                 continue
             if self._last_seen_poll_at.get(key) == polled_at:
                 continue  # same snapshot as last check - nothing new learned
+            if state != "down" and self._poll_predates_alert(key, polled_at):
+                # Older than the alert itself - it can't witness a recovery
+                # that hadn't happened when it was taken. Deliberately not
+                # recorded as "seen", so the next genuinely newer poll is
+                # still evaluated normally.
+                continue
             self._last_seen_poll_at[key] = polled_at
             if state != "down":
                 if key in self._alerting:
@@ -326,6 +391,7 @@ class InterfaceAlertChecker:
                     self._down_since.pop(key, None)
                     self._last_posted.pop(key, None)
                     self._last_seen_poll_at.pop(key, None)
+                    self._alert_started_at.pop(key, None)
             elif key not in self._alerting:
                 log.info(
                     "interface alert re-armed via poll (state lost, e.g. restart): %s/%s",
@@ -335,6 +401,7 @@ class InterfaceAlertChecker:
                 self._fire(cfg, alertmanager, device_name_for, 0)
                 self._alerting.add(key)
                 self._last_posted[key] = now
+                self._mark_episode_start(key)
 
     def forget(self, device_id, port):
         """Drops all tracking for one port, so a manual resolve from the UI
@@ -353,6 +420,7 @@ class InterfaceAlertChecker:
         self._down_since.pop(key, None)
         self._last_posted.pop(key, None)
         self._last_seen_poll_at.pop(key, None)
+        self._alert_started_at.pop(key, None)
 
     def pending_entries(self, configs, device_name_for):
         """Delayed-mode ports currently counting down toward their
@@ -422,6 +490,13 @@ class InterfaceAlertChecker:
             self._alerting.add(key)
             self._down_since.setdefault(key, now)
             self._last_posted[key] = now
+            # This episode started before this process did, so anything the
+            # poller has since recorded genuinely postdates it. Use the
+            # alert's real startsAt when Alertmanager offers one; otherwise
+            # a far-past stamp, which is correct here and keeps
+            # _poll_predates_alert from blocking a legitimate resolve.
+            started = _parse_ts(alert.get("startsAt")) or datetime.min.replace(tzinfo=timezone.utc)
+            self._alert_started_at[key] = started
             seeded += 1
         if seeded:
             log.info("interface alert state reseeded from Alertmanager: %d alert(s) still active", seeded)
