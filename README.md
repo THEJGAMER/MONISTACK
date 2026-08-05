@@ -124,6 +124,38 @@ label was.
 
 ## Deploying on an LXC
 
+### The quick way: `packaging/install-stack.sh`
+
+An installer that does the native (no-Docker) deployment for you, one
+module at a time or as a bundle:
+
+```
+sudo ./packaging/install-stack.sh              # interactive - detects, then asks
+sudo ./packaging/install-stack.sh --detect     # what's installed here (no root needed)
+sudo ./packaging/install-stack.sh --bundle app # webui + Prometheus on this host
+sudo ./packaging/install-stack.sh --update     # after a git pull
+```
+
+Bundles exist for a practical reason rather than convenience. The webui's
+Rules tab writes Prometheus's alert-rules file and then calls Prometheus's
+`/-/reload`, so both processes must see the **same file**. Split across
+machines that needs NFS/CIFS/SMB; co-located it's just a path on disk
+shared through a Unix group - which is what `--bundle app` sets up.
+
+| Bundle | Modules | For |
+|---|---|---|
+| `app` | webui + prometheus | The pairing that avoids needing a shared filesystem |
+| `monitoring` | prometheus + alertmanager + grafana | The metrics/alerting side, no webui |
+| `all` | everything | One-host install |
+
+Individual modules: `webui`, `prometheus`, `alertmanager`, `grafana`,
+`exporter`. It detects what's already present, only updates what's out of
+date, prints per-module next steps when it finishes, and has `--dry-run`.
+The walkthroughs below remain the reference for what it does and why -
+read them if you want to understand or customise any step.
+
+### The manual walkthroughs
+
 Five full walkthroughs, depending on what you need:
 
 - **[docs/deploy-lxc-docker.md](docs/deploy-lxc-docker.md)** — the whole

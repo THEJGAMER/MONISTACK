@@ -13,6 +13,13 @@ tarballs (matching the versions pinned in `docker-compose.yml`) were
 downloaded and their binaries actually executed to confirm the URLs and
 internal paths below are real, not guessed from documentation.
 
+> **There's a script for this now.** `packaging/install-stack.sh` performs
+> everything below, per-module or by bundle, with install detection and an
+> update path: `sudo ./packaging/install-stack.sh --bundle app`. This guide
+> remains the reference for *what it does and why* - each step here
+> explains a failure that shaped it. Read it if you're customising, or if
+> the script does something you want to understand.
+
 Assumes Debian 12 or Ubuntu 22.04+ LXCs, `amd64`. Assign static IPs to all
 4 LXCs before starting - the configs below reference each other.
 
