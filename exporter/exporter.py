@@ -88,6 +88,40 @@ xcvr_tx_dbm = Gauge("s4048_transceiver_tx_power_dbm", "Tx optical power", ["devi
 xcvr_rx_dbm = Gauge("s4048_transceiver_rx_power_dbm", "Rx optical power", ["device_id", "port"])
 xcvr_alarm = Gauge("s4048_transceiver_alarm", "1=alarm active", ["device_id", "port", "flag"])
 
+# Every metric above carries `device_id` as its first label, which is what
+# makes _clear_device_metrics below a simple generic sweep rather than the
+# per-metric bookkeeping an earlier version of this file decided wasn't
+# worth doing (see the removal branch in main()).
+_DEVICE_LABELED_METRICS = [
+    up, scrape_duration, cpu_util, mem_bytes,
+    fan_status, fan_rpm, psu_status, psu_power_watts,
+    unit_temp_c, sensor_temp_c, iface_up, iface_speed_mbps,
+    xcvr_present, xcvr_temp_c, xcvr_voltage_v, xcvr_bias_ma,
+    xcvr_tx_dbm, xcvr_rx_dbm, xcvr_alarm,
+]
+
+
+def _clear_device_metrics(device_id):
+    """Drops every series belonging to one device once it leaves the
+    registry. Without this, a removed device's last-scraped values stay in
+    the exposition forever - and the value that matters most is `s4048_up`,
+    which is very often 0 at exactly that moment (a device is usually
+    removed *because* it's dead or decommissioned). That left
+    `S4048DeviceDown` firing permanently for a device that no longer
+    existed, unclearable by anything short of restarting this process -
+    confirmed live before this fix.
+
+    `_metrics` is prometheus_client's own child-series dict; it's the only
+    way to enumerate existing label combinations, since `.remove()` needs
+    exact label values and nothing else exposes them."""
+    for metric in _DEVICE_LABELED_METRICS:
+        for labelvalues in [lv for lv in list(getattr(metric, "_metrics", {})) if lv and lv[0] == device_id]:
+            try:
+                metric.remove(*labelvalues)
+            except KeyError:
+                pass  # already gone - another sweep or a concurrent scrape raced us
+
+
 INTERFACE_PREFIXES = [("Te", "TenGigabitEthernet"), ("Fo", "fortyGigE")]
 
 # Junos environment items look like "FPC 0 Fan 1" / "FPC 0 Power Supply 0"
@@ -385,6 +419,7 @@ def main():
 
     store = _build_store()
     threads = {}  # device_id -> (Thread, stop_event)
+    pending_cleanup = {}  # device_id -> Thread, awaiting exit before its metrics are swept
     warned_unsupported = set()
 
     while True:
@@ -415,14 +450,32 @@ def main():
         for device_id in list(threads):
             if device_id not in seen:
                 log.info("device_id=%s: no longer in the registry, stopping its poll loop", device_id)
-                _, stop_event = threads.pop(device_id)
+                t, stop_event = threads.pop(device_id)
                 stop_event.set()
-                # Deliberately not clearing this device's Gauge label
-                # combinations here - Prometheus will just keep serving
-                # its last-known values until this process restarts. Fine
-                # for how rarely devices are removed; not worth the
-                # bookkeeping of tracking every label combination emitted
-                # per device just to un-set them.
+                # This used to deliberately leave the device's series in
+                # place ("Prometheus will just keep serving its last-known
+                # values until this process restarts - fine for how rarely
+                # devices are removed"). It wasn't fine: the last-known
+                # s4048_up for a just-removed device is usually 0, so
+                # S4048DeviceDown kept firing forever for a device that no
+                # longer existed. See _clear_device_metrics.
+                #
+                # The sweep is deferred until the poll thread has actually
+                # exited rather than done right here: setting stop_event
+                # doesn't interrupt a thread already blocked in a ~12s SSH
+                # connect timeout, and that thread's own error handler does
+                # `up.set(0)` on its way out - recreating the exact series
+                # just removed. Confirmed live: sweeping immediately left
+                # the metric present after a full refresh cycle.
+                pending_cleanup[device_id] = t
+
+        for device_id in list(pending_cleanup):
+            thread = pending_cleanup[device_id]
+            thread.join(timeout=0.1)
+            if not thread.is_alive():
+                _clear_device_metrics(device_id)
+                del pending_cleanup[device_id]
+                log.info("device_id=%s: poll loop exited, metrics cleared", device_id)
 
         time.sleep(REGISTRY_REFRESH_INTERVAL)
 

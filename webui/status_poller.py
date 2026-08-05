@@ -467,8 +467,28 @@ class StatusPoller:
             _merge_port_state(interfaces, desc_rows)
             _merge_activity(interfaces, rates)
             _merge_errors(interfaces, errors)
-            env["fans"] = _fill_missing_bays(env.get("fans", []), status.known_fan_bays, _fan_placeholder)
-            env["psus"] = _fill_missing_bays(env.get("psus", []), status.known_psu_bays, _psu_placeholder)
+            # A `show environment` that parsed to *nothing* on a device we
+            # already know has fans/PSUs is a failed read (garbled or
+            # partial output - observed live right after an SSH session
+            # reconnect), not a chassis that lost every component at once.
+            # Without this guard _fill_missing_bays below faithfully turns
+            # that empty parse into a synthetic "down" row for every known
+            # bay, which is exactly what fired 5 simultaneous false fan/PSU
+            # alarms on the healthy S4048 within ~10s of each reconnect
+            # (confirmed in the logs: every burst is one reconcile tick
+            # after a "connected and escalated" line, resolving on the next
+            # good poll). Keep the last known-good env instead - the same
+            # treatment a hard SSH failure already gets, since this is the
+            # same situation: no trustworthy sample this cycle.
+            if not env.get("fans") and not env.get("psus") and (status.known_fan_bays or status.known_psu_bays):
+                log.warning(
+                    "discarding empty 'show environment' parse for %s - keeping last known-good "
+                    "environment rather than reporting every bay as down", device.id,
+                )
+                env = status.env or {}
+            else:
+                env["fans"] = _fill_missing_bays(env.get("fans", []), status.known_fan_bays, _fan_placeholder)
+                env["psus"] = _fill_missing_bays(env.get("psus", []), status.known_psu_bays, _psu_placeholder)
             state, alarms, up_count, total = _evaluate(env, interfaces)
             # The switch's own `show alarms` is authoritative - fold its
             # Minor/Major entries into the same alarm state/list our own

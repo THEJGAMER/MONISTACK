@@ -216,8 +216,29 @@ class HardwareAlertChecker:
                 self._resolve(key, alertmanager, device_name_for)
                 self._last_posted.pop(key, None)
             for key, severity in currently_faulted.items():
-                self._fire(key, severity, alertmanager, device_name_for)
-                self._last_posted[key] = time.monotonic()
+                self._maybe_fire_or_heartbeat(key, severity, alertmanager, device_name_for)
+
+    def _maybe_fire_or_heartbeat(self, key, severity, alertmanager, device_name_for):
+        """Fires a genuinely new fault immediately, but re-POSTs an
+        already-firing one only every HEARTBEAT_SECONDS - the direct
+        equivalent of InterfaceAlertChecker._maybe_heartbeat, and needed
+        for the same two reasons. The re-POST exists at all because a
+        directly-posted alert (unlike a Prometheus-rule one, which
+        Prometheus re-sends every evaluation cycle) is lost silently if
+        Alertmanager restarts, with no way for it to ask for a resend.
+        But reconcile_via_poll runs every ~10s against a fault that can
+        persist for hours, so firing unconditionally there re-POSTed the
+        same unchanged alarm ~12x more often than the heartbeat interval
+        this class already declared - confirmed by counting real posts
+        (10 posts across 10 unchanged polls, where 1 was intended)."""
+        now = time.monotonic()
+        if key not in self._alerting:
+            self._fire(key, severity, alertmanager, device_name_for)
+            self._last_posted[key] = now
+            return
+        if now - self._last_posted.get(key, 0) >= self.HEARTBEAT_SECONDS:
+            self._fire(key, severity, alertmanager, device_name_for)
+            self._last_posted[key] = now
 
     def reseed_from_alertmanager(self, alertmanager):
         """Called once at process startup (see app.py) - same reasoning as

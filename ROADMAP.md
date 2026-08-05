@@ -1234,6 +1234,84 @@ The gate on anyone other than you using this.
       alert with correct labels/summary in Alertmanager; a matching
       recovery event resolved it. 12 new tests
       (`test_hardware_alerting.py`), all passing.
+- [x] **2026-08-06**: Full-app audit (tests + live stack), triggered by a
+      general "report on the app" request rather than a specific
+      complaint - three real bugs found, all live-confirmed before fixing,
+      two of them in the fan/PSU alerting shipped four days earlier.
+
+      **1. Heartbeat throttle was dead code.** `hardware_alerting.py`
+      declared `HEARTBEAT_SECONDS = 120` and maintained a `_last_posted`
+      dict, but `reconcile_via_poll` never read it - it called `_fire()`
+      unconditionally for every faulted component on every fresh poll
+      (~10s), re-POSTing unchanged alarms ~12x more often than intended.
+      `interface_alerting.py`, the module this was modelled on, gates the
+      identical re-POST behind `_maybe_heartbeat`; that gate simply wasn't
+      carried across. Proven by counting real posts (10 across 10
+      unchanged polls, where 1 was intended), fixed with
+      `_maybe_fire_or_heartbeat`, pinned by 2 tests covering both
+      directions (throttled while unchanged, still re-POSTs once the
+      interval elapses - the re-POST matters because a directly-posted
+      alert is lost silently if Alertmanager restarts).
+
+      **2. An empty `show environment` parse reported the whole chassis as
+      down.** `_fill_missing_bays` synthesizes a "down" row for any known
+      bay missing from the current poll - correct for a physically pulled
+      fan tray (the row just disappears), but it cannot distinguish that
+      from a read that returned *nothing*. A garbled/partial
+      `show environment` right after an SSH reconnect therefore produced
+      "every fan and PSU is down". Found in the logs, not theorised: the
+      healthy S4048 fired 5 simultaneous fan/PSU alarms four separate
+      times over 46 hours, each burst exactly one reconcile tick after a
+      "connected and escalated" line and resolving on the next good poll.
+      Notably this is a *pre-existing* poller weakness that only became
+      visible when fan/PSU alerting moved off the Prometheus rules - their
+      `for: 120s` confirmation window had been silently absorbing every
+      ~30s burst. Fixed by treating an all-empty parse on a device with
+      known bays as a failed read and keeping the last known-good env
+      (the same treatment a hard SSH failure already gets, verified
+      earlier this week to be safe); 4 new tests, `status_poller.py`'s
+      first.
+
+      **3. A removed device's metrics never cleared, so its alert could
+      never clear.** The exporter stopped a removed device's poll loop but
+      deliberately left its series in the exposition ("Prometheus will
+      just keep serving its last-known values until this process restarts
+      - fine for how rarely devices are removed"). It wasn't fine: the
+      last-known `s4048_up` for a just-removed device is usually 0,
+      because a device is typically removed *because* it's dead. A leftover
+      test device was found still firing `S4048DeviceDown` with no way to
+      clear it short of an exporter restart. Fixed with a generic sweep
+      (every metric carries `device_id` as its first label, so this needs
+      no per-metric bookkeeping - the objection the original comment
+      raised). The first attempt failed live verification, which is the
+      point of doing it: sweeping immediately left the metric present,
+      because `stop_event.set()` doesn't interrupt a thread already
+      blocked in a ~12s SSH connect timeout, and that thread's own error
+      handler re-runs `up.set(0)` on its way out, recreating the exact
+      series just deleted. Corrected to defer the sweep until the thread
+      has actually exited. Live-verified end to end without a restart:
+      added a probe device, confirmed `s4048_up=0` appeared, deleted it,
+      and watched the log go "stopping its poll loop" -> (one cycle
+      later) "poll loop exited, metrics cleared" with every series gone.
+      4 new tests - the exporter's first, it had none.
+
+      Also confirmed healthy in the same pass, so it's on record: 71 API
+      routes audited for their auth dependency with **zero** unintentionally
+      unauthenticated (the 11 open ones are exactly the documented
+      orchestrator/first-boot set); all 5 containers up with both
+      Prometheus targets healthy; zero TODO/FIXME markers in the codebase;
+      and OPNsense is genuinely parsed by the webui (only the *exporter*
+      skips it, which is what the docs actually claim).
+
+      Known-but-unfixed, deliberately left for a decision rather than
+      changed unilaterally: the S4048 at 192.168.4.106 is registered
+      **twice** - `s4048` (static, `common/devices.yaml` via
+      `SWITCH_HOST`) and `s4048-core-switch` (dynamic, Postgres) - 267
+      identical series each, two SSH sessions against one switch, and two
+      alerts for any single real fault. Removing either one means editing
+      the user's own registry/`.env`, so it's reported, not silently
+      resolved.
+
 - [x] **2026-08-02**: Made the Prometheus `for:` confirmation window (the
       "pending" time shown on the Alerts/Alarms pages) editable per rule
       from the Rules tab, alongside the existing severity/enabled/page-

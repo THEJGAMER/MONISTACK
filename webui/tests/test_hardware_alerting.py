@@ -146,6 +146,44 @@ def test_reconcile_ignores_a_stale_unchanged_snapshot():
     assert len(am.posted) == 1  # only the first tick actually posted
 
 
+def test_unchanged_fault_is_not_reposted_on_every_poll():
+    """reconcile_via_poll runs every ~10s but a real fault persists for
+    hours - an already-firing alarm must only be re-POSTed on the
+    HEARTBEAT_SECONDS cadence (Alertmanager-restart insurance), not on
+    every tick. Shipped once firing unconditionally here: 10 posts across
+    10 unchanged polls, ~12x the intended rate."""
+    checker = HardwareAlertChecker()
+    am = _FakeAlertmanager()
+    env = {"fans": [], "psus": [{"unit": 1, "bay": 2, "status": "down"}]}
+
+    for i in range(10):
+        checker.reconcile_via_poll(
+            ["dev1"], lambda d, i=i: (env, f"t{i}"), _device_name_for, am
+        )
+
+    assert len(am.posted) == 1, f"expected 1 initial fire, got {len(am.posted)} posts"
+
+
+def test_heartbeat_reposts_once_the_interval_has_elapsed():
+    """The flip side of the throttle above - the re-POST must still
+    actually happen, or an Alertmanager restart silently drops the alert
+    with nothing to resend it."""
+    checker = HardwareAlertChecker()
+    am = _FakeAlertmanager()
+    env = {"fans": [], "psus": [{"unit": 1, "bay": 2, "status": "down"}]}
+
+    checker.reconcile_via_poll(["dev1"], lambda d: (env, "t0"), _device_name_for, am)
+    assert len(am.posted) == 1
+
+    # Backdate the last POST past the heartbeat interval.
+    key = ("dev1", "psu", "1", "2")
+    checker._last_posted[key] -= checker.HEARTBEAT_SECONDS + 1
+    checker.reconcile_via_poll(["dev1"], lambda d: (env, "t1"), _device_name_for, am)
+
+    assert len(am.posted) == 2
+    assert "endsAt" not in am.posted[-1]  # a heartbeat, not a resolve
+
+
 def test_forget_drops_tracking_but_a_still_real_fault_can_refire():
     """Mirrors InterfaceAlertChecker.forget's non-suppression contract - a
     manual resolve clears bookkeeping, but the next poll tick that still
