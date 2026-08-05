@@ -1439,6 +1439,52 @@ The gate on anyone other than you using this.
       (always use an unused `--user-data-dir` per browser-based check,
       never reuse one across calls) is worth not re-learning.
 
+- [x] **2026-08-06**: `alert_occurrences` had grown to 21,065 rows on a
+      three-device lab - 19,813 of them a single `S4048DeviceDown` for one
+      continuously-down device, which should have been exactly one row.
+      Found while sizing tables for the retention item in 0.3, and worth
+      chasing before adding retention, since prune-first would have
+      quietly capped the symptom and left the cause running.
+
+      Root cause, confirmed via `pg_stat_activity` rather than inferred:
+      **two Switchboard instances were sharing one Postgres** - the
+      deployed LXC (`192.168.0.147`, connected continuously since
+      2026-08-02 12:56, which is exactly when the junk rows start) and a
+      local dev stack pointed at the same `DATABASE_URL`. Occurrence
+      closing was *absence-based* - "anything open that I can't currently
+      see firing is over" - so each instance, reconciling against its own
+      Alertmanager, kept closing occurrences the other had just opened,
+      and the other immediately reopened them. One row every ~3s, forever.
+
+      Getting there took several wrong turns worth recording: the signature
+      hashing, the `ON CONFLICT` dedup, and the partial unique index were
+      each suspected and each individually proven correct (`open()` is
+      genuinely idempotent; calling the full sync loop by hand was
+      idempotent too). What finally isolated it was instrumenting `close()`
+      itself and finding it was **never called in this process** while
+      `resolved_at` kept being set - which only leaves another writer.
+
+      Fixed by making closing evidence-based instead: a new `last_seen_at`
+      column, `touch()` called for every firing/pending signature each
+      tick by whichever instance can see it, and `stale_open(grace)`
+      closing only what *nobody* has reported active for
+      `OCCURRENCE_CLOSE_GRACE_SECONDS` (90s). This also fixes a
+      single-instance failure that needed no second instance at all: one
+      slow or failed Alertmanager/Prometheus poll emptied the local view
+      for a tick and spuriously closed every open alarm.
+
+      Live-verified: with the second instance stopped, occurrence count
+      held flat at 21,068 over 30s having previously grown ~10 rows per
+      30s. 7 new tests against a real Postgres, including a direct
+      two-instance reproduction (instance B must not close what instance A
+      can still see) and a five-consecutive-blank-ticks case. 136 tests
+      pass.
+
+      Deliberately **not** done here: deleting the ~19,800 existing junk
+      rows. They're in a live production database this session doesn't
+      own, and a bulk delete of real operational history is the user's
+      call, not a cleanup to slip into a bug fix.
+
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added
       a real Juniper EX3300-48P (root SSH, verified live), with its own

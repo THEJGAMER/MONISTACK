@@ -22,7 +22,7 @@ occurrences from that one place covers both without a second code path.
 """
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger("webui.occurrences")
 
@@ -84,6 +84,38 @@ class OccurrenceStore:
             (resolved_at, paged_at, row["id"]),
         )
         return self.get(row["id"])
+
+    def touch(self, signature, seen_at=None):
+        """Records that this alarm was just observed genuinely active.
+
+        Called for every firing/pending signature on every sync tick, by
+        whichever instance can see it. `stale_open` below then closes only
+        what nobody has touched recently, which is what makes closing
+        evidence-based rather than "absent from *my* view right now" - see
+        db.py's note on last_seen_at for the two ways that view goes
+        partial (a second instance on the same database, and a momentary
+        Alertmanager/Prometheus blip)."""
+        self.db.execute(
+            "UPDATE alert_occurrences SET last_seen_at = %s WHERE signature = %s AND resolved_at IS NULL",
+            (seen_at or datetime.now(timezone.utc).isoformat(), signature),
+        )
+
+    def stale_open(self, grace_seconds, now=None):
+        """Open occurrences nobody has reported active for `grace_seconds`.
+
+        A NULL last_seen_at counts as stale: rows predating that column, or
+        opened by an instance that then died, should still be closable.
+        This is safe because the sync tick touches everything genuinely
+        active *before* consulting this - so anything still real has a
+        fresh timestamp by the time we get here."""
+        now = now or datetime.now(timezone.utc)
+        cutoff = (now - timedelta(seconds=grace_seconds)).isoformat()
+        rows = self.db.query(
+            "SELECT * FROM alert_occurrences WHERE resolved_at IS NULL "
+            "AND (last_seen_at IS NULL OR last_seen_at < %s)",
+            (cutoff,),
+        )
+        return [self._to_dict(r) for r in rows]
 
     def open_for(self, signature):
         row = self.db.query_one(
@@ -318,4 +350,7 @@ class OccurrenceStore:
             "paged_at": row["paged_at"],
             "paging_disabled": bool(row["paging_disabled"]),
             "silence_id": row["silence_id"],
+            # .get() because several queries select an explicit column subset
+            # rather than * (see due_to_page/repair) and would KeyError here.
+            "last_seen_at": row.get("last_seen_at") if hasattr(row, "get") else None,
         }

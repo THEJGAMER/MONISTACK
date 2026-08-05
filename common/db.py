@@ -352,6 +352,29 @@ CREATE INDEX IF NOT EXISTS idx_command_favorites_actor ON command_favorites(acto
 -- saved before this column existed genuinely have no attribution - showing
 -- "-" for those is honest, backfilling a guess would not be.
 ALTER TABLE results ADD COLUMN IF NOT EXISTS actor TEXT;
+
+-- Last time *any* Switchboard instance observed this occurrence's alarm
+-- actually active (firing in Alertmanager, or pending in Prometheus).
+--
+-- Exists because occurrence closing used to be absence-based: "anything
+-- open that I can't currently see firing is over". That is only correct
+-- if this process has a complete view, and it silently isn't in two real
+-- cases. The one found live: two Switchboard instances sharing this
+-- database (a dev stack and a deployed one, confirmed via
+-- pg_stat_activity - two distinct client_addr, the second connected
+-- continuously since 2026-08-02) each reconcile against their *own*
+-- Alertmanager, so each kept closing occurrences the other had just
+-- opened, which the other immediately reopened. That ping-pong produced
+-- ~19,800 junk occurrence rows for a single continuously-down device.
+-- The second case needs no second instance at all: a brief Alertmanager
+-- or Prometheus blip empties the local view for one tick and closes every
+-- open alarm spuriously.
+--
+-- With this column, closing becomes evidence-based - an occurrence is
+-- only closed once nobody has seen it active for a grace period - so a
+-- partial or momentarily-empty view can no longer end an alarm that is
+-- still really happening.
+ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS last_seen_at TEXT;
 """
 
 

@@ -78,6 +78,13 @@ PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
 # instant it fires". Applies to new alarms only - anything already held
 # keeps the window it was given.
 PAGE_DELAY_SECONDS = int(os.environ.get("PAGE_DELAY_SECONDS", "120"))
+# How long an open occurrence must go without *any* instance reporting its
+# alarm active before it's closed (see occurrences.stale_open). Needs to
+# comfortably exceed the 3s sync tick plus a slow Alertmanager/Prometheus
+# round trip, so a single slow or failed poll never ends a live alarm;
+# 90s costs at most that much delay on a resolve, against the alternative
+# of spuriously closing and reopening real alarms every few seconds.
+OCCURRENCE_CLOSE_GRACE_SECONDS = int(os.environ.get("OCCURRENCE_CLOSE_GRACE_SECONDS", "90"))
 PAGER = paging.PagingController(ALERTMANAGER, PAGE_DELAY_SECONDS)
 # Holds placed before an alarm exists as an occurrence, keyed by signature.
 # A hold has to be in place *before* Alertmanager dispatches (group_wait is
@@ -799,8 +806,22 @@ def _sync_occurrences():
     # firing closes the same way, which is the fix for the logging gap
     # above: it now has a start time, an end time, and a full timeline,
     # instead of never having existed as a record at all.
+    # Record that everything we *can* see is genuinely still active, before
+    # deciding what to close. Closing is deliberately evidence-based -
+    # "nobody has seen this active for a while" - rather than absence-based
+    # ("it isn't in my view this instant"), because this instance's view is
+    # not always complete. Found live: a second Switchboard sharing this
+    # database reconciles against its own Alertmanager, so each instance
+    # kept closing occurrences the other had just opened and the other
+    # immediately reopened them - ~19,800 junk rows for one continuously
+    # down device. The same flaw bites a single instance whenever
+    # Alertmanager or Prometheus blips for one tick. See db.py's
+    # last_seen_at comment.
     never_closing = firing_signatures | pending_signatures
-    for occurrence in OCCURRENCES.list(limit=1000, open_only=True):
+    for signature in never_closing:
+        OCCURRENCES.touch(signature)
+
+    for occurrence in OCCURRENCES.stale_open(OCCURRENCE_CLOSE_GRACE_SECONDS):
         if occurrence["signature"] in never_closing:
             continue
         if occurrence["silence_id"]:
