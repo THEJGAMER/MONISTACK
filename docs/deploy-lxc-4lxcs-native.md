@@ -48,16 +48,16 @@ cd webui/frontend && npm install && npm run build && cd -
 # devices.py/ssh_client.py/metrics.py/junos_parsers.py/devices.yaml with
 # it via common/.
 mkdir -p /opt/switchboard/app/frontend
-cp common/db.py common/store.py common/devices.py common/ssh_client.py \
-   common/metrics.py common/junos_parsers.py common/devices.yaml \
-   webui/app.py webui/auth.py webui/occurrences.py webui/paging.py \
-   webui/commands.py webui/results_store.py webui/status_poller.py \
-   webui/loki_client.py webui/alertmanager_client.py webui/alert_rules.py \
-   webui/alert_acks.py webui/audit.py webui/interface_alerting.py \
-   webui/parsers.py webui/opnsense_parsers.py webui/summarize.py \
-   webui/settings.py webui/topology.py webui/topology_store.py \
-   webui/trending.py webui/logging_setup.py webui/scheduler.py \
-   webui/compliance.py webui/requirements.txt \
+# Globs, not a hand-written file list. This used to name all ~30 modules
+# individually, which went stale the moment a new one was added and took
+# production down with `ModuleNotFoundError: No module named
+# 'command_history'` in a restart loop - app.py had been updated, the
+# module it imports had never been listed here to copy. Every `.py` in
+# these two directories is meant to be deployed (webui/ has no test files
+# at its top level - they live in webui/tests/), so a glob is both correct
+# and immune to that failure.
+cp common/*.py common/devices.yaml \
+   webui/*.py webui/requirements.txt \
    /opt/switchboard/app/
 cp -r webui/frontend/dist /opt/switchboard/app/frontend/dist
 mkdir -p /opt/switchboard/data
@@ -422,8 +422,28 @@ curl -s http://localhost:9090/api/v1/query --data-urlencode 'query=s4048_up'
 There's no `git pull && docker compose up -d --build` shortcut here - each
 piece is rebuilt/reinstalled manually:
 
-- **webui**: `git pull`, rebuild the frontend, re-copy the app files into
-  `/opt/switchboard/app`, `systemctl restart switchboard-webui`.
+- **webui**: the full sequence, not a summary - copying only the files you
+  think changed is how production ended up in a `ModuleNotFoundError`
+  restart loop (a new module `app.py` imports is easy to miss). Copy
+  everything; the globs make that cheap:
+
+  ```
+  cd ~/MONISTACK
+  git pull
+  (cd webui/frontend && npm ci && npm run build)
+  cp common/*.py common/devices.yaml webui/*.py webui/requirements.txt /opt/switchboard/app/
+  rm -rf /opt/switchboard/app/frontend/dist
+  cp -r webui/frontend/dist /opt/switchboard/app/frontend/dist
+  /opt/switchboard/venv/bin/pip install -r /opt/switchboard/app/requirements.txt
+  chown -R switchboard:switchboard /opt/switchboard/app
+  systemctl restart switchboard-webui
+  systemctl is-active switchboard-webui
+  ```
+
+  Schema changes apply themselves on startup (`db.py`'s `CREATE TABLE IF
+  NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`), so there's no
+  separate migration step - but that only happens if the process actually
+  starts, so check `is-active` rather than assuming.
 - **Prometheus/Alertmanager/Grafana**: download the new version's tarball,
   swap the binary directory, keep the config/data directories as they are,
   restart the service.
