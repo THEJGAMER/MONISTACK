@@ -78,6 +78,25 @@ sed "s#__EXEC_START__#$INSTALL_DIR/venv/bin/python $INSTALL_DIR/app/exporter.py#
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 
+# Deliberately asymmetric, and the asymmetry is the point:
+#
+#  - A *first* install must not start: exporter.env still holds the
+#    example credentials, so starting now just fails against the switch
+#    and fills the journal with auth errors before anyone has configured
+#    it. The next-steps below tell you to edit it and start.
+#  - An *update* to a service that is already running must restart, or the
+#    new code sits on disk doing nothing while the old process keeps
+#    serving. That is not hypothetical: it is exactly how a deployment
+#    ended up with a frontend calling an endpoint its own backend didn't
+#    have yet, with every file correctly copied.
+if systemctl is-active --quiet "$SERVICE_NAME"; then
+  echo "==> $SERVICE_NAME is running - restarting it to load the new code"
+  systemctl restart "$SERVICE_NAME"
+  systemctl is-active --quiet "$SERVICE_NAME" \
+    && echo "    restarted, still active" \
+    || echo "    WARNING: did not come back up - journalctl -u $SERVICE_NAME -n 50"
+fi
+
 echo
 echo "Installed. Next steps:"
 echo "  1. Edit $CONFIG_DIR/exporter.env with the switch's real host/user/password"

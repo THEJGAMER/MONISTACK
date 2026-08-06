@@ -260,9 +260,18 @@ write_unit() {
 }
 
 enable_now() {
+  # `enable --now` is enable + *start*, and start is a no-op on a service
+  # that's already running - so on an update it would copy the new code
+  # and leave the old process serving it, with everything looking
+  # successful. That exact failure hit production: new files on disk, an
+  # 11-hour-old process, and a UI calling an endpoint its backend didn't
+  # have yet. `restart` is correct for both cases, since restarting a
+  # stopped unit just starts it.
   local unit="$1"
   run systemctl daemon-reload
-  run systemctl enable --now "$unit"
+  run systemctl enable "$unit"
+  step "Restarting $unit to load the new code"
+  run systemctl restart "$unit"
 }
 
 wait_healthy() {
