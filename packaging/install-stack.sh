@@ -425,6 +425,19 @@ install_prometheus() {
   ensure_shared_group
   run usermod -aG "$SHARED_GROUP" prometheus
 
+  # Config lives in /etc, never inside /opt/prometheus - an update
+  # replaces that whole directory, so a prometheus.yml kept in there is
+  # destroyed on every upgrade. Same convention the exporter and
+  # alertmanager already use.
+  run mkdir -p /etc/prometheus
+  # Migrate a config left in the old location by an earlier version of
+  # this script (or a hand-rolled install following the guide) *before*
+  # the directory is removed, rather than silently losing it.
+  if [[ -f /opt/prometheus/prometheus.yml && ! -f /etc/prometheus/prometheus.yml ]]; then
+    run cp /opt/prometheus/prometheus.yml /etc/prometheus/prometheus.yml
+    ok "migrated existing prometheus.yml to /etc/prometheus/"
+  fi
+
   local tmp=/tmp/prometheus.tar.gz
   fetch_tarball "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" "$tmp"
   run tar xzf "$tmp" -C /tmp
@@ -462,7 +475,7 @@ Type=simple
 User=prometheus
 Group=prometheus
 ExecStart=/opt/prometheus/prometheus \
-  --config.file=/opt/prometheus/prometheus.yml \
+  --config.file=/etc/prometheus/prometheus.yml \
   --storage.tsdb.path=/var/lib/prometheus \
   --web.console.libraries=/opt/prometheus/console_libraries \
   --web.console.templates=/opt/prometheus/consoles \
@@ -479,19 +492,21 @@ EOF
 }
 
 write_prometheus_yml() {
-  if [[ -f /opt/prometheus/prometheus.yml.switchboard ]]; then
-    ok "prometheus.yml already customised - left untouched"
+  # Any existing config is the operator's, not ours - an update must never
+  # overwrite it (or re-prompt for values already answered).
+  if [[ -f /etc/prometheus/prometheus.yml ]]; then
+    ok "/etc/prometheus/prometheus.yml exists - left untouched"
     return
   fi
-  step "Writing prometheus.yml"
+  step "Writing /etc/prometheus/prometheus.yml"
   local am_target exp_target
   am_target="$(ask '  Alertmanager host:port' '127.0.0.1:9093')"
   exp_target="$(ask '  Exporter host:port' '127.0.0.1:9101')"
 
   if [[ $DRY_RUN -eq 1 ]]; then
-    printf '  %s[dry-run]%s write /opt/prometheus/prometheus.yml\n' "$C_DIM" "$C_RESET"; return
+    printf '  %s[dry-run]%s write /etc/prometheus/prometheus.yml\n' "$C_DIM" "$C_RESET"; return
   fi
-  cat > /opt/prometheus/prometheus.yml <<EOF
+  cat > /etc/prometheus/prometheus.yml <<EOF
 global:
   scrape_interval: 30s
   # Explicit, not defaulted. Prometheus's own default is 1 minute, which
@@ -517,9 +532,8 @@ scrape_configs:
     static_configs:
       - targets: ["localhost:8080"]
 EOF
-  touch /opt/prometheus/prometheus.yml.switchboard
-  chown prometheus:prometheus /opt/prometheus/prometheus.yml
-  ok "wrote /opt/prometheus/prometheus.yml"
+  chown -R prometheus:prometheus /etc/prometheus
+  ok "wrote /etc/prometheus/prometheus.yml"
 }
 
 # ------------------------------------------------------------ alertmanager
@@ -537,7 +551,12 @@ install_alertmanager() {
   run mkdir -p /var/lib/alertmanager /etc/alertmanager/secrets
 
   if [[ -f /etc/alertmanager/alertmanager.yml ]]; then
+    # Config *and* the secrets beside it are the operator's - an update
+    # replaces only the binary in /opt. Real Pushover/PagerDuty keys live
+    # in /etc/alertmanager/secrets and must never be overwritten by the
+    # repo's placeholder copies.
     ok "/etc/alertmanager/alertmanager.yml exists - left untouched"
+    ok "/etc/alertmanager/secrets left untouched"
   else
     local webui_url
     webui_url="$(ask '  webui host:port (for the alert webhook)' "$(hostname -I 2>/dev/null | awk '{print $1}'):8080")"
@@ -598,6 +617,16 @@ install_grafana() {
   ensure_apt curl
   ensure_user grafana
 
+  # Provisioning lives in /etc, not /opt/grafana/conf - an update replaces
+  # that whole directory, which would silently wipe the datasource and
+  # dashboard provisioning every upgrade. Grafana's own
+  # `paths.provisioning` setting exists exactly so this can live elsewhere.
+  run mkdir -p /etc/grafana/provisioning/datasources /etc/grafana/provisioning/dashboards
+  if [[ -d /opt/grafana/conf/provisioning/datasources ]] && \
+     [[ ! -f /etc/grafana/provisioning/datasources/switchboard.yml ]]; then
+    run bash -c "cp -r /opt/grafana/conf/provisioning/datasources/*.yml /etc/grafana/provisioning/datasources/ 2>/dev/null || true"
+  fi
+
   local tmp=/tmp/grafana.tar.gz
   fetch_tarball "https://dl.grafana.com/oss/release/grafana-${GRAFANA_VERSION}.linux-amd64.tar.gz" "$tmp"
   run tar xzf "$tmp" -C /tmp
@@ -605,17 +634,19 @@ install_grafana() {
   run mv "/tmp/grafana-v${GRAFANA_VERSION}" /opt/grafana
   run mkdir -p /var/lib/grafana/dashboards /var/log/grafana
 
+  # Dashboards are content, not config: refreshed from the repo each time.
+  # The provisioning *config* pointing at them is what must survive.
   if [[ -d "$REPO_DIR/grafana/dashboards" ]]; then
     run bash -c "cp '$REPO_DIR'/grafana/dashboards/*.json /var/lib/grafana/dashboards/ 2>/dev/null || true"
-    run bash -c "cp -r '$REPO_DIR'/grafana/provisioning/dashboards/* /opt/grafana/conf/provisioning/dashboards/ 2>/dev/null || true"
+    run bash -c "cp -r '$REPO_DIR'/grafana/provisioning/dashboards/* /etc/grafana/provisioning/dashboards/ 2>/dev/null || true"
   fi
 
-  if [[ ! -f /opt/grafana/conf/provisioning/datasources/switchboard.yml ]]; then
+  if [[ ! -f /etc/grafana/provisioning/datasources/switchboard.yml ]]; then
     local prom_url loki_url
     prom_url="$(ask '  Prometheus URL' 'http://127.0.0.1:9090')"
     loki_url="$(ask '  Loki URL (blank to skip)' '')"
     if [[ $DRY_RUN -eq 0 ]]; then
-      mkdir -p /opt/grafana/conf/provisioning/datasources
+      mkdir -p /etc/grafana/provisioning/datasources
       {
         echo "apiVersion: 1"
         echo "datasources:"
@@ -633,16 +664,22 @@ install_grafana() {
           echo "    jsonData:"
           echo "      maxLines: 1000"
         fi
-      } > /opt/grafana/conf/provisioning/datasources/switchboard.yml
-      ok "wrote Grafana datasource provisioning"
+      } > /etc/grafana/provisioning/datasources/switchboard.yml
+      ok "wrote Grafana datasource provisioning (/etc/grafana)"
     fi
   fi
 
-  local gpass
-  gpass="$(ask '  Grafana admin password' 'changeme')"
-  run chown -R grafana:grafana /opt/grafana /var/lib/grafana /var/log/grafana
+  # Only ask for a password on a first install - on an update the unit
+  # already carries one, and re-prompting would silently reset it.
+  local gpass=""
+  if [[ ! -f /etc/systemd/system/grafana.service ]]; then
+    gpass="$(ask '  Grafana admin password' 'changeme')"
+  else
+    ok "grafana.service exists - keeping its existing admin password"
+  fi
+  run chown -R grafana:grafana /opt/grafana /var/lib/grafana /var/log/grafana /etc/grafana
 
-  if [[ $DRY_RUN -eq 0 ]]; then
+  if [[ $DRY_RUN -eq 0 && -n "$gpass" ]]; then
     cat > /etc/systemd/system/grafana.service <<EOF
 [Unit]
 Description=Grafana
@@ -657,7 +694,7 @@ Environment=GF_SECURITY_ADMIN_PASSWORD=$gpass
 Environment=GF_USERS_ALLOW_SIGN_UP=false
 ExecStart=/opt/grafana/bin/grafana server \\
   --homepath=/opt/grafana \\
-  --configOverrides="cfg:default.paths.data=/var/lib/grafana cfg:default.paths.logs=/var/log/grafana"
+  --configOverrides="cfg:default.paths.data=/var/lib/grafana cfg:default.paths.logs=/var/log/grafana cfg:default.paths.provisioning=/etc/grafana/provisioning"
 Restart=on-failure
 RestartSec=5
 

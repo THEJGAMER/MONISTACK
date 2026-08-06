@@ -151,6 +151,23 @@ shared through a Unix group - which is what `--bundle app` sets up.
 Individual modules: `webui`, `prometheus`, `alertmanager`, `grafana`,
 `exporter`. It detects what's already present, only updates what's out of
 date, prints per-module next steps when it finishes, and has `--dry-run`.
+
+**Updates never touch your config.** Every module keeps its configuration
+under `/etc`, deliberately outside the `/opt/<module>` directory an upgrade
+replaces wholesale:
+
+| Module | Config kept at | On update |
+|---|---|---|
+| webui | `/etc/switchboard/webui.env` | untouched |
+| prometheus | `/etc/prometheus/prometheus.yml` | untouched |
+| alertmanager | `/etc/alertmanager/` incl. `secrets/` | untouched |
+| grafana | `/etc/grafana/provisioning/` + admin password in the unit | untouched |
+| exporter | `/etc/s4048-exporter/exporter.env` | untouched |
+
+Only the binaries, the Python app files, the frontend bundle and the
+dashboard JSON are replaced. If an earlier install left a `prometheus.yml`
+inside `/opt/prometheus`, it is migrated to `/etc/prometheus` before that
+directory is removed rather than lost.
 The walkthroughs below remain the reference for what it does and why -
 read them if you want to understand or customise any step.
 
