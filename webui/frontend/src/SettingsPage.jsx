@@ -71,7 +71,22 @@ export default function SettingsPage({ pushFlash }) {
     } catch (e) {
       // A failed health *fetch* is itself worth showing, rather than
       // leaving the panel silently stale and looking fine.
-      setHealth({ checks: [], error: e.message });
+      //
+      // A 404 specifically means this endpoint doesn't exist on the
+      // server, which - since this panel only ships alongside it - means
+      // the frontend bundle is newer than the Python backend serving it.
+      // That happens when a deploy copies webui/frontend/dist but not
+      // webui/*.py (or doesn't restart the service), and it surfaced
+      // exactly that way in production. "Not Found" gives no clue; say
+      // what's actually wrong.
+      const stale = /HTTP 404|Not Found/i.test(e.message || "");
+      setHealth({
+        checks: [],
+        error: stale
+          ? "This page is newer than the server it's talking to - /api/settings/health doesn't exist there yet. " +
+            "Copy webui/*.py and common/*.py to the app directory and restart the service, then reload."
+          : e.message,
+      });
     } finally {
       setHealthLoading(false);
     }
