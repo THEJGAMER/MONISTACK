@@ -117,6 +117,8 @@ export const addFavorite = (body) =>
   });
 export const deleteFavorite = (id) => api(`/api/favorites/${id}`, { method: "DELETE" });
 
+export const getSettingsHealth = () => api("/api/settings/health");
+
 export const getResult = (filename) => api(`/api/results/${filename}`);
 export const deleteResult = (filename) => api(`/api/results/${filename}`, { method: "DELETE" });
 export const exportResultUrl = (filename, format) => `/api/results/${encodeURIComponent(filename)}/export?format=${format}`;

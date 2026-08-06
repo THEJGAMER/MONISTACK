@@ -99,6 +99,9 @@ PENDING_HOLDS = {}
 # writable bind mount at this exact path and --web.enable-lifecycle.
 ALERT_RULES_FILE = os.environ.get("ALERT_RULES_FILE", str(BASE_DIR / "data" / "prometheus-alerts.yml"))
 PROMETHEUS_RELOAD_URL = os.environ.get("PROMETHEUS_RELOAD_URL", "http://prometheus:9090/-/reload")
+# Not scraped by the webui (Prometheus does that) - held only so the
+# Settings page can report whether the exporter is actually reachable.
+EXPORTER_URL = os.environ.get("EXPORTER_URL", "http://s4048-exporter:9101")
 
 # Deployment config (Postgres DSN, Loki URL) lives in a small JSON file on
 # the webui-data volume, editable from the in-app Settings page - see
@@ -973,15 +976,41 @@ def _apply_settings(settings_dict):
     DSN; callers decide how to surface that (500 at boot vs. a 400 back to
     the wizard/settings form)."""
     global LOKI_URL, DATABASE_URL, CONFIGURED, DB_ERROR, LOKI
+    global ALERTMANAGER_URL, PROMETHEUS_URL, PROMETHEUS_RELOAD_URL, EXPORTER_URL
+    global ALERTMANAGER, PAGER
     # Validate the DSN before committing any globals, so a failed update
     # (e.g. a typo'd Postgres URL) can't half-apply - the previously-working
     # DB connection is left untouched.
     _load_database(settings_dict["database_url"])
-    LOKI_URL = settings_dict.get("loki_url") or settings_store.DEFAULT_LOKI_URL
+    _apply_service_settings(settings_dict)
     DATABASE_URL = settings_dict["database_url"]
-    LOKI = LokiClient(LOKI_URL)
     CONFIGURED = True
     DB_ERROR = None
+
+
+def _apply_service_settings(settings_dict):
+    """The non-database half of _apply_settings, split out because it
+    cannot fail and must not be gated behind a working Postgres.
+
+    That gating is the exact shape of a bug already fixed once here: the
+    Settings page is where a broken deployment gets repaired, so anything
+    on it that requires the database to already work is unreachable
+    precisely when it's needed. An admin whose Postgres is down must still
+    be able to correct the Alertmanager or Loki address."""
+    global LOKI_URL, LOKI, ALERTMANAGER_URL, PROMETHEUS_URL, PROMETHEUS_RELOAD_URL
+    global EXPORTER_URL, ALERTMANAGER, PAGER
+    LOKI_URL = settings_dict.get("loki_url") or settings_store.DEFAULT_LOKI_URL
+    LOKI = LokiClient(LOKI_URL)
+    ALERTMANAGER_URL = settings_dict.get("alertmanager_url") or ALERTMANAGER_URL
+    PROMETHEUS_URL = settings_dict.get("prometheus_url") or PROMETHEUS_URL
+    PROMETHEUS_RELOAD_URL = settings_store.reload_url_for(settings_dict) or PROMETHEUS_RELOAD_URL
+    EXPORTER_URL = settings_dict.get("exporter_url") or EXPORTER_URL
+    # Rebuilt rather than mutated so a URL change takes effect immediately
+    # instead of at the next restart. PAGER holds its own reference to the
+    # client, so it has to be rebuilt too or it keeps talking to the old
+    # address - a silent failure where holds would be placed nowhere.
+    ALERTMANAGER = AlertmanagerClient(ALERTMANAGER_URL)
+    PAGER = paging.PagingController(ALERTMANAGER, PAGE_DELAY_SECONDS)
 
 
 _initial_settings = settings_store.load()
@@ -1083,6 +1112,12 @@ class SetupRequest(BaseModel):
 class SettingsUpdateRequest(BaseModel):
     database_url: Optional[str] = None  # blank = keep current
     loki_url: Optional[str] = None
+    alertmanager_url: Optional[str] = None
+    prometheus_url: Optional[str] = None
+    # Blank is meaningful here, unlike the others: it means "derive from
+    # prometheus_url" (settings.reload_url_for).
+    prometheus_reload_url: Optional[str] = None
+    exporter_url: Optional[str] = None
 
 
 @app.get("/api/setup/status")
@@ -1166,21 +1201,95 @@ def api_get_settings(user: str = Depends(require_auth)):
     return {
         "database_url_display": settings_store.redact_dsn(DATABASE_URL) if DATABASE_URL else None,
         "loki_url": LOKI_URL,
+        "alertmanager_url": ALERTMANAGER_URL,
+        "prometheus_url": PROMETHEUS_URL,
+        "prometheus_reload_url": PROMETHEUS_RELOAD_URL,
+        "exporter_url": EXPORTER_URL,
         "db_error": DB_ERROR,
     }
 
 
+def _probe(url, timeout=3):
+    """One service health check. Returns (ok, detail).
+
+    Deliberately treats any HTTP response as "reachable": a 404 from a
+    wrong path still proves something is listening and answering, which is
+    a different (and much more useful) diagnosis than a refused connection
+    or a DNS failure. Reporting both as a bare "down" is what makes a
+    typo'd path look identical to a dead host."""
+    if not url:
+        return False, "not configured"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return True, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as e:
+        return True, f"reachable, HTTP {e.code}"
+    except urllib.error.URLError as e:
+        return False, str(e.reason)
+    except Exception as e:  # socket timeouts, malformed URLs
+        return False, str(e)
+
+
+@app.get("/api/settings/health")
+def api_settings_health(user: str = Depends(require_auth)):
+    """Live reachability of every configured service.
+
+    require_auth, not require_auth_and_db: this is a diagnostic page, and
+    a broken database is exactly when someone needs to look at it. Gating
+    it behind the DB would blank the whole panel at the one moment it
+    matters - the same mistake that once made the Settings page itself
+    unusable when Postgres was down."""
+    checks = []
+
+    if STORE is not None and DB_ERROR is None:
+        checks.append({"name": "Postgres", "target": settings_store.redact_dsn(DATABASE_URL or ""),
+                       "ok": True, "detail": "connected"})
+    else:
+        checks.append({"name": "Postgres", "target": settings_store.redact_dsn(DATABASE_URL or ""),
+                       "ok": False, "detail": DB_ERROR or "not configured"})
+
+    for name, url, path in (
+        ("Loki", LOKI_URL, "/ready"),
+        ("Alertmanager", ALERTMANAGER_URL, "/-/healthy"),
+        ("Prometheus", PROMETHEUS_URL, "/-/healthy"),
+        ("Exporter", EXPORTER_URL, "/metrics"),
+    ):
+        base = (url or "").rstrip("/")
+        ok_, detail = _probe(f"{base}{path}" if base else "")
+        checks.append({"name": name, "target": url, "ok": ok_, "detail": detail})
+
+    return {"checks": checks}
+
+
 @app.put("/api/settings")
 def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_admin_no_db)):
-    new_settings = {
-        "database_url": (req.database_url or "").strip() or DATABASE_URL,
-        "loki_url": (req.loki_url or "").strip() or settings_store.DEFAULT_LOKI_URL,
-    }
+    current = settings_store.load() or {}
+    new_settings = dict(current)
+    new_settings["database_url"] = (req.database_url or "").strip() or DATABASE_URL
+    for key, _env, fallback in settings_store.SERVICE_SETTINGS:
+        submitted = getattr(req, key, None)
+        if submitted is None:
+            continue  # field omitted entirely - keep whatever is stored
+        submitted = submitted.strip()
+        # prometheus_reload_url is legitimately blank (it derives from
+        # prometheus_url); the rest fall back rather than being blanked.
+        new_settings[key] = submitted or ("" if key == "prometheus_reload_url" else fallback)
+
+    # The service URLs are applied and saved first, and never gated behind
+    # Postgres: this page is where a broken deployment gets fixed, so an
+    # unreachable database must not block correcting an unrelated address.
+    _apply_service_settings(new_settings)
+    settings_store.save(new_settings)
+
     try:
         _apply_settings(new_settings)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not connect to Postgres: {e}")
-    settings_store.save(new_settings)
+        log.warning("user=%s saved settings, but Postgres is unreachable: %s", user, e)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Saved, but could not connect to Postgres: {e}",
+        )
     log.info("user=%s updated deployment settings", user)
     return {"ok": True}
 

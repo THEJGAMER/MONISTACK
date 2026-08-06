@@ -1561,6 +1561,55 @@ The gate on anyone other than you using this.
       cleared it. All five stages passed; test alert and silence cleaned
       up afterwards, zero residue.
 
+- [x] **2026-08-06**: Every service the webui talks to is now editable on
+      the Settings page, with a live health panel - previously only the
+      Postgres DSN and Loki URL were, and the Alertmanager/Prometheus/
+      reload/exporter addresses were env-only, invisible in the UI and
+      only changeable by editing a file and restarting.
+
+      `settings.py` grew a `SERVICE_SETTINGS` table so each one seeds from
+      its env var on first boot and is then owned by the saved file, the
+      same contract database_url/loki_url already had. The reload URL
+      derives from the Prometheus URL unless explicitly overridden - one
+      less thing to keep in sync by hand, and getting it wrong silently
+      breaks the Rules tab's live reload rather than erroring visibly.
+      Saving rebuilds the Alertmanager client *and* the PagingController
+      (which holds its own reference to it), so a URL change applies
+      immediately instead of at the next restart - without that second
+      rebuild, paging holds would keep being placed at the old address,
+      which fails silently.
+
+      New `GET /api/settings/health` probes all five and reports each
+      separately. A probe deliberately treats *any* HTTP response as
+      "reachable": a 404 from a wrong path proves something is listening,
+      which is a completely different diagnosis from a refused connection
+      or a DNS failure, and collapsing both into "down" is what makes a
+      typo indistinguishable from a dead host.
+
+      The property held hardest, and tested hardest: **none of this
+      requires a working database.** Health is `require_auth`, not
+      `require_auth_and_db`, and the PUT applies and saves the service
+      URLs *before* touching Postgres, returning a 400 that says "saved,
+      but could not connect" rather than refusing the whole write. This
+      page is where a broken deployment gets repaired, so anything on it
+      gated behind Postgres is unreachable exactly when it's needed - the
+      same mistake already made once here (PUT /api/settings used to 503
+      when the DB was down, the page whose entire job is fixing the DB),
+      and adding four settings plus a panel is a natural place to
+      reintroduce it.
+
+      13 new tests (198 total). Live-verified against the real stack: all
+      five services probed correctly, then deliberately broken to confirm
+      the failure modes are distinguished rather than lumped together - a
+      dead host reads "timed out", a wrong port "Connection refused", an
+      unset URL "not configured", and a wrong path on a live host still
+      reads reachable with "HTTP 404".
+
+      Also confirmed while doing it, since both instances were running
+      against the shared database again: occurrence count held flat over
+      25s, so the evidence-based close fix genuinely holds across two
+      instances rather than only when one is stopped.
+
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added
       a real Juniper EX3300-48P (root SSH, verified live), with its own
