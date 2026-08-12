@@ -91,19 +91,54 @@ build on.
       `frontend-build` (`npm ci && npm run build`).
 
 ### 0.3 Data durability and growth
-- [ ] **Results grow unbounded — still true, and now bigger than when this
-      was written (checked live 2026-08-02).** `results` sits at 150 rows
-      with zero automated retention - the only deletion path is still a
-      manual per-row click. A working prune pattern already exists in the
-      codebase (`trending.py`'s `prune_old_samples`, called daily, keeps
-      90 days of `metric_samples`) - it was just never applied to
-      `results`. Worse, three more unbounded tables were added since this
-      item was written and inherited the same gap: `alert_history` (79
-      rows), `audit_log` (18 rows), and `alert_occurrences`/
-      `alarm_comments` (the per-alarm ticketing added 2026-08-01/02) - none
-      of them have retention either. Needs: age- and/or count-based
-      retention, a prune job (mirroring `trending.py`'s), and a documented
-      policy - now covering all four tables, not just `results`.
+- [x] **Retention for every growing table - done 2026-08-12.** New
+      `webui/retention.py` owns one policy table for all of them, pruning
+      at startup and then daily.
+
+      The starting point turned out to be worse than the item described.
+      `metric_samples` was supposedly covered by `trending.py`'s 90-day
+      prune, but its only caller slept 24 hours *before* its first run and
+      nothing called it at startup - so on a webui redeployed several times
+      a day it had realistically never run. Found at **2.03M rows / 493
+      MB**, roughly 3x its size six days earlier, while its own docstring
+      claimed it was "called once at startup and then daily".
+
+      Fixing that exposed a second, subtler version of the same bug, and
+      only live testing caught it: the corrected loop still didn't prune at
+      boot, because the thread starts at import time ~500 lines before
+      `DB` exists, saw `DB is None`, and slept a full day - the identical
+      "never runs" outcome reached a different way. Confirmed by planting a
+      400-day-old row, restarting, and finding it still there. Now polls
+      briefly until the database is configured, then falls into the daily
+      cadence; re-tested the same way, the row was gone ~65s after boot.
+
+      Age alone turned out not to be the answer either. A dry run against
+      real data showed **zero rows** would be deleted at any sane window,
+      because nothing is old enough yet - while the table grows ~185k
+      rows/day. Measuring where that comes from: the four per-port
+      interface series across ~105 ports were **1.91M of 2.03M rows
+      (93.9%)**, most of them permanently-unused ports - the same
+      observation that made interface *alerting* opt-in per port, except
+      trending records every port regardless. `metric_samples` is
+      therefore split into two policies (interface 30d, everything else
+      180d) so the 94% can age out fast without throwing away optic
+      history, which is cheap to keep and exactly the trend you want
+      months of. The split was verified to partition the table exactly -
+      1,909,809 + 123,246 = 2,033,055, nothing double-counted or missed.
+
+      Two rules shape every policy, both about not destroying what someone
+      deliberately created: explicitly-saved results are **never** pruned
+      (only auto-saved copies age out), and no occurrence carrying an ack,
+      comment or audit entry is ever deleted - `alarm_acks`/
+      `alarm_comments` cascade from `alert_occurrences`, so an age-only
+      delete would silently take incident discussion with it. That guard
+      is mutation-verified: removing it fails exactly the two tests that
+      protect human records. `audit_log` keeps the longest window (365d)
+      and can be set to 0 for "forever", because an audit trail that
+      quietly deletes itself is worth very little.
+
+      12 new tests against a real Postgres (210 total), and the policy is
+      documented in README.md with the reasoning per table.
 - [x] **No DB backup - answered 2026-08-06: covered outside this repo, no
       code needed.** This used to say `switchboard.db` lives on a single
       Docker volume - that's no longer true. The app moved to Postgres on a

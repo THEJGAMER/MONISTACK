@@ -49,6 +49,7 @@ import command_history
 import compliance
 import hardware_alerting
 import interface_alerting
+import retention
 from ssh_client import SwitchSSH, SwitchSSHError
 from status_poller import StatusPoller
 from store import DeviceStore
@@ -469,20 +470,38 @@ STATUS = StatusPoller(
     get_session=_get_session, lock_for=lambda device_id: _session_locks[device_id], get_db=lambda: DB
 )
 
-# Trend samples (see trending.py) accumulate at ~288/day/metric/port on the
-# status poller's slow cadence - pruned once a day so the table doesn't
-# grow forever. A plain daemon thread rather than a scheduler dependency;
-# prune_old_samples() is a no-op until DB is actually configured.
-def _trend_pruner_loop():
+# Retention for every growing table (see retention.py), not just trend
+# samples. A plain daemon thread rather than a scheduler dependency;
+# prune_all() is a no-op until DB is actually configured.
+#
+# Prunes on startup *before* the first sleep, which the previous version of
+# this loop did not: it slept 24h first and had no startup call, so on a
+# process redeployed several times a day the prune realistically never ran
+# at all - `metric_samples` was found at 2.03M rows / 493 MB, roughly 3x
+# its size six days earlier, despite nominally having a 90-day policy since
+# early on. The startup pass is what makes the policy real rather than
+# aspirational, and it's cheap: the DELETEs match nothing once caught up.
+def _retention_loop():
     while True:
-        time.sleep(24 * 3600)
+        if DB is None:
+            # This thread starts at import time, ~500 lines before settings
+            # are applied and DB actually exists. Sleeping a full day here
+            # would mean the startup prune silently never happens on a
+            # fresh boot - the same "never runs" outcome as the loop this
+            # replaced, just reached a different way. Confirmed live: the
+            # first version of this fix planted a 400-day-old row, restarted,
+            # and the row was still there. Poll briefly until configured
+            # instead, then fall into the daily cadence.
+            time.sleep(60)
+            continue
         try:
-            trending.prune_old_samples(DB, keep_days=90)
+            retention.prune_all(DB)
         except Exception:
-            log.exception("trend sample pruning failed")
+            log.exception("retention pruning failed")
+        time.sleep(24 * 3600)
 
 
-threading.Thread(target=_trend_pruner_loop, daemon=True, name="trend-pruner").start()
+threading.Thread(target=_retention_loop, daemon=True, name="retention-pruner").start()
 
 
 # Scheduled/recurring runs (ROADMAP 3.6) - a lightweight poll loop rather

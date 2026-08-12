@@ -112,6 +112,39 @@ label was.
 - `s4048_transceiver_present{device_id,port}`, `_temperature_celsius`, `_voltage_volts`,
   `_tx_bias_ma`, `_tx_power_dbm`, `_rx_power_dbm`, `_alarm{device_id,port,flag}`
 
+## Data retention
+
+Every growing table is pruned by `webui/retention.py`, once at startup and
+then daily. Windows are per-table and env-tunable; **0 disables that
+table's prune** ("keep forever", said honestly rather than by setting an
+absurd number).
+
+| Table | Env var | Default | Why |
+|---|---|---|---|
+| `metric_samples` (iface_*) | `RETAIN_IFACE_SAMPLES_DAYS` | 30 | ~94% of all samples - ~105 ports x 4 series, most ports unused |
+| `metric_samples` (other) | `RETAIN_METRIC_SAMPLES_DAYS` | 180 | optics/PSU: low volume, high value over long periods |
+| `alert_history` | `RETAIN_ALERT_HISTORY_DAYS` | 90 | raw webhook log; `alert_occurrences` is the durable record |
+| `alert_occurrences` | `RETAIN_OCCURRENCES_DAYS` | 180 | resolved only, never one carrying acks/comments/audit entries |
+| `results` (auto-saved) | `RETAIN_AUTOSAVED_RESULTS_DAYS` | 90 | explicitly saved results are **never** pruned |
+| `command_history` | `RETAIN_COMMAND_HISTORY_DAYS` | 90 | per-user working list; `audit_log` keeps the durable record |
+| `audit_log` | `RETAIN_AUDIT_LOG_DAYS` | 365 | longest by design - an audit trail that deletes itself is worth little |
+
+Two rules the policies are built around, both about not destroying things
+a person deliberately created:
+
+1. **Deliberate keeps outlive automatic ones.** A result you clicked Save
+   on is not the same as the auto-saved copy of every command ever run.
+2. **Never cascade over human records.** `alarm_acks`/`alarm_comments`
+   cascade from `alert_occurrences`, so an age-only delete would silently
+   destroy acknowledgements and incident discussion. The occurrence policy
+   excludes any row carrying them.
+
+`metric_samples` is split because one class of series dominates it -
+measured at 1.91M of 2.03M rows on a real 3-device fleet. A single window
+would force a bad trade: short enough to control the interface series
+throws away optic history that costs almost nothing and is exactly the
+trend you want months of.
+
 ## Notes
 
 - The switch's `admin` account lands in unprivileged EXEC (`>`); the

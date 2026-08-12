@@ -52,10 +52,21 @@ def record_samples(db, rows):
 
 
 def prune_old_samples(db, keep_days=90):
-    """Deletes samples older than `keep_days` - called once at startup and
-    then daily (see app.py) so this table doesn't grow forever. 90 days at
-    the ~288/day/metric/port write rate is a few hundred thousand rows for
-    a small fleet, comfortably fine for Postgres without partitioning."""
+    """Deletes samples older than `keep_days`.
+
+    Scheduling now lives in retention.py, which owns this table alongside
+    every other growing one - this function is kept for direct/ad-hoc use
+    and is no longer wired to a loop of its own, so there is exactly one
+    thing deciding when pruning happens.
+
+    The docstring here used to claim it was "called once at startup and
+    then daily". It wasn't: the loop that called it slept 24 hours before
+    its first run and nothing called it at startup, so on a process
+    redeployed several times a day it realistically never ran. The table
+    was found at 2.03M rows / 493 MB as a result. Corrected rather than
+    quietly deleted, because the gap between what a comment claims and
+    what the code does is the thing that hid this for weeks.
+    """
     if db is None:
         return
     try:
