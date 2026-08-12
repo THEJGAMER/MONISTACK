@@ -353,6 +353,44 @@ CREATE INDEX IF NOT EXISTS idx_command_favorites_actor ON command_favorites(acto
 -- "-" for those is honest, backfilling a guess would not be.
 ALTER TABLE results ADD COLUMN IF NOT EXISTS actor TEXT;
 
+-- Full-text search over saved results (ROADMAP 4). A generated column so
+-- it can never drift from the row it describes - there is no application
+-- code that could forget to update it.
+--
+-- 'simple', not 'english', and that is load-bearing rather than a default:
+-- the english config discards stopwords and stems, and it was verified
+-- against real text that `to_tsvector('english', '... is up ... no
+-- shutdown ...')` cannot match a search for "up" or for "no" at all. Those
+-- are among the most meaningful words in switch output ("is up", "no
+-- shutdown"), so english would silently fail the searches people actually
+-- run. 'simple' keeps them, and keeps tokens like `1/37` and `-3.2` intact.
+--
+-- Weighted rather than one flat vector: identifying fields (device,
+-- command, filename, summary) are 'A' and the command's body output is
+-- 'B', so searching a device or command name ranks that device's results
+-- above every unrelated result that merely mentions the word somewhere in
+-- 20k of CLI text. Without weights both are identical to ts_rank and the
+-- order falls back to recency, which looks arbitrary to anyone who just
+-- typed a device name.
+--
+-- `output` is bounded because a tsvector has a hard 1MB ceiling and
+-- exceeding it raises - which would fail the INSERT of the result itself,
+-- turning "this output was unusually large" into "the command appears to
+-- have failed". 100k characters is far more than any observed result
+-- (largest seen: ~20k) while leaving a wide margin.
+ALTER TABLE results ADD COLUMN IF NOT EXISTS search_vector tsvector
+    GENERATED ALWAYS AS (
+        setweight(to_tsvector('simple',
+            coalesce(filename, '') || ' ' ||
+            coalesce(device_id, '') || ' ' ||
+            coalesce(device_name, '') || ' ' ||
+            coalesce(command, '') || ' ' ||
+            coalesce(summary, '')), 'A')
+        ||
+        setweight(to_tsvector('simple', left(coalesce(output, ''), 100000)), 'B')
+    ) STORED;
+CREATE INDEX IF NOT EXISTS idx_results_search ON results USING GIN (search_vector);
+
 -- Last time *any* Switchboard instance observed this occurrence's alarm
 -- actually active (firing in Alertmanager, or pending in Prometheus).
 --

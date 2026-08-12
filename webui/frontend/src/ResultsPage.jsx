@@ -94,7 +94,7 @@ export default function ResultsPage({ pushFlash }) {
             <TextFilter
               filteringText={filterText}
               onChange={({ detail }) => setFilterText(detail.filteringText)}
-              filteringPlaceholder="Search results..."
+              filteringPlaceholder="Search commands and output..."
             />
           }
           pagination={
@@ -105,7 +105,35 @@ export default function ResultsPage({ pushFlash }) {
             />
           }
           columnDefinitions={[
-            { id: "title", header: "Result", cell: (r) => r.title || r.filename },
+            {
+              id: "title",
+              header: "Result",
+              cell: (r) => (
+                <SpaceBetween size="xxs">
+                  <Box>{r.title || r.filename}</Box>
+                  {/* Only present when searching - the matched text from
+                      inside the output, so a hit is explicable without
+                      opening the result. Postgres marks matches with
+                      «guillemets» (chosen over angle brackets, which are
+                      common in CLI output and would be ambiguous), split
+                      here rather than rendered as HTML so nothing from a
+                      device can inject markup. */}
+                  {r.snippet && (
+                    <Box fontSize="body-s" color="text-status-inactive">
+                      {String(r.snippet).split(/(«[^»]*»)/g).map((part, i) =>
+                        part.startsWith("«") && part.endsWith("»") ? (
+                          <Box key={i} variant="strong" display="inline" color="text-status-info">
+                            {part.slice(1, -1)}
+                          </Box>
+                        ) : (
+                          <React.Fragment key={i}>{part}</React.Fragment>
+                        )
+                      )}
+                    </Box>
+                  )}
+                </SpaceBetween>
+              ),
+            },
             { id: "saved_at", header: "Saved at", cell: (r) => r.saved_at },
             {
               id: "kind",
