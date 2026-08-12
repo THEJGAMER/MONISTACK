@@ -81,6 +81,21 @@ def parse_junos_environment(text):
         measurement = line[measurement_col:].strip()
         if not item:
             continue
+        # A component row with no Status is a truncated or garbled read,
+        # not a reading. Dropping it matters because everything downstream
+        # decides "faulted" by comparing against the literal "OK" (see
+        # status_poller's Junos mapping), so an empty status became `down`
+        # - inventing a fan or PSU failure out of a short line, which now
+        # pages within ~10s via hardware_alerting. Column-slicing a line
+        # that ends early also produces junk in `measurement` (a lone "n"
+        # from the middle of a word), which is the tell.
+        #
+        # Skipping is the safe direction: the component simply isn't
+        # reported this cycle and the next good poll restores it, whereas
+        # emitting it fabricates an outage. Sensors are exempt - nothing
+        # alerts on them, and a temperature with no reading is harmless.
+        if not status and current_class in ("Fans", "Power"):
+            continue
         if current_class == "Fans":
             fans.append({"item": item, "status": status, "measurement": measurement})
         elif current_class == "Power":

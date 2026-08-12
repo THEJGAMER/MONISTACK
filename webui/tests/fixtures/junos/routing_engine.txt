@@ -1,0 +1,22 @@
+Routing Engine status:
+  Slot 0:
+    Current state                  Master
+    Temperature                 35 degrees C / 95 degrees F
+    CPU temperature             35 degrees C / 95 degrees F
+    DRAM                      1024 MB
+    Memory utilization          55 percent
+    5 sec CPU utilization:
+      User                      21 percent
+      Background                 0 percent
+      Kernel                    30 percent
+      Interrupt                  0 percent
+      Idle                      49 percent
+    Model                          EX3300 48-Port POE+
+    Serial ID                      GB0216161015
+    Start time                     2026-01-15 23:11:42 EST
+    Uptime                         100 days, 15 hours, 38 minutes, 16 seconds
+    Last reboot reason             0x1:power cycle/failure 
+    Load averages:                 1 minute   5 minute  15 minute
+                                       1.62       1.32       1.30
+
+{master:0}

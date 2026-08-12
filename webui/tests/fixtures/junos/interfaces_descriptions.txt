@@ -1,0 +1,5 @@
+Interface       Admin Link Description
+ge-0/0/7        up    up   LOUNGE-ROOM-AP
+vlan.900        up    down MANAGEMENT
+
+{master:0}

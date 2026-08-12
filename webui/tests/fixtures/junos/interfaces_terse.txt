@@ -1,0 +1,133 @@
+Interface               Admin Link Proto    Local                 Remote
+ge-0/0/0                up    up
+ge-0/0/0.0              up    up   eth-switch
+ge-0/0/1                up    down
+ge-0/0/1.0              up    down eth-switch
+ge-0/0/2                up    up
+ge-0/0/2.0              up    up   eth-switch
+ge-0/0/3                up    down
+ge-0/0/3.0              up    down eth-switch
+ge-0/0/4                up    down
+ge-0/0/4.0              up    down eth-switch
+ge-0/0/5                up    up
+ge-0/0/5.0              up    up   eth-switch
+ge-0/0/6                up    up
+ge-0/0/6.0              up    up   eth-switch
+ge-0/0/7                up    up
+ge-0/0/7.0              up    up   eth-switch
+ge-0/0/8                up    up
+ge-0/0/8.0              up    up   eth-switch
+ge-0/0/9                up    up
+ge-0/0/9.0              up    up   eth-switch
+ge-0/0/10               up    up
+ge-0/0/10.0             up    up   eth-switch
+ge-0/0/11               up    down
+ge-0/0/11.0             up    down eth-switch
+ge-0/0/12               up    down
+ge-0/0/12.0             up    down eth-switch
+ge-0/0/13               up    down
+ge-0/0/13.0             up    down eth-switch
+ge-0/0/14               up    down
+ge-0/0/14.0             up    down eth-switch
+ge-0/0/15               up    down
+ge-0/0/15.0             up    down eth-switch
+ge-0/0/16               up    down
+ge-0/0/16.0             up    down eth-switch
+ge-0/0/17               up    down
+ge-0/0/17.0             up    down eth-switch
+ge-0/0/18               up    down
+ge-0/0/18.0             up    down eth-switch
+ge-0/0/19               up    down
+ge-0/0/19.0             up    down eth-switch
+ge-0/0/20               up    down
+ge-0/0/20.0             up    down eth-switch
+ge-0/0/21               up    down
+ge-0/0/21.0             up    down eth-switch
+ge-0/0/22               up    down
+ge-0/0/22.0             up    down eth-switch
+ge-0/0/23               up    down
+ge-0/0/23.0             up    down eth-switch
+ge-0/0/24               up    down
+ge-0/0/24.0             up    down eth-switch
+ge-0/0/25               up    down
+ge-0/0/25.0             up    down eth-switch
+ge-0/0/26               up    down
+ge-0/0/26.0             up    down eth-switch
+ge-0/0/27               up    down
+ge-0/0/27.0             up    down eth-switch
+ge-0/0/28               up    down
+ge-0/0/28.0             up    down eth-switch
+ge-0/0/29               up    down
+ge-0/0/29.0             up    down eth-switch
+ge-0/0/30               up    down
+ge-0/0/30.0             up    down eth-switch
+ge-0/0/31               up    down
+ge-0/0/31.0             up    down eth-switch
+ge-0/0/32               up    down
+ge-0/0/32.0             up    down eth-switch
+ge-0/0/33               up    down
+ge-0/0/33.0             up    down eth-switch
+ge-0/0/34               up    down
+ge-0/0/34.0             up    down eth-switch
+ge-0/0/35               up    up
+ge-0/0/35.0             up    up   eth-switch
+ge-0/0/36               up    down
+ge-0/0/36.0             up    down eth-switch
+ge-0/0/37               up    down
+ge-0/0/37.0             up    down eth-switch
+ge-0/0/38               up    down
+ge-0/0/38.0             up    down eth-switch
+ge-0/0/39               up    down
+ge-0/0/39.0             up    down eth-switch
+ge-0/0/40               up    down
+ge-0/0/40.0             up    down eth-switch
+ge-0/0/41               up    down
+ge-0/0/41.0             up    down eth-switch
+ge-0/0/42               up    down
+ge-0/0/42.0             up    down eth-switch
+ge-0/0/43               up    down
+ge-0/0/43.0             up    down eth-switch
+ge-0/0/44               up    down
+ge-0/0/44.0             up    down eth-switch
+ge-0/0/45               up    down
+ge-0/0/45.0             up    down eth-switch
+ge-0/0/46               up    up
+ge-0/0/46.0             up    up   eth-switch
+ge-0/0/47               up    up
+ge-0/0/47.0             up    up   eth-switch
+xe-0/1/2                up    up
+xe-0/1/2.0              up    up   aenet    --> ae1.0
+xe-0/1/3                up    up
+xe-0/1/3.0              up    up   aenet    --> ae1.0
+ae1                     up    up
+ae1.0                   up    up   eth-switch
+bme0                    up    up
+bme0.32768              up    up   inet     128.0.0.1/2     
+                                            128.0.0.16/2    
+                                            128.0.0.32/2    
+                                   tnp      0x10            
+dsc                     up    up
+gre                     up    up
+ipip                    up    up
+jsrv                    up    up
+jsrv.1                  up    up   inet     128.0.0.127/2   
+lo0                     up    up
+lo0.0                   up    up  
+lo0.16384               up    up   inet     127.0.0.1           --> 0/0
+lsi                     up    up
+me0                     up    up
+me0.0                   up    up   inet     192.168.5.10/24 
+mtun                    up    up
+pimd                    up    up
+pime                    up    up
+tap                     up    up
+vlan                    up    up
+vlan.20                 up    up   inet     192.168.0.4/24  
+vlan.50                 up    up   inet     192.168.1.1/24  
+vlan.100                up    up   inet     192.168.2.1/24  
+vlan.150                up    up   inet     192.168.3.1/24  
+vlan.200                up    up   inet     192.168.4.1/24  
+vlan.900                up    down inet    
+vme                     up    down
+
+{master:0}

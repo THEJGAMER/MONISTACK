@@ -1645,6 +1645,50 @@ The gate on anyone other than you using this.
       25s, so the evidence-based close fix genuinely holds across two
       instances rather than only when one is stopped.
 
+- [x] **2026-08-12**: `common/junos_parsers.py` had zero tests despite
+      being shared by *both* the webui and the exporter and running against
+      a real EX3300 in production - a silent regression there corrupts
+      CPU/memory/fan/PSU/interface data in two services at once, with
+      nothing to catch it. 28 tests added, and a real bug found.
+
+      Fixtures are **real output captured from the live EX3300**
+      (`webui/tests/fixtures/junos/`), not hand-written, because the
+      details that break screen-scrapers are exactly the ones nobody
+      invents: the trailing `{master:0}` prompt on every response, an
+      empty System Name column, an LLDP "port info" that is just a MAC,
+      the same local port appearing twice with two different neighbours,
+      and fan health being the words "Spinning at normal speed" with no
+      RPM anywhere. Cases that can't be captured on healthy hardware (a
+      failed PSU, an active alarm) are constructed and labelled as such
+      rather than presented as real.
+
+      **The bug:** `parse_junos_environment` slices fixed column ranges,
+      so a line that ends early - a truncated or garbled read - produced a
+      component with an empty Status (and junk in `measurement`, a stray
+      "n" sliced from mid-word). Everything downstream decides "faulted"
+      by comparing against the literal string "OK", so an empty status
+      became `fan1_status="down"`: a fabricated fan or PSU failure, which
+      since the hardware-alerting rework pages within ~10s. Fixed by
+      dropping status-less Fans/Power rows entirely - the component simply
+      isn't reported that cycle and the next good poll restores it,
+      whereas emitting it invents an outage. Sensors are exempt: nothing
+      alerts on them and a temperature with no reading is harmless.
+      Mutation-verified - removing the guard fails exactly the two tests
+      that cover it. Live-checked afterwards against the real device: 2
+      fans up, 1 PSU up, zero false alarms.
+
+      Known gap deliberately **not** closed while here:
+      `hardware_alerting.py`'s Loki filter is Dell-only
+      (`CHMGR|ENVMON|RPM|OSTATE`), so Junos hardware faults reach only the
+      ~10s SSH-poll path, not the ~3s syslog one. Adding `CHASSISD|ALARMD`
+      is one line, but the syslog component wording has never been
+      captured from a real Junos fault, and the poll path keys PSUs as
+      `unit=0, bay=<0-based enumerate index>` while Junos syslog numbers
+      them from 1 - so a speculative parser would likely fire a key the
+      poll path can never resolve, leaving a stuck alert. Trading ~7
+      seconds of detection latency for that risk isn't worth it until a
+      real fault message exists to build against.
+
 ### 3.3 Multi-vendor
 - [x] **Per-platform command trees — done 2026-07-30, for Junos.** Added
       a real Juniper EX3300-48P (root SSH, verified live), with its own

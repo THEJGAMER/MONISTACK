@@ -1,0 +1,13 @@
+Class Item                           Status     Measurement
+Power FPC 0 Power Supply 0           OK        
+Temp  FPC 0 CPU                      OK         35 degrees C / 95 degrees F
+      FPC 0 EX-PFE1                  OK         48 degrees C / 118 degrees F
+      FPC 0 EX-PFE2                  OK         42 degrees C / 107 degrees F
+      FPC 0 GEPHY1                   OK         29 degrees C / 84 degrees F
+      FPC 0 Fan Exhaust              OK         36 degrees C / 96 degrees F
+      FPC 0 SFP+ PHY                 OK         26 degrees C / 78 degrees F
+      FPC 0 Local Sensor             OK         33 degrees C / 91 degrees F
+Fans  FPC 0 Fan 1                    OK         Spinning at normal speed
+      FPC 0 Fan 2                    OK         Spinning at normal speed
+
+{master:0}

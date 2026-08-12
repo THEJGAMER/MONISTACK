@@ -1,0 +1,6 @@
+2 alarms currently active
+Alarm time               Class  Description
+2026-08-13 02:55:22 EST  Minor  OSPFv2 Routing Protocol usage requires a license
+2026-01-15 23:17:13 EST  Minor  Rescue configuration is not set
+
+{master:0}
