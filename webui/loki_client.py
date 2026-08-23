@@ -25,6 +25,36 @@ class LokiClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
+    def newest_entry_age_seconds(self, lookback_seconds=86400):
+        """Seconds since the most recent syslog line Loki holds, or None if
+        it has nothing at all in `lookback_seconds`.
+
+        Exists because "Loki answers /ready" and "syslog is still arriving"
+        are completely different questions, and only the first was ever
+        checked. Confirmed the hard way: the Vector host went down and the
+        pipeline was dead for seven days while the health panel showed Loki
+        reachable the entire time - the Syslog tab and Alarm History simply
+        returned empty, with nothing anywhere saying why.
+        """
+        end = int(time.time() * 1e9)
+        start = end - int(lookback_seconds * 1e9)
+        params = urllib.parse.urlencode({
+            "query": '{job="syslog"}', "limit": 1,
+            "start": start, "end": end, "direction": "backward",
+        })
+        url = f"{self.base_url}/loki/api/v1/query_range?{params}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            data = json.loads(resp.read())
+        streams = (data.get("data") or {}).get("result") or []
+        newest_ns = 0
+        for stream in streams:
+            for ts, _line in stream.get("values", []):
+                newest_ns = max(newest_ns, int(ts))
+        if not newest_ns:
+            return None
+        return max(0.0, time.time() - newest_ns / 1e9)
+
     def query_range(self, filters=None, limit=200, since_seconds=3600):
         """`filters` is a list of already-trusted LogQL field-filter
         fragments (e.g. `event_category="auth"`, `alarm_component != ""`) -

@@ -86,6 +86,11 @@ PAGE_DELAY_SECONDS = int(os.environ.get("PAGE_DELAY_SECONDS", "120"))
 # 90s costs at most that much delay on a resolve, against the alternative
 # of spuriously closing and reopening real alarms every few seconds.
 OCCURRENCE_CLOSE_GRACE_SECONDS = int(os.environ.get("OCCURRENCE_CLOSE_GRACE_SECONDS", "90"))
+# How quiet the syslog pipeline may go before the Settings health panel
+# calls it stale. Generous by default: a small fleet can genuinely be
+# silent for a while, and this should flag "the pipeline is dead", not
+# "the switches had nothing to say for ten minutes".
+SYSLOG_STALE_AFTER_SECONDS = int(os.environ.get("SYSLOG_STALE_AFTER_SECONDS", "1800"))
 PAGER = paging.PagingController(ALERTMANAGER, PAGE_DELAY_SECONDS)
 # Holds placed before an alarm exists as an occurrence, keyed by signature.
 # A hold has to be in place *before* Alertmanager dispatches (group_wait is
@@ -1267,6 +1272,37 @@ def api_settings_health(user: str = Depends(require_auth)):
     else:
         checks.append({"name": "Postgres", "target": settings_store.redact_dsn(DATABASE_URL or ""),
                        "ok": False, "detail": DB_ERROR or "not configured"})
+
+    # Loki gets a second, separate check: whether anything is still
+    # *arriving*. "/ready answers" and "syslog is flowing" are different
+    # questions and only the first was ever asked - confirmed the hard
+    # way when the Vector host stayed down for seven days while this panel
+    # showed Loki reachable throughout, and the Syslog tab simply went
+    # quiet with nothing anywhere saying why.
+    # Always emitted, even unconfigured. A check that silently disappears
+    # when something is wrong is the same class of failure this row exists
+    # to catch - the panel must never look complete while quietly omitting
+    # the one thing that was broken.
+    if LOKI is None or not LOKI_URL:
+        checks.append({"name": "Syslog flow", "target": LOKI_URL or None, "ok": False,
+                       "detail": "not configured"})
+    else:
+        try:
+            age = LOKI.newest_entry_age_seconds()
+            if age is None:
+                checks.append({"name": "Syslog flow", "target": LOKI_URL, "ok": False,
+                               "detail": "no syslog received in the last 24h"})
+            else:
+                stale_after = SYSLOG_STALE_AFTER_SECONDS
+                mins = age / 60
+                checks.append({
+                    "name": "Syslog flow", "target": LOKI_URL, "ok": age <= stale_after,
+                    "detail": (f"last event {mins:.0f} min ago" if age > 90
+                               else f"last event {age:.0f}s ago"),
+                })
+        except Exception as e:
+            checks.append({"name": "Syslog flow", "target": LOKI_URL, "ok": False,
+                           "detail": f"could not query Loki: {e}"})
 
     for name, url, path in (
         ("Loki", LOKI_URL, "/ready"),

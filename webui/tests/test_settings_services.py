@@ -180,3 +180,80 @@ def test_omitted_fields_keep_their_stored_value(monkeypatch):
     assert resp.status_code == 200, resp.text
     assert saved["alertmanager_url"] == "http://kept:9093"
     assert saved["prometheus_url"] == "http://new-prom:9090"
+
+
+# --- syslog freshness ------------------------------------------------
+# Added after a real seven-day outage: the Vector host went down, and this
+# panel reported Loki "reachable" the entire time because /ready only
+# proves the Loki process is alive. The Syslog tab and Alarm History went
+# silently empty with nothing anywhere explaining why.
+
+class _FakeLoki:
+    def __init__(self, age=None, raises=False):
+        self.age, self.raises = age, raises
+
+    def newest_entry_age_seconds(self, lookback_seconds=86400):
+        if self.raises:
+            raise RuntimeError("loki unreachable")
+        return self.age
+
+
+def _configure_loki(monkeypatch, loki):
+    """A configured deployment has both the client and the URL - setting
+    only one leaves the "not configured" branch firing, which is correct
+    behaviour but not the case under test."""
+    monkeypatch.setattr(app_module, "LOKI", loki)
+    monkeypatch.setattr(app_module, "LOKI_URL", "http://loki-host:3100")
+
+
+def _health_checks(client):
+    client.cookies.set("switchboard_session", _session_cookie(app_module, "viewer"))
+    resp = client.get("/api/settings/health")
+    assert resp.status_code == 200, resp.text
+    return {c["name"]: c for c in resp.json()["checks"]}
+
+
+def test_recent_syslog_reports_healthy(broken_db_client, monkeypatch):
+    monkeypatch.setattr(app_module, "_probe", lambda url, timeout=3: (True, "HTTP 200"))
+    _configure_loki(monkeypatch, _FakeLoki(age=12))
+
+    flow = _health_checks(broken_db_client)["Syslog flow"]
+
+    assert flow["ok"] is True
+    assert "12s ago" in flow["detail"]
+
+
+def test_a_long_silence_is_reported_as_a_failure(broken_db_client, monkeypatch):
+    """The actual outage: seven days with nothing arriving must not read
+    as healthy just because Loki itself answers."""
+    monkeypatch.setattr(app_module, "_probe", lambda url, timeout=3: (True, "HTTP 200"))
+    _configure_loki(monkeypatch, _FakeLoki(age=7 * 24 * 3600))
+
+    checks = _health_checks(broken_db_client)
+
+    assert checks["Syslog flow"]["ok"] is False
+    # ...while Loki's own reachability is still reported honestly and
+    # separately, because those really are two different facts.
+    assert checks["Loki"]["ok"] is True
+
+
+def test_no_syslog_at_all_is_distinguished_from_stale(broken_db_client, monkeypatch):
+    monkeypatch.setattr(app_module, "_probe", lambda url, timeout=3: (True, "HTTP 200"))
+    _configure_loki(monkeypatch, _FakeLoki(age=None))
+
+    flow = _health_checks(broken_db_client)["Syslog flow"]
+
+    assert flow["ok"] is False
+    assert "no syslog" in flow["detail"].lower()
+
+
+def test_a_failing_freshness_query_does_not_break_the_panel(broken_db_client, monkeypatch):
+    """A diagnostic panel that vanishes when something is wrong is worse
+    than none - every other check must still render."""
+    monkeypatch.setattr(app_module, "_probe", lambda url, timeout=3: (True, "HTTP 200"))
+    _configure_loki(monkeypatch, _FakeLoki(raises=True))
+
+    checks = _health_checks(broken_db_client)
+
+    assert checks["Syslog flow"]["ok"] is False
+    assert "Alertmanager" in checks and checks["Alertmanager"]["ok"] is True
