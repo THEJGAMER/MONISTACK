@@ -23,15 +23,20 @@ Ordering below reflects that: foundations → identity → scale → features.
 Nothing here is user-visible. All of it is what makes the rest safe to
 build on.
 
-### 0.1 Version control — **do this first**
-- [ ] The repo has **zero commits**. Everything so far exists only as
-      working-tree files. One `rm -rf` from oblivion.
-- [ ] Initial commit + sensible history going forward.
-- [ ] `.gitignore` is already correct (`.env`, `webui/data/`,
-      `node_modules/`, `dist/` excluded) — verify nothing secret is staged
-      before the first push.
-- [ ] Decide on a remote (or deliberately keep it local-only and back up
-      the bare repo).
+### 0.1 Version control — **done**
+- [x] **Repo under version control** (closed 2026-08-23). This section
+      described a working tree with zero commits, "one `rm -rf` from
+      oblivion". Long since false and left stale, which is its own small
+      hazard - a roadmap that states things that aren't true stops being
+      read. At close: **52 commits** on `main`.
+- [x] Initial commit + sensible history going forward.
+- [x] `.gitignore` verified - `.env`, `webui/data/`, `node_modules/`,
+      `dist/` excluded, and no secret has been staged (checked again
+      before the Junos fixtures were committed: real device output, but
+      no credentials).
+- [x] **Remote decided**: `github.com/THEJGAMER/MONISTACK`. Deployment
+      pulls from it (see docs/deploy-lxc-4lxcs-native.md), so the remote
+      is load-bearing rather than just a backup.
 
 ### 0.2 Test suite + CI
 - [x] **There are no tests** (2026-08-01: now 28 of them). The
@@ -446,14 +451,29 @@ The gate on anyone other than you using this.
       the primary mechanism for a fleet.
 - [ ] **Device grouping** — sites, racks, roles, tags — plus filtering and
       per-group views throughout the UI.
-- [ ] Loki/Prometheus retention and cardinality review before fleet-scale
-      ingest.
+- [x] **Loki/Prometheus retention and cardinality reviewed - 2026-08-23.**
+      Measured on the real deployment rather than estimated.
 
----
+      **Prometheus is bounded and healthy**: 15d retention (the default,
+      confirmed via `/api/v1/status/runtimeinfo` rather than assumed),
+      **501 active series**, 12 MB on disk. Cardinality is low because
+      every metric is per-device/per-port on a 3-device fleet - nothing
+      here is close to a cardinality problem.
 
-## Phase 3 — Network-ops features that earn daily use
+      **Loki has no retention at all** - no compactor, no
+      `retention_period`, no table_manager. Deliberately left that way:
+      the operator wants everything kept. That is a supportable decision
+      here, not a deferral, and the numbers are why: **~2 MB/day**
+      (37 MB accumulated over 17 days of real ingest at 2,769 lines/hour)
+      against **6.8 GB free on an 8 GB disk** - roughly **9 years** of
+      headroom. Retention would be solving a problem that doesn't exist.
 
-### 3.1 Config backup, versioning, drift detection — *highest value*
+      Worth revisiting only if the shape changes rather than on a
+      schedule: adding the APs (which were configured to ship syslog but
+      have never appeared in Loki), a chatty new device class, or a
+      flapping link producing a sustained log storm. The Syslog flow
+      health check added the same day makes a change in volume visible,
+      and `df` on `.145` is the check that actually matters.
 - [ ] Scheduled config pulls into a git-backed store, with per-device
       history and diffs.
 - [ ] Drift detection and alerting against last-known-good.

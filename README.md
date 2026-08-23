@@ -19,6 +19,11 @@ running a pre-approved, read-only command from a menu (no free-text CLI
 ever reaches the switch), plus a Devices page for registering new switches
 by IP, make/model/OS, and a password or SSH key.
 
+[loki/](loki/README.md) holds the deployed Loki config (the LXC at
+`192.168.0.145`) - it wasn't version-controlled at all until 2026-08-23,
+which meant the store keeping every log forever had its config on exactly
+one machine and nowhere else.
+
 `common/` holds the device registry and SSH-client code shared between
 `webui/` and `exporter/` (device-adding UI and metrics polling both need
 to agree on the same device list and know how to talk to the same
