@@ -201,12 +201,53 @@ def test_per_port_separates_in_from_out(store):
     directions would hide it."""
     _flow(store, "10.0.0.1", "10.0.0.2", 700, i_in=2101764, i_out=2101892)
 
-    rows = {r["iface"]: r for r in store.per_port(since_minutes=60)}
+    rows = {r["iface"]: r for r in store.per_port(since_minutes=60, platform_for=lambda a: "os9")}
 
     assert int(rows[2101764]["in_bytes"]) == 700
     assert int(rows[2101764]["out_bytes"]) == 0
     assert int(rows[2101892]["out_bytes"]) == 700
     assert rows[2101764]["port"] == "Te 1/37"
+
+
+def test_per_port_does_not_merge_the_same_ifindex_across_switches(store):
+    """An ifIndex is only meaningful relative to the switch that issued
+    it. With two switches sending, ifIndex 1 on each is a different port -
+    grouping on the index alone silently summed them into one row. Found
+    once both a Dell and a Juniper were really exporting."""
+    _flow(store, "10.0.0.1", "10.0.0.2", 100, i_in=1, i_out=2, agent="192.168.4.106")
+    _flow(store, "10.0.0.3", "10.0.0.4", 900, i_in=1, i_out=2, agent="192.168.5.10")
+
+    rows = store.per_port(since_minutes=60)
+    ifindex_1 = [r for r in rows if r["iface"] == 1]
+
+    assert len(ifindex_1) == 2, "one row per (switch, ifIndex), not one per ifIndex"
+    assert {int(r["in_bytes"]) for r in ifindex_1} == {100, 900}
+
+
+def test_each_row_is_decoded_with_its_own_switch_platform(store):
+    """A Juniper ifIndex must never be run through Dell's arithmetic. The
+    per-row platform lookup is what prevents one vendor's encoding being
+    applied to another's flows."""
+    _flow(store, "10.0.0.1", "10.0.0.2", 100, i_in=2101764, i_out=2101892, agent="192.168.4.106")
+    _flow(store, "10.0.0.3", "10.0.0.4", 100, i_in=503, i_out=504, agent="192.168.5.10")
+
+    platform_for = {"192.168.4.106": "os9", "192.168.5.10": "junos"}.get
+    rows = {(r["peer_ip_src"], r["iface"]): r for r in
+            store.per_port(since_minutes=60, platform_for=platform_for)}
+
+    assert rows[("192.168.4.106", 2101764)]["port"] == "Te 1/37"
+    assert rows[("192.168.5.10", 503)]["port"] is None, "no Dell decode on a Junos ifIndex"
+
+
+def test_an_unknown_agent_gets_no_vendor_decode(store):
+    """The default must be "no opinion", not "assume Dell" - applying one
+    vendor's arithmetic to an unidentified agent is how a real-looking but
+    wrong port name gets shown."""
+    _flow(store, "10.0.0.1", "10.0.0.2", 100, i_in=2101764, agent="10.9.9.9")
+
+    rows = store.per_port(since_minutes=60, platform_for=lambda a: None)
+
+    assert all(r["port"] is None for r in rows)
 
 
 def test_port_detail_matches_traffic_in_either_direction(store):

@@ -75,6 +75,25 @@ Point both at **6343** (the sFlow default and what sfacctd binds). Junos
 defaults elsewhere if `udp-port` is set to something else, and a collector
 listening on the wrong port looks identical to a switch not sending.
 
+## Agent identity
+
+sFlow identifies a switch by its **agent-id**, which is not necessarily its
+management address — it is often a loopback or router-id. The EX3300 here
+initially reported `192.168.5.10` while being registered at `192.168.4.1`,
+which made it unselectable in the UI's filter and left its flows
+unattributed.
+
+Two consequences, both handled:
+
+- The UI's agent filter is built from the flows themselves, not the device
+  registry, so an agent always appears even when it can't be matched to a
+  device (shown as `unrecognised agent`).
+- An unidentified agent gets **no vendor ifIndex decode at all**. Defaulting
+  to one vendor's arithmetic would risk a real-looking but wrong port name.
+
+Setting `set protocols sflow agent-id <management-ip>` keeps the two
+aligned and is worth doing, but nothing breaks if they differ.
+
 ## Reading the numbers honestly
 
 sFlow *samples* — one packet in N (32768 by default on this S4048). Byte

@@ -3195,13 +3195,43 @@ def api_delete_favorite(favorite_id: int, user: str = Depends(require_auth_and_d
 
 def _sflow_platform_for(agent_ip):
     """ifIndex encoding is vendor-specific, so the decode needs to know
-    which platform sent the flow. Matched by agent IP against the device
-    registry; unknown agents fall back to os9 and simply won't resolve,
-    which surfaces as a raw ifIndex rather than a wrong port name."""
+    which platform sent the flow.
+
+    Returns None for an agent we can't identify, and that default matters:
+    it used to fall back to "os9", which meant applying Dell's ifIndex
+    arithmetic to flows from an unknown vendor and risking a real-looking
+    but wrong port name - the exact failure the decode is careful to avoid
+    elsewhere. An unidentified agent gets no vendor decode at all.
+
+    Matching is deliberately not just `host`: an sFlow agent-id is often a
+    loopback or router-id rather than the management address. The real
+    EX3300 here reports agent 192.168.5.10 while being registered at
+    192.168.4.1, so a host-only match silently found nothing."""
+    if not agent_ip:
+        return None
     for d in DEVICES_BY_ID.values():
-        if d.host == agent_ip:
+        if agent_ip in _sflow_addresses_for(d):
             return d.platform
-    return "os9"
+    return None
+
+
+def _sflow_addresses_for(device):
+    """Every address a device might legitimately use as its sFlow agent-id.
+    Currently its management host plus any explicitly recorded agent IPs;
+    kept as one place so adding more sources later doesn't scatter."""
+    addrs = {device.host}
+    extra = getattr(device, "sflow_agent_ip", None)
+    if extra:
+        addrs.add(extra)
+    return addrs
+
+
+def _sflow_agent_label(agent_ip):
+    """Device name for an agent IP, or None if it isn't one we know."""
+    for d in DEVICES_BY_ID.values():
+        if agent_ip in _sflow_addresses_for(d):
+            return d.name
+    return None
 
 
 @app.get("/api/sflow/overview")
@@ -3216,15 +3246,24 @@ def api_sflow_overview(
     requests that could each land in a different window."""
     minutes = max(1, min(int(minutes), 10080))  # 1 min .. 7 days
     limit = max(1, min(int(limit), 200))
-    platform = _sflow_platform_for(agent) if agent else "os9"
     return {
         "available": SFLOW.available(),
         "minutes": minutes,
-        "agents": SFLOW.agents(since_minutes=minutes),
+        # Built from the data, not the device registry: an agent whose
+        # agent-id differs from its management IP would otherwise be
+        # unselectable in the UI - which is exactly what happened with the
+        # EX3300 reporting 192.168.5.10.
+        "agents": [
+            {**a,
+             "device_name": _sflow_agent_label(a["peer_ip_src"]),
+             "platform": _sflow_platform_for(a["peer_ip_src"])}
+            for a in SFLOW.agents(since_minutes=minutes)
+        ],
         "top_talkers": SFLOW.top_talkers(since_minutes=minutes, agent_ip=agent, limit=limit),
         "top_hosts": SFLOW.top_hosts(since_minutes=minutes, agent_ip=agent, limit=limit),
         "protocol_mix": SFLOW.protocol_mix(since_minutes=minutes, agent_ip=agent, limit=limit),
-        "per_port": SFLOW.per_port(since_minutes=minutes, agent_ip=agent, platform=platform, limit=limit),
+        "per_port": SFLOW.per_port(since_minutes=minutes, agent_ip=agent,
+                                   platform_for=_sflow_platform_for, limit=limit),
     }
 
 
@@ -3240,7 +3279,7 @@ def api_sflow_port(
     minutes = max(1, min(int(minutes), 10080))
     return {
         "iface": iface,
-        "port": sflow_store.ifindex_to_port(iface, _sflow_platform_for(agent) if agent else "os9"),
+        "port": sflow_store.ifindex_to_port(iface, _sflow_platform_for(agent)),
         "flows": SFLOW.port_detail(iface, since_minutes=minutes, agent_ip=agent,
                                    limit=max(1, min(int(limit), 200))),
     }

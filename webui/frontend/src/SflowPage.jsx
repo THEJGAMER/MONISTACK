@@ -37,12 +37,18 @@ export default function SflowPage({ devices, pushFlash }) {
   const [loading, setLoading] = useState(true);
   const [drill, setDrill] = useState(null);
 
-  // Agent options come from the device registry so a switch is named
-  // rather than shown as a bare IP - sFlow itself only ever reports the
-  // agent's address.
+  // Options come from the *data* (which agents have actually sent flows),
+  // annotated with a device name where the server could match one. Built
+  // from the device registry instead, an agent whose sFlow agent-id
+  // differs from its management IP is unselectable - which is exactly
+  // what happened with the EX3300 reporting 192.168.5.10 while registered
+  // at 192.168.4.1.
   const agentOptions = [
     { label: "All switches", value: "" },
-    ...(devices || []).map((d) => ({ label: `${d.name} (${d.host})`, value: d.host })),
+    ...(data?.agents || []).map((a) => ({
+      label: a.device_name ? `${a.device_name} (${a.peer_ip_src})` : a.peer_ip_src,
+      value: a.peer_ip_src,
+    })),
   ];
 
   const load = useCallback(async () => {
@@ -61,9 +67,12 @@ export default function SflowPage({ devices, pushFlash }) {
     load();
   }, [load]);
 
-  async function openPort(iface) {
+  async function openPort(iface, agentIp) {
     try {
-      setDrill(await getSflowPort(iface, { minutes: Number(minutes.value), agent: agent.value || undefined }));
+      // Scoped to the switch that owns this ifIndex, not the page filter -
+      // otherwise the drill-down mixes two switches' identically-numbered
+      // interfaces together.
+      setDrill(await getSflowPort(iface, { minutes: Number(minutes.value), agent: agentIp }));
     } catch (e) {
       pushFlash("error", `Could not load port detail: ${e.message}`);
     }
@@ -119,9 +128,12 @@ export default function SflowPage({ devices, pushFlash }) {
           <ColumnLayout columns={Math.min(data.agents.length, 3)} variant="text-grid">
             {data.agents.map((a) => (
               <div key={a.peer_ip_src}>
-                <Box variant="awsui-key-label">{a.peer_ip_src}</Box>
+                <Box variant="awsui-key-label">{a.device_name || a.peer_ip_src}</Box>
                 <Box fontSize="display-l" fontWeight="bold">{bytes(a.bytes)}</Box>
-                <Box color="text-status-inactive">{a.flows} flow records</Box>
+                <Box color="text-status-inactive">
+                  {a.flows} flow records · {a.peer_ip_src}
+                  {!a.platform && " · unrecognised agent"}
+                </Box>
               </div>
             ))}
           </ColumnLayout>
@@ -171,18 +183,22 @@ export default function SflowPage({ devices, pushFlash }) {
 
         <Container header={<Header variant="h3" description="Per switch interface - click a row for what's crossing it">Per-port traffic</Header>}>
           <Table
-            variant="embedded" items={data?.per_port || []} empty={empty} trackBy="iface"
+            variant="embedded" items={data?.per_port || []} empty={empty}
+            trackBy={(p) => `${p.peer_ip_src}-${p.iface}`}
             columnDefinitions={[
               {
                 id: "port", header: "Port",
                 // An unmapped ifIndex is shown raw rather than guessed at -
                 // the decode only covers Dell OS9 physical ports.
                 cell: (p) => (
-                  <Button variant="inline-link" onClick={() => openPort(p.iface)}>
+                  <Button variant="inline-link" onClick={() => openPort(p.iface, p.peer_ip_src)}>
                     {p.port || `ifIndex ${p.iface}`}
                   </Button>
                 ),
               },
+              // Shown because an ifIndex only means anything relative to
+              // the switch that issued it.
+              { id: "switch", header: "Switch", cell: (p) => p.peer_ip_src },
               { id: "in", header: "In", cell: (p) => bytes(p.in_bytes) },
               { id: "out", header: "Out", cell: (p) => bytes(p.out_bytes) },
             ]}

@@ -176,28 +176,39 @@ class SFlowStore:
             out.append(d)
         return out
 
-    def per_port(self, since_minutes=60, agent_ip=None, platform="os9", limit=50):
+    def per_port(self, since_minutes=60, agent_ip=None, platform_for=None, limit=50):
         """Traffic per switch interface, in and out kept separate so a
         one-directional problem (a port only ever receiving) is visible
-        rather than averaged away."""
+        rather than averaged away.
+
+        Grouped by (agent, iface), not iface alone: an ifIndex is only
+        meaningful relative to the switch that issued it, so with two
+        switches sending, ifIndex 1 on each is two different ports.
+        Grouping on the index by itself silently summed them into one row.
+
+        `platform_for` is a callable agent_ip -> platform (or None), so
+        each row is decoded with its own switch's encoding rather than one
+        platform applied to every agent."""
         where, params = self._window(since_minutes, agent_ip)
         rows = self.db.query(
-            f"""SELECT iface, SUM(in_bytes) AS in_bytes, SUM(out_bytes) AS out_bytes,
+            f"""SELECT peer_ip_src, iface, SUM(in_bytes) AS in_bytes, SUM(out_bytes) AS out_bytes,
                        SUM(in_pkts) AS in_packets, SUM(out_pkts) AS out_packets FROM (
-                    SELECT iface_in AS iface, bytes AS in_bytes, 0 AS out_bytes,
+                    SELECT peer_ip_src, iface_in AS iface, bytes AS in_bytes, 0 AS out_bytes,
                            packets AS in_pkts, 0 AS out_pkts
                       FROM sflow_flows WHERE {where} AND iface_in IS NOT NULL
                     UNION ALL
-                    SELECT iface_out AS iface, 0, bytes, 0, packets
+                    SELECT peer_ip_src, iface_out AS iface, 0, bytes, 0, packets
                       FROM sflow_flows WHERE {where} AND iface_out IS NOT NULL
-                ) t GROUP BY iface
+                ) t GROUP BY peer_ip_src, iface
                 ORDER BY (SUM(in_bytes) + SUM(out_bytes)) DESC NULLS LAST LIMIT %s""",
             tuple(params) + tuple(params) + (int(limit),),
         )
         out = []
         for r in rows:
             d = dict(r)
-            d["port"] = ifindex_to_port(d.get("iface"), platform)
+            plat = platform_for(d["peer_ip_src"]) if platform_for else None
+            d["platform"] = plat
+            d["port"] = ifindex_to_port(d.get("iface"), plat)
             out.append(d)
         return out
 
