@@ -279,3 +279,43 @@ def test_a_sensor_without_a_reading_is_still_kept():
     text = "Class Item                Status     Measurement\nTemp  FPC 0 CPU\n"
 
     assert "FPC 0 CPU" in jp.parse_junos_environment(text)["sensors"]
+
+
+# --- SNMP ifIndex map (for sFlow port naming) ------------------------
+
+def test_snmp_ifindex_maps_physical_and_logical():
+    """Real captured shape. sFlow identifies interfaces by SNMP ifIndex,
+    which is a *different* number from the "Interface index" printed on
+    the same line - reading the wrong one names every port incorrectly."""
+    text = (
+        "Physical interface: ge-0/0/0, Enabled, Physical link is Up\n"
+        "  Interface index: 131, SNMP ifIndex: 501\n"
+        "  Logical interface ge-0/0/0.0 (Index 78) (SNMP ifIndex 502)\n"
+        "Physical interface: ge-0/0/2, Enabled, Physical link is Up\n"
+        "  Interface index: 133, SNMP ifIndex: 525\n"
+        "  Logical interface ge-0/0/2.0 (Index 80) (SNMP ifIndex 526)\n"
+    )
+    m = jp.parse_junos_snmp_ifindex(text)
+
+    assert m[501] == "ge-0/0/0"
+    assert m[525] == "ge-0/0/2"
+    assert m[526] == "ge-0/0/2.0", "logical units are mapped too - sFlow may sample either"
+    assert 131 not in m and 133 not in m, "the internal Interface index must never be used"
+
+
+def test_snmp_ifindex_values_are_not_arithmetic():
+    """Documents why this is discovered rather than computed: the real
+    device's values have no usable stride (501, 503, 525, 547, 569)."""
+    text = "".join(
+        f"Physical interface: ge-0/0/{i}, Enabled, Physical link is Up\n"
+        f"  Interface index: {131+i}, SNMP ifIndex: {v}\n"
+        for i, v in enumerate((501, 503, 525, 547, 569))
+    )
+    m = jp.parse_junos_snmp_ifindex(text)
+
+    steps = {b - a for a, b in zip(sorted(m), sorted(m)[1:])}
+    assert len(steps) > 1, "irregular by nature - any single-stride assumption is wrong"
+
+
+def test_snmp_ifindex_survives_empty_input():
+    assert jp.parse_junos_snmp_ifindex("") == {}

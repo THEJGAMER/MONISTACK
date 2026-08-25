@@ -340,6 +340,7 @@ INTERFACE_ALERT_RULES = None
 COMMAND_HISTORY = None
 FAVORITES = None
 SFLOW = None
+SFLOW_IFINDEX = None
 OCCURRENCES = None
 AUDIT = None
 # Not reset on DB reconfigure like the stores above - it's just in-memory
@@ -951,7 +952,7 @@ def _load_database(dsn):
     so callers (setup wizard, Settings save) can report a clear error
     without disturbing whatever was working before the attempt."""
     global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES
-    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW
+    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW, SFLOW_IFINDEX
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
@@ -964,12 +965,14 @@ def _load_database(dsn):
     new_command_history = command_history.CommandHistoryStore(new_db)
     new_favorites = command_history.CommandFavoritesStore(new_db)
     new_sflow = sflow_store.SFlowStore(new_db)
+    new_ifindex = sflow_store.IfIndexMap(new_db)
     DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES = (
         new_db, new_store, new_results, new_topology_store, new_schedules, new_alert_rules, new_interface_alert_rules
     )
     OCCURRENCES, AUDIT = new_occurrences, new_audit
     COMMAND_HISTORY, FAVORITES = new_command_history, new_favorites
     SFLOW = new_sflow
+    SFLOW_IFINDEX = new_ifindex
 
     _migrate_legacy_json_devices()
     _migrate_legacy_sqlite()
@@ -3189,6 +3192,46 @@ def api_delete_favorite(favorite_id: int, user: str = Depends(require_auth_and_d
     return {"ok": True}
 
 
+
+# sFlow reports interfaces as SNMP ifIndex integers. Dell OS9 encodes them
+# arithmetically (verified against the switch), but Junos's are irregular
+# and have to be read off the device, so they're discovered here and
+# cached in Postgres. Refreshed rarely - port-to-ifIndex mappings only
+# change when hardware or config does - and a failure just leaves the
+# previous map in place, or falls back to a raw ifIndex.
+def _refresh_sflow_ifindex():
+    if DB is None or SFLOW_IFINDEX is None:
+        return
+    for device in list(DEVICES_BY_ID.values()):
+        if device.platform != "junos":
+            continue  # OS9 needs no discovery; anything else has no parser yet
+        try:
+            with _session_locks[device.id]:
+                switch = _get_session(device)
+                out = switch.run('show interfaces | match "Physical interface|SNMP ifIndex"')
+            mapping = junos_parsers.parse_junos_snmp_ifindex(out)
+            if mapping:
+                SFLOW_IFINDEX.save(device.id, mapping)
+                log.info("sflow ifindex map refreshed for %s: %d entries", device.id, len(mapping))
+        except Exception:
+            log.warning("could not refresh sflow ifindex map for %s", device.id, exc_info=True)
+
+
+def _sflow_ifindex_loop():
+    while True:
+        if DB is None:
+            time.sleep(60)
+            continue
+        try:
+            _refresh_sflow_ifindex()
+        except Exception:
+            log.exception("sflow ifindex refresh failed")
+        time.sleep(6 * 3600)
+
+
+threading.Thread(target=_sflow_ifindex_loop, daemon=True, name="sflow-ifindex").start()
+
+
 # --- sFlow (ROADMAP: traffic visibility) -----------------------------
 # Read-only: rows are written by sfacctd on the collector LXC, never by
 # this app (see sflow/README.md for the split and why).
@@ -3226,6 +3269,24 @@ def _sflow_addresses_for(device):
     return addrs
 
 
+def _sflow_cached_map_for(agent_ip):
+    """The discovered ifIndex map for whichever device owns this agent IP."""
+    for d in DEVICES_BY_ID.values():
+        if agent_ip in _sflow_addresses_for(d):
+            return _SFLOW_IFINDEX_CACHE.get(d.id)
+    return None
+
+
+_SFLOW_IFINDEX_CACHE = {}
+
+
+def _sflow_device_id_for(agent_ip):
+    for d in DEVICES_BY_ID.values():
+        if agent_ip in _sflow_addresses_for(d):
+            return d.id
+    return None
+
+
 def _sflow_agent_label(agent_ip):
     """Device name for an agent IP, or None if it isn't one we know."""
     for d in DEVICES_BY_ID.values():
@@ -3246,6 +3307,9 @@ def api_sflow_overview(
     requests that could each land in a different window."""
     minutes = max(1, min(int(minutes), 10080))  # 1 min .. 7 days
     limit = max(1, min(int(limit), 200))
+    # One query for every device's map, rather than per row.
+    _SFLOW_IFINDEX_CACHE.clear()
+    _SFLOW_IFINDEX_CACHE.update(SFLOW_IFINDEX.load_all())
     return {
         "available": SFLOW.available(),
         "minutes": minutes,
@@ -3263,7 +3327,8 @@ def api_sflow_overview(
         "top_hosts": SFLOW.top_hosts(since_minutes=minutes, agent_ip=agent, limit=limit),
         "protocol_mix": SFLOW.protocol_mix(since_minutes=minutes, agent_ip=agent, limit=limit),
         "per_port": SFLOW.per_port(since_minutes=minutes, agent_ip=agent,
-                                   platform_for=_sflow_platform_for, limit=limit),
+                                   platform_for=_sflow_platform_for,
+                                   cached_for=_sflow_cached_map_for, limit=limit),
     }
 
 
@@ -3279,7 +3344,9 @@ def api_sflow_port(
     minutes = max(1, min(int(minutes), 10080))
     return {
         "iface": iface,
-        "port": sflow_store.ifindex_to_port(iface, _sflow_platform_for(agent)),
+        "port": sflow_store.ifindex_to_port(
+            iface, _sflow_platform_for(agent),
+            cached=(SFLOW_IFINDEX.load(_sflow_device_id_for(agent)) if _sflow_device_id_for(agent) else None)),
         "flows": SFLOW.port_detail(iface, since_minutes=minutes, agent_ip=agent,
                                    limit=max(1, min(int(limit), 200))),
     }

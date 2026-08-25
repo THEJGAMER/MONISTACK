@@ -330,3 +330,35 @@ def parse_ethernet_switching_table(text):
             continue
         out.append({"mac": m.group("mac").lower(), "interface": _strip_unit(m.group("interface"))})
     return out
+
+
+def parse_junos_snmp_ifindex(text):
+    """{snmp_ifindex: interface_name} from `show interfaces`.
+
+    sFlow identifies interfaces by **SNMP ifIndex**, which on Junos is a
+    different number from the "Interface index" printed beside it - and
+    the values are irregular (501, 503, 525, 547, 569...), so unlike Dell
+    OS9 there is no arithmetic to derive them. They have to be read off
+    the device.
+
+    Both physical and logical units are mapped: a switch may sample either
+    (`ge-0/0/2` at 525, `ge-0/0/2.0` at 526), and showing the wrong one is
+    worse than showing the raw index.
+    """
+    mapping = {}
+    current = None
+    for line in (text or "").splitlines():
+        phys = re.search(r"Physical interface:\s*([A-Za-z0-9./:-]+)", line)
+        if phys:
+            current = phys.group(1).rstrip(",")
+            continue
+        logical = re.search(
+            r"Logical interface\s+([A-Za-z0-9./:-]+).*?SNMP ifIndex\s+(\d+)", line
+        )
+        if logical:
+            mapping[int(logical.group(2))] = logical.group(1)
+            continue
+        snmp = re.search(r"SNMP ifIndex:\s*(\d+)", line)
+        if snmp and current:
+            mapping[int(snmp.group(1))] = current
+    return mapping

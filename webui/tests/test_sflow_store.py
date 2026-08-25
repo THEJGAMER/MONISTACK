@@ -265,3 +265,72 @@ def test_agents_summarises_each_switch(store):
     agents = {a["peer_ip_src"]: int(a["bytes"]) for a in store.agents(since_minutes=60)}
 
     assert agents == {"192.168.4.106": 100, "192.168.4.1": 250}
+
+
+# --- discovered ifIndex maps -----------------------------------------
+# Dell OS9's encoding is arithmetic and verified; Junos's is irregular
+# (501, 503, 525, 547...) and has to be read off the switch, so it is
+# discovered and cached. These pin that the cache always beats inference.
+
+def test_a_cached_mapping_wins_over_the_arithmetic():
+    """The switch's own answer beats our inference about it. If a device
+    reports 2101764 as something other than Te 1/37, the device is right."""
+    assert ifindex_to_port(2101764, "os9") == "Te 1/37"
+    assert ifindex_to_port(2101764, "os9", cached={2101764: "Po 1"}) == "Po 1"
+
+
+def test_a_cached_mapping_names_a_junos_port_the_arithmetic_cannot():
+    """The whole point for Junos - 525 is derivable from nothing."""
+    assert ifindex_to_port(525, "junos") is None
+    assert ifindex_to_port(525, "junos", cached={525: "ge-0/0/2"}) == "ge-0/0/2"
+
+
+def test_a_cache_miss_still_falls_back_rather_than_guessing():
+    assert ifindex_to_port(999, "junos", cached={525: "ge-0/0/2"}) is None
+    assert ifindex_to_port(2101764, "os9", cached={525: "ge-0/0/2"}) == "Te 1/37"
+
+
+def test_ifindex_map_round_trips(store):
+    from sflow_store import IfIndexMap
+
+    m = IfIndexMap(store.db)
+    store.db.execute("""CREATE TABLE sflow_ifindex (
+        device_id TEXT NOT NULL, ifindex BIGINT NOT NULL, port TEXT NOT NULL,
+        updated_at TEXT NOT NULL, PRIMARY KEY (device_id, ifindex))""")
+
+    m.save("ex3300", {501: "ge-0/0/0", 525: "ge-0/0/2"})
+
+    assert m.load("ex3300") == {501: "ge-0/0/0", 525: "ge-0/0/2"}
+    assert m.load_all()["ex3300"][525] == "ge-0/0/2"
+
+
+def test_saving_replaces_rather_than_merges(store):
+    """A port that has genuinely gone away must not linger as a stale name
+    on an ifIndex the switch may since have reused."""
+    from sflow_store import IfIndexMap
+
+    m = IfIndexMap(store.db)
+    store.db.execute("""CREATE TABLE sflow_ifindex (
+        device_id TEXT NOT NULL, ifindex BIGINT NOT NULL, port TEXT NOT NULL,
+        updated_at TEXT NOT NULL, PRIMARY KEY (device_id, ifindex))""")
+
+    m.save("ex3300", {501: "ge-0/0/0", 525: "ge-0/0/2"})
+    m.save("ex3300", {501: "ge-0/0/0"})
+
+    assert m.load("ex3300") == {501: "ge-0/0/0"}
+
+
+def test_an_empty_discovery_does_not_wipe_a_good_map(store):
+    """A failed or truncated read must leave the previous map intact -
+    losing every port name is worse than a slightly stale one."""
+    from sflow_store import IfIndexMap
+
+    m = IfIndexMap(store.db)
+    store.db.execute("""CREATE TABLE sflow_ifindex (
+        device_id TEXT NOT NULL, ifindex BIGINT NOT NULL, port TEXT NOT NULL,
+        updated_at TEXT NOT NULL, PRIMARY KEY (device_id, ifindex))""")
+
+    m.save("ex3300", {501: "ge-0/0/0"})
+    m.save("ex3300", {})
+
+    assert m.load("ex3300") == {501: "ge-0/0/0"}

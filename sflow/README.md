@@ -103,14 +103,29 @@ record, and the UI says so.
 
 ## ifIndex → port names
 
-sFlow reports interfaces as ifIndex integers. Dell OS9 encodes physical
-ports arithmetically, verified against the real switch (`Interface index
-is …` for Te 1/1, 1/37, 1/38, 1/48 — all four matched):
+sFlow reports interfaces as **SNMP ifIndex** integers. The two platforms
+need completely different treatment:
+
+**Dell OS9** encodes physical ports arithmetically, verified against the
+real switch (`Interface index is …` for Te 1/1, 1/37, 1/38, 1/48 — all
+four matched):
 
 ```
 ifIndex = 2097156 + (port - 1) * 128
 ```
 
-Anything off that stride, or from a non-OS9 platform, is shown as a raw
-ifIndex rather than a guessed name — a confidently wrong port label is
-worse than a number.
+**Junos does not.** Its values are irregular — 501, 503, 525, 547, 569 —
+with no usable stride, so they are **discovered** from the device
+(`show interfaces | match "Physical interface|SNMP ifIndex"`) and cached
+in the `sflow_ifindex` table, refreshed every 6h by a background loop.
+Note that Junos prints *two* numbers on that line: the internal
+`Interface index` and the `SNMP ifIndex`. sFlow uses the latter; reading
+the former names every port incorrectly.
+
+A discovered mapping always beats the arithmetic — the switch's own answer
+about itself outranks our inference. On a cache miss the arithmetic is
+tried, and failing that the raw ifIndex is shown: a confidently wrong port
+label is worse than a number.
+
+Worth knowing: this also resolves aggregates. `ae1` shows up as a port in
+its own right rather than as its two member links.

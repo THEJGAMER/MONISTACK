@@ -425,6 +425,24 @@ CREATE INDEX IF NOT EXISTS idx_sflow_stamp ON sflow_flows(stamp_inserted DESC);
 CREATE INDEX IF NOT EXISTS idx_sflow_agent ON sflow_flows(peer_ip_src, stamp_inserted DESC);
 CREATE INDEX IF NOT EXISTS idx_sflow_iface ON sflow_flows(peer_ip_src, iface_in, stamp_inserted DESC);
 
+-- sFlow reports interfaces as SNMP ifIndex integers, which mean nothing to
+-- a human. Dell OS9 encodes them arithmetically (verified against the real
+-- switch), but Junos does not - its values are irregular (501, 503, 525,
+-- 547...) and have to be read off the device. This caches that lookup so
+-- the sFlow page can name ports without an SSH round trip per request.
+--
+-- Cache, not source of truth: it is refreshed from the devices themselves
+-- and a miss simply falls back to showing the raw ifIndex, which is why
+-- there is no foreign key and no cascade - a stale or absent row degrades
+-- the display, it never blocks anything.
+CREATE TABLE IF NOT EXISTS sflow_ifindex (
+    device_id TEXT NOT NULL,
+    ifindex BIGINT NOT NULL,
+    port TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (device_id, ifindex)
+);
+
 -- Last time *any* Switchboard instance observed this occurrence's alarm
 -- actually active (firing in Alertmanager, or pending in Prometheus).
 --

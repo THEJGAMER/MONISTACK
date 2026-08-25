@@ -17,6 +17,7 @@ only meaningful in aggregate and in relative terms. The UI says so rather
 than presenting them as exact.
 """
 import logging
+from datetime import datetime, timezone
 
 log = logging.getLogger("webui.sflow")
 
@@ -50,15 +51,21 @@ _PORT_NAMES = {
 _PROTO_NAMES = {"1": "icmp", "6": "tcp", "17": "udp", "47": "gre", "50": "esp", "58": "icmpv6"}
 
 
-def ifindex_to_port(ifindex, platform="os9"):
+def ifindex_to_port(ifindex, platform="os9", cached=None):
     """Best-effort ifIndex -> human port name. Returns None when unknown,
-    which callers surface as the raw index rather than a fabricated name."""
+    which callers surface as the raw index rather than a fabricated name.
+
+    `cached` is a {ifindex: port} map discovered from the device and always
+    wins: it is what the switch itself reports, where the arithmetic below
+    is inference that only holds for Dell OS9 physical ports."""
     if ifindex is None:
         return None
     try:
         ifindex = int(ifindex)
     except (TypeError, ValueError):
         return None
+    if cached and ifindex in cached:
+        return cached[ifindex]
     if platform == "os9":
         offset = ifindex - _OS9_IFINDEX_BASE
         if offset >= 0 and offset % _OS9_IFINDEX_STEP == 0:
@@ -78,6 +85,53 @@ def service_name(port):
         return _PORT_NAMES.get(int(port))
     except (TypeError, ValueError):
         return None
+
+
+class IfIndexMap:
+    """Cached SNMP ifIndex -> port-name lookup, per device.
+
+    Dell OS9's encoding is arithmetic and verified, so it needs no device
+    round trip. Junos's is irregular and must be read off the switch, so
+    it is discovered and cached here. A miss falls back to the arithmetic,
+    then to None - never to a guess."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def save(self, device_id, mapping):
+        """Replaces one device's map. Deletes first so a port that has
+        genuinely gone away (a removed module) doesn't linger as a stale
+        name attached to an ifIndex the switch has since reused."""
+        if not mapping:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        self.db.execute("DELETE FROM sflow_ifindex WHERE device_id = %s", (device_id,))
+        for ifindex, port in mapping.items():
+            self.db.execute(
+                """INSERT INTO sflow_ifindex (device_id, ifindex, port, updated_at)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (device_id, ifindex) DO UPDATE
+                     SET port = EXCLUDED.port, updated_at = EXCLUDED.updated_at""",
+                (device_id, int(ifindex), str(port), now),
+            )
+        return len(mapping)
+
+    def load(self, device_id):
+        rows = self.db.query(
+            "SELECT ifindex, port FROM sflow_ifindex WHERE device_id = %s", (device_id,)
+        )
+        return {int(r["ifindex"]): r["port"] for r in rows}
+
+    def load_all(self):
+        """{device_id: {ifindex: port}} - one query, since the sFlow page
+        renders every agent at once."""
+        out = {}
+        try:
+            for r in self.db.query("SELECT device_id, ifindex, port FROM sflow_ifindex"):
+                out.setdefault(r["device_id"], {})[int(r["ifindex"])] = r["port"]
+        except Exception:
+            log.warning("could not load sflow ifindex cache", exc_info=True)
+        return out
 
 
 class SFlowStore:
@@ -176,7 +230,8 @@ class SFlowStore:
             out.append(d)
         return out
 
-    def per_port(self, since_minutes=60, agent_ip=None, platform_for=None, limit=50):
+    def per_port(self, since_minutes=60, agent_ip=None, platform_for=None,
+                 cached_for=None, limit=50):
         """Traffic per switch interface, in and out kept separate so a
         one-directional problem (a port only ever receiving) is visible
         rather than averaged away.
@@ -206,9 +261,11 @@ class SFlowStore:
         out = []
         for r in rows:
             d = dict(r)
-            plat = platform_for(d["peer_ip_src"]) if platform_for else None
+            agent = d["peer_ip_src"]
+            plat = platform_for(agent) if platform_for else None
             d["platform"] = plat
-            d["port"] = ifindex_to_port(d.get("iface"), plat)
+            d["port"] = ifindex_to_port(d.get("iface"), plat,
+                                        cached=(cached_for(agent) if cached_for else None))
             out.append(d)
         return out
 
