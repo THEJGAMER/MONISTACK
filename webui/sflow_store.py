@@ -11,10 +11,16 @@ so "top talkers over the last hour" is a sum over ~60 rows per flow rather
 than a scan across raw samples.
 
 A note on what these numbers mean: sFlow *samples* - the switch reports
-one packet in N (32768 by default on this S4048). Byte counts are
-therefore an estimate of real traffic, not a measurement of it, and are
-only meaningful in aggregate and in relative terms. The UI says so rather
-than presenting them as exact.
+one packet in N (1:1024 on both switches here). These counts are the raw
+sampled bytes, deliberately **not** scaled up by the sampling rate.
+
+pmacct can renormalize (multiply by the rate to estimate real traffic),
+and it was tried and measured against ground truth - the SSH-polled
+interface counters this app already collects. It was accurate for the
+Juniper but ~15x too high for the Dell, implying >10 Gbit/s on 10G links.
+So the numbers here are proportional to real traffic and comparable
+between switches, but are not absolute volumes, and the UI says exactly
+that instead of calling them estimates. See sflow/sfacctd.conf.
 """
 import logging
 from datetime import datetime, timezone

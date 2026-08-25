@@ -161,7 +161,7 @@ export default function SflowPage({ devices, pushFlash }) {
         header={
           <Header
             variant="h2"
-            description="Traffic sampled by the switches themselves and collected by sfacctd. Byte counts are estimates scaled from samples, not exact measurements - useful in relative terms."
+            description="Traffic sampled by the switches themselves and collected by sfacctd. Counts are raw sampled bytes (1 packet in 1024), not scaled to real traffic - proportional and comparable between switches, but not absolute volumes."
             actions={
               <SpaceBetween size="xs" direction="horizontal" alignItems="center">
                 <Toggle checked={auto} onChange={({ detail }) => setAuto(detail.checked)}>Auto</Toggle>

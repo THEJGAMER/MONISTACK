@@ -114,10 +114,35 @@ UI rules mandate its tokens.
 
 ## Reading the numbers honestly
 
-sFlow *samples* — one packet in N (32768 by default on this S4048). Byte
-counts are estimates scaled from those samples, not measurements. They are
-meaningful in aggregate and in relative terms; they are not a billing
-record, and the UI says so.
+sFlow *samples* — one packet in N (both switches run 1:1024). The stored
+`bytes` are the **raw sampled bytes**, deliberately not scaled up by the
+sampling rate.
+
+pmacct can renormalize (`sfacctd_renormalize: true`, multiply by the rate
+to estimate real traffic). It was enabled and then **measured against
+ground truth** — the SSH-polled interface counters this app already
+collects for the same ports over the same window:
+
+| | sFlow estimate | polled actual | ratio |
+|---|---|---|---|
+| EX3300 `ge-0/0/2` | 26.9 Mbit/s | 33.8 | 0.8x |
+| EX3300 `ae1` | 12.2 Mbit/s | 7.5 | 1.6x |
+| S4048 `Te 1/40` | **3189.7 Mbit/s** | **224.3** | **14.2x** |
+| S4048 `Te 1/41` | **3323.3 Mbit/s** | **208.5** | **15.9x** |
+
+Accurate for the Juniper (within sFlow's statistical variance), ~15x too
+high for the Dell — several ports implying >10 Gbit/s on 10G links, which
+is physically impossible. Cause not established; the S4048 appears to
+report a sampling rate that doesn't match what it actually samples at.
+
+So renormalization is **off**. The numbers are proportional to real
+traffic and directly comparable between switches (both at 1:1024), but
+are not absolute volumes, and the UI says exactly that. Re-test against
+the polled counters before turning it on.
+
+This was found by looking at the rendered chart: the Dell's series stepped
+up sharply at the exact moment its sampling rate changed, which is a
+traffic event that never happened.
 
 ## ifIndex → port names
 
