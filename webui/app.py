@@ -3202,17 +3202,32 @@ def api_delete_favorite(favorite_id: int, user: str = Depends(require_auth_and_d
 def _refresh_sflow_ifindex():
     if DB is None or SFLOW_IFINDEX is None:
         return
+    # One command per device, parsed per platform. OS9 physical ports are
+    # arithmetic, but its port-channels, management and VLAN interfaces sit
+    # in unrelated ranges (Te 1/1 = 2097156, Po 1 = 1258291712,
+    # Ma 1/1 = 9437185), so it is discovered too rather than half-covered.
+    discovery = {
+        "junos": ('show interfaces | match "Physical interface|SNMP ifIndex"',
+                  junos_parsers.parse_junos_snmp_ifindex),
+        "os9": ("show interfaces", parsers.parse_os9_ifindex),
+    }
     for device in list(DEVICES_BY_ID.values()):
-        if device.platform != "junos":
-            continue  # OS9 needs no discovery; anything else has no parser yet
+        plan = discovery.get(device.platform)
+        if plan is None:
+            continue  # no parser for this platform yet
+        command, parse = plan
         try:
             with _session_locks[device.id]:
                 switch = _get_session(device)
-                out = switch.run('show interfaces | match "Physical interface|SNMP ifIndex"')
-            mapping = junos_parsers.parse_junos_snmp_ifindex(out)
+                out = switch.run(command)
+            mapping = parse(out)
             if mapping:
                 SFLOW_IFINDEX.save(device.id, mapping)
                 log.info("sflow ifindex map refreshed for %s: %d entries", device.id, len(mapping))
+            else:
+                # Deliberately not saved: an empty parse is a failed read,
+                # and wiping a good map loses every port name at once.
+                log.warning("sflow ifindex refresh for %s parsed nothing - keeping previous map", device.id)
         except Exception:
             log.warning("could not refresh sflow ifindex map for %s", device.id, exc_info=True)
 

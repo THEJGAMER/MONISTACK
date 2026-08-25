@@ -106,13 +106,21 @@ record, and the UI says so.
 sFlow reports interfaces as **SNMP ifIndex** integers. The two platforms
 need completely different treatment:
 
-**Dell OS9** encodes physical ports arithmetically, verified against the
-real switch (`Interface index is …` for Te 1/1, 1/37, 1/38, 1/48 — all
-four matched):
+**Dell OS9** is also discovered (`show interfaces`, ~9s for 65
+interfaces), because only its `TenGigabitEthernet` ports are arithmetic:
 
 ```
-ifIndex = 2097156 + (port - 1) * 128
+ifIndex = 2097156 + (port - 1) * 128     # Te only
 ```
+
+Everything else sits in unrelated ranges — `Po 1` is 1258291712,
+`Ma 1/1` is 9437185, `Vlan 20` is 1107296276, and the `Fo 1/49-54` 40GbE
+uplinks are outside the Te stride entirely. The arithmetic is kept as a
+fallback for when discovery hasn't run yet, not as the primary answer.
+
+Discovered names are normalised to the short form the rest of the app uses
+(`Te 1/37`, not `TenGigabitEthernet 1/37`), so a discovered name and a
+computed one are never two labels for the same port.
 
 **Junos does not.** Its values are irregular — 501, 503, 525, 547, 569 —
 with no usable stride, so they are **discovered** from the device

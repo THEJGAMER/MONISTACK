@@ -154,3 +154,66 @@ def test_parse_memory():
         "total": 3203182592, "used": 2687662, "free": 3200494930,
         "lowest": 3200130522, "largest": 3200494930,
     }
+
+
+# --- sFlow ifIndex discovery (Dell OS9) ------------------------------
+# sFlow identifies interfaces by ifIndex. Physical ports on this platform
+# are arithmetic, but port-channels, management and VLAN interfaces are
+# not - measured on the real S4048: Te 1/1 = 2097156, Po 1 = 1258291712,
+# Ma 1/1 = 9437185. Three unrelated ranges, so the map is read off the
+# device instead of derived.
+
+_OS9_IFINDEX_SAMPLE = """TenGigabitEthernet 1/1 is up, line protocol is up
+Hardware is DellEth, address is 14:18:77:8d:04:90
+Interface index is 2097156
+TenGigabitEthernet 1/2 is down, line protocol is down
+Interface index is 2097284
+Port-channel 1 is up, line protocol is up
+Interface index is 1258291712
+ManagementEthernet 1/1 is up, line protocol is up
+Interface index is 9437185
+Vlan 20 is up, line protocol is up
+Interface index is 1107296276
+"""
+
+
+def test_os9_ifindex_covers_every_interface_type():
+    m = parsers.parse_os9_ifindex(_OS9_IFINDEX_SAMPLE)
+
+    assert m[2097156] == "Te 1/1"
+    assert m[2097284] == "Te 1/2"
+    assert m[1258291712] == "Po 1"
+    assert m[9437185] == "Ma 1/1"
+    assert m[1107296276] == "Vlan 20"
+
+
+def test_os9_ifindex_uses_the_short_names_the_rest_of_the_ui_uses():
+    """`show interfaces` spells types out in full, but the front panel,
+    status poller and sFlow's arithmetic fallback all use the short form.
+    Two different labels for one port would be worse than none."""
+    m = parsers.parse_os9_ifindex(_OS9_IFINDEX_SAMPLE)
+
+    assert "TenGigabitEthernet 1/1" not in m.values()
+    assert all(not v.startswith("TenGigabit") for v in m.values())
+
+
+def test_a_block_missing_its_index_does_not_shift_every_later_name():
+    """Pairing by walking, not by zipping two regex results: one absent
+    index line would otherwise offset every subsequent pairing by one and
+    mislabel every port after it - silently, and plausibly."""
+    text = (
+        "TenGigabitEthernet 1/1 is up, line protocol is up\n"
+        "TenGigabitEthernet 1/2 is up, line protocol is up\n"   # no index line
+        "Interface index is 2097284\n"
+        "Port-channel 1 is up, line protocol is up\n"
+        "Interface index is 1258291712\n"
+    )
+    m = parsers.parse_os9_ifindex(text)
+
+    assert m[2097284] == "Te 1/2", "the index must attach to its own block"
+    assert 2097156 not in m, "an interface with no index is absent, not misassigned"
+    assert m[1258291712] == "Po 1"
+
+
+def test_os9_ifindex_survives_empty_output():
+    assert parsers.parse_os9_ifindex("") == {}

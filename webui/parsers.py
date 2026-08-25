@@ -513,3 +513,47 @@ def parse_port_channel_brief(text):
         if current_pc:
             members_by_pc.setdefault(current_pc, []).append(m.group("port"))
     return {port: pc for pc, ports in members_by_pc.items() for port in ports}
+
+
+# Dell OS9 spells interface types out in full in `show interfaces`
+# ("TenGigabitEthernet 1/37") while every other surface in this app - the
+# front panel, status poller, sFlow's arithmetic fallback - uses the short
+# form ("Te 1/37"). Normalised here so a discovered name and a computed
+# one are never two different labels for the same port.
+_OS9_TYPE_ABBREV = {
+    "TenGigabitEthernet": "Te",
+    "fortyGigE": "Fo",
+    "GigabitEthernet": "Gi",
+    "Port-channel": "Po",
+    "ManagementEthernet": "Ma",
+    "Vlan": "Vlan",
+}
+
+
+def parse_os9_ifindex(text):
+    """{ifindex: short_port_name} from `show interfaces`.
+
+    sFlow identifies interfaces by ifIndex. Physical ports on this platform
+    happen to be arithmetic, but port-channels, management and VLAN
+    interfaces are not - measured on a real S4048, Te 1/1 is 2097156,
+    Port-channel 1 is 1258291712 and ManagementEthernet 1/1 is 9437185,
+    three unrelated ranges. So the map is read off the device rather than
+    derived.
+
+    Paired by walking the output rather than zipping two regex results:
+    a block missing its index line would silently shift every subsequent
+    pairing by one, naming every port after it incorrectly.
+    """
+    mapping = {}
+    current = None
+    for line in (text or "").splitlines():
+        header = re.match(r"^(\S+)\s+(\S+)\s+is\s+(?:up|down)", line)
+        if header:
+            kind, ident = header.group(1), header.group(2)
+            current = f"{_OS9_TYPE_ABBREV.get(kind, kind)} {ident}"
+            continue
+        m = re.search(r"Interface index is (\d+)", line)
+        if m and current:
+            mapping[int(m.group(1))] = current
+            current = None  # one index per block; don't reuse a stale name
+    return mapping
