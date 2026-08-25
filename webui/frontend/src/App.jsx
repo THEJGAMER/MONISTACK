@@ -22,6 +22,7 @@ const ResultsPage = lazy(() => import("./ResultsPage.jsx"));
 const SettingsPage = lazy(() => import("./SettingsPage.jsx"));
 const TopologyPage = lazy(() => import("./TopologyPage.jsx"));
 const TrendsPage = lazy(() => import("./TrendsPage.jsx"));
+const SflowPage = lazy(() => import("./SflowPage.jsx"));
 const BulkRunPage = lazy(() => import("./BulkRunPage.jsx"));
 const SchedulesPage = lazy(() => import("./SchedulesPage.jsx"));
 const CompliancePage = lazy(() => import("./CompliancePage.jsx"));
@@ -187,6 +188,7 @@ export default function App() {
     "results",
     "topology",
     "trends",
+    "sflow",
     "bulk-run",
     "schedules",
     "compliance",
@@ -295,6 +297,7 @@ export default function App() {
               { type: "link", text: "Devices", href: "#/devices" },
               { type: "link", text: "Topology", href: "#/topology" },
               { type: "link", text: "Trends", href: "#/trends" },
+              { type: "link", text: "Traffic (sFlow)", href: "#/sflow" },
               { type: "link", text: "Saved Results", href: "#/results" },
               { type: "divider" },
               { type: "link", text: "Bulk Run", href: "#/bulk-run" },
@@ -338,6 +341,8 @@ export default function App() {
                 <TopologyPage pushFlash={pushFlash} onOpenConsole={openConsoleFor} onAddDevice={openAddDevice} />
               ) : page === "trends" ? (
                 <TrendsPage devices={devices} pushFlash={pushFlash} />
+              ) : page === "sflow" ? (
+                <SflowPage devices={devices} pushFlash={pushFlash} />
               ) : page === "bulk-run" ? (
                 <BulkRunPage devices={devices} commandTree={commandTree} pushFlash={pushFlash} />
               ) : page === "schedules" ? (

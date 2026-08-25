@@ -391,6 +391,40 @@ ALTER TABLE results ADD COLUMN IF NOT EXISTS search_vector tsvector
     ) STORED;
 CREATE INDEX IF NOT EXISTS idx_results_search ON results USING GIN (search_vector);
 
+-- sFlow flow records, written by sfacctd (pmacct) on the collector LXC and
+-- read by the webui. Column names are pmacct's, not ours: its postgresql
+-- plugin maps aggregation primitives to fixed column names (peer_src_ip ->
+-- peer_ip_src, src_port -> port_src, and so on) and will refuse
+-- to start against a table whose columns don't match the configured
+-- `aggregate` line, so this schema is dictated by that contract.
+--
+-- Written by a different process than every other table here, which is why
+-- it carries no foreign keys to `devices`: sfacctd knows switches only by
+-- the agent IP in the sFlow datagram, and a flow record arriving from an
+-- IP that isn't a registered device is still a true fact worth keeping
+-- rather than something to reject at write time. The webui joins on
+-- peer_ip_src -> device.host when it can, and shows the raw IP when it can't.
+CREATE TABLE IF NOT EXISTS sflow_flows (
+    id BIGSERIAL PRIMARY KEY,
+    peer_ip_src TEXT NOT NULL,
+    iface_in BIGINT,
+    iface_out BIGINT,
+    ip_src TEXT,
+    ip_dst TEXT,
+    port_src INTEGER,
+    port_dst INTEGER,
+    ip_proto TEXT,
+    packets BIGINT NOT NULL DEFAULT 0,
+    bytes BIGINT NOT NULL DEFAULT 0,
+    stamp_inserted TIMESTAMPTZ NOT NULL DEFAULT now(),
+    stamp_updated TIMESTAMPTZ
+);
+-- Every sFlow query is "recent traffic, optionally for one switch/port",
+-- so time leads both indexes.
+CREATE INDEX IF NOT EXISTS idx_sflow_stamp ON sflow_flows(stamp_inserted DESC);
+CREATE INDEX IF NOT EXISTS idx_sflow_agent ON sflow_flows(peer_ip_src, stamp_inserted DESC);
+CREATE INDEX IF NOT EXISTS idx_sflow_iface ON sflow_flows(peer_ip_src, iface_in, stamp_inserted DESC);
+
 -- Last time *any* Switchboard instance observed this occurrence's alarm
 -- actually active (firing in Alertmanager, or pending in Prometheus).
 --

@@ -1,0 +1,22 @@
+-- Reference copy of the table sfacctd writes into, for reading on the
+-- collector host. NOT wired into sfacctd.conf as `sql_table_schema`:
+-- pmacct would execute it as DDL and collide with the webui, which is the
+-- real creator (common/db.py). Documentation only.
+-- definition lives in common/db.py's SCHEMA (the webui creates it at
+-- startup like every other table); this file exists so the pmacct side is
+-- self-describing on the collector host.
+CREATE TABLE sflow_flows (
+    id BIGSERIAL PRIMARY KEY,
+    peer_ip_src TEXT NOT NULL,
+    iface_in BIGINT,
+    iface_out BIGINT,
+    ip_src TEXT,
+    ip_dst TEXT,
+    port_src INTEGER,
+    port_dst INTEGER,
+    ip_proto TEXT,
+    packets BIGINT NOT NULL DEFAULT 0,
+    bytes BIGINT NOT NULL DEFAULT 0,
+    stamp_inserted TIMESTAMPTZ NOT NULL DEFAULT now(),
+    stamp_updated TIMESTAMPTZ
+);

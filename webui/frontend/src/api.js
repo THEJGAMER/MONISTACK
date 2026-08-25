@@ -119,6 +119,20 @@ export const deleteFavorite = (id) => api(`/api/favorites/${id}`, { method: "DEL
 
 export const getSettingsHealth = () => api("/api/settings/health");
 
+// sFlow traffic views. One request returns all four panels over the same
+// window - four separate calls could each land in a different window and
+// disagree with each other.
+export const getSflowOverview = ({ minutes = 60, agent, limit = 20 } = {}) => {
+  const p = new URLSearchParams({ minutes: String(minutes), limit: String(limit) });
+  if (agent) p.set("agent", agent);
+  return api(`/api/sflow/overview?${p.toString()}`, undefined, 30_000);
+};
+export const getSflowPort = (iface, { minutes = 60, agent } = {}) => {
+  const p = new URLSearchParams({ minutes: String(minutes) });
+  if (agent) p.set("agent", agent);
+  return api(`/api/sflow/port/${iface}?${p.toString()}`, undefined, 30_000);
+};
+
 export const getResult = (filename) => api(`/api/results/${filename}`);
 export const deleteResult = (filename) => api(`/api/results/${filename}`, { method: "DELETE" });
 export const exportResultUrl = (filename, format) => `/api/results/${encodeURIComponent(filename)}/export?format=${format}`;

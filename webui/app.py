@@ -50,6 +50,7 @@ import compliance
 import hardware_alerting
 import interface_alerting
 import retention
+import sflow_store
 from ssh_client import SwitchSSH, SwitchSSHError
 from status_poller import StatusPoller
 from store import DeviceStore
@@ -338,6 +339,7 @@ ALERT_RULES = None
 INTERFACE_ALERT_RULES = None
 COMMAND_HISTORY = None
 FAVORITES = None
+SFLOW = None
 OCCURRENCES = None
 AUDIT = None
 # Not reset on DB reconfigure like the stores above - it's just in-memory
@@ -949,7 +951,7 @@ def _load_database(dsn):
     so callers (setup wizard, Settings save) can report a clear error
     without disturbing whatever was working before the attempt."""
     global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES
-    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES
+    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
@@ -961,11 +963,13 @@ def _load_database(dsn):
     new_audit = audit.AuditLog(new_db)
     new_command_history = command_history.CommandHistoryStore(new_db)
     new_favorites = command_history.CommandFavoritesStore(new_db)
+    new_sflow = sflow_store.SFlowStore(new_db)
     DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES = (
         new_db, new_store, new_results, new_topology_store, new_schedules, new_alert_rules, new_interface_alert_rules
     )
     OCCURRENCES, AUDIT = new_occurrences, new_audit
     COMMAND_HISTORY, FAVORITES = new_command_history, new_favorites
+    SFLOW = new_sflow
 
     _migrate_legacy_json_devices()
     _migrate_legacy_sqlite()
@@ -3183,6 +3187,63 @@ def api_add_favorite(req: FavoriteRequest, user: str = Depends(require_auth_and_
 def api_delete_favorite(favorite_id: int, user: str = Depends(require_auth_and_db)):
     FAVORITES.delete(user, favorite_id)
     return {"ok": True}
+
+
+# --- sFlow (ROADMAP: traffic visibility) -----------------------------
+# Read-only: rows are written by sfacctd on the collector LXC, never by
+# this app (see sflow/README.md for the split and why).
+
+def _sflow_platform_for(agent_ip):
+    """ifIndex encoding is vendor-specific, so the decode needs to know
+    which platform sent the flow. Matched by agent IP against the device
+    registry; unknown agents fall back to os9 and simply won't resolve,
+    which surfaces as a raw ifIndex rather than a wrong port name."""
+    for d in DEVICES_BY_ID.values():
+        if d.host == agent_ip:
+            return d.platform
+    return "os9"
+
+
+@app.get("/api/sflow/overview")
+def api_sflow_overview(
+    minutes: int = 60,
+    agent: Optional[str] = None,
+    limit: int = 20,
+    user: str = Depends(require_auth_and_db),
+):
+    """Everything the sFlow page needs in one round trip - four views over
+    the same time window, which is cheaper and more consistent than four
+    requests that could each land in a different window."""
+    minutes = max(1, min(int(minutes), 10080))  # 1 min .. 7 days
+    limit = max(1, min(int(limit), 200))
+    platform = _sflow_platform_for(agent) if agent else "os9"
+    return {
+        "available": SFLOW.available(),
+        "minutes": minutes,
+        "agents": SFLOW.agents(since_minutes=minutes),
+        "top_talkers": SFLOW.top_talkers(since_minutes=minutes, agent_ip=agent, limit=limit),
+        "top_hosts": SFLOW.top_hosts(since_minutes=minutes, agent_ip=agent, limit=limit),
+        "protocol_mix": SFLOW.protocol_mix(since_minutes=minutes, agent_ip=agent, limit=limit),
+        "per_port": SFLOW.per_port(since_minutes=minutes, agent_ip=agent, platform=platform, limit=limit),
+    }
+
+
+@app.get("/api/sflow/port/{iface}")
+def api_sflow_port(
+    iface: int,
+    minutes: int = 60,
+    agent: Optional[str] = None,
+    limit: int = 20,
+    user: str = Depends(require_auth_and_db),
+):
+    """Drill-down: what is actually crossing one interface."""
+    minutes = max(1, min(int(minutes), 10080))
+    return {
+        "iface": iface,
+        "port": sflow_store.ifindex_to_port(iface, _sflow_platform_for(agent) if agent else "os9"),
+        "flows": SFLOW.port_detail(iface, since_minutes=minutes, agent_ip=agent,
+                                   limit=max(1, min(int(limit), 200))),
+    }
 
 
 @app.get("/api/alert-rules")
