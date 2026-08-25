@@ -94,6 +94,24 @@ Two consequences, both handled:
 Setting `set protocols sflow agent-id <management-ip>` keeps the two
 aligned and is worth doing, but nothing breaks if they differ.
 
+## What the page shows
+
+| Panel | Form | Why that form |
+|---|---|---|
+| Headline figures | stat tiles | A single number is not a one-bar chart |
+| Traffic over time | stacked area, one series per switch | The only view that keeps time — every other one collapses it |
+| Traffic by host | horizontal bars | Magnitude across identities, read at a glance |
+| Top talkers / hosts / protocols / ports | tables | Exact values, sortable, filterable |
+| Host and port drill-downs | modal tables | "What is this machine/port actually doing" |
+
+Charts sit *beside* the tables rather than replacing them: the chart is
+for shape, the table for exact numbers. One y-axis everywhere — bytes —
+and never a second scale on the same plot.
+
+Colours come from Cloudscape's own categorical palette rather than being
+hand-picked. It is a validated design-system palette, and the project's
+UI rules mandate its tokens.
+
 ## Reading the numbers honestly
 
 sFlow *samples* — one packet in N (32768 by default on this S4048). Byte

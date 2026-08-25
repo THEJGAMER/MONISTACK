@@ -269,6 +269,83 @@ class SFlowStore:
             out.append(d)
         return out
 
+    def timeseries(self, since_minutes=60, agent_ip=None, bucket_seconds=None):
+        """Bytes per time bucket per agent - the one thing the tables on
+        this page cannot show, since every other view collapses time away.
+
+        Bucket size adapts to the window so the shape stays readable
+        rather than the point count exploding: a 7-day window at
+        1-minute resolution is 10,080 points per series, which is slower
+        to render and less legible than the ~150 a chart actually needs.
+        """
+        if bucket_seconds is None:
+            bucket_seconds = self.bucket_for(since_minutes)
+        where, params = self._window(since_minutes, agent_ip)
+        rows = self.db.query(
+            f"""SELECT peer_ip_src,
+                       to_timestamp(floor(extract(epoch FROM stamp_inserted) / %s) * %s) AS bucket,
+                       SUM(bytes) AS bytes, SUM(packets) AS packets
+                  FROM sflow_flows WHERE {where}
+                 GROUP BY peer_ip_src, bucket ORDER BY bucket""",
+            (int(bucket_seconds), int(bucket_seconds)) + tuple(params),
+        )
+        out = {}
+        for r in rows:
+            out.setdefault(r["peer_ip_src"], []).append({
+                "t": r["bucket"].isoformat(),
+                "bytes": int(r["bytes"] or 0),
+                "packets": int(r["packets"] or 0),
+            })
+        return {"bucket_seconds": int(bucket_seconds), "series": out}
+
+    @staticmethod
+    def bucket_for(since_minutes):
+        """Roughly 60-180 points across the window, on human-friendly
+        boundaries - not an arbitrary division, so bucket edges line up
+        with clock minutes and hours."""
+        for limit, seconds in ((60, 60), (360, 300), (1440, 900), (4320, 3600), (10080, 21600)):
+            if since_minutes <= limit:
+                return seconds
+        return 21600
+
+    def host_detail(self, host, since_minutes=60, agent_ip=None, limit=30):
+        """Everything involving one address, in both directions - the
+        answer to "what is this machine actually doing", which none of the
+        aggregate views can give."""
+        where, params = self._window(since_minutes, agent_ip)
+        rows = self.db.query(
+            f"""SELECT ip_src, ip_dst, ip_proto,
+                       LEAST(COALESCE(port_src, 65535), COALESCE(port_dst, 65535)) AS port,
+                       SUM(bytes) AS bytes, SUM(packets) AS packets
+                  FROM sflow_flows
+                 WHERE {where} AND (ip_src = %s OR ip_dst = %s)
+                 GROUP BY ip_src, ip_dst, ip_proto, port
+                 ORDER BY bytes DESC NULLS LAST LIMIT %s""",
+            tuple(params) + (host, host, int(limit)),
+        )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["proto_name"] = proto_name(d.get("ip_proto"))
+            d["service"] = service_name(d.get("port"))
+            d["direction"] = "out" if d.get("ip_src") == host else "in"
+            out.append(d)
+        return out
+
+    def totals(self, since_minutes=60, agent_ip=None):
+        """Headline figures for the stat row. A single number is a stat
+        tile, not a chart - see the page."""
+        where, params = self._window(since_minutes, agent_ip)
+        row = self.db.query_one(
+            f"""SELECT COALESCE(SUM(bytes),0) AS bytes, COALESCE(SUM(packets),0) AS packets,
+                       COUNT(*) AS records,
+                       COUNT(DISTINCT ip_src) AS talkers,
+                       COUNT(DISTINCT peer_ip_src) AS agents
+                  FROM sflow_flows WHERE {where}""",
+            tuple(params),
+        )
+        return dict(row) if row else {}
+
     def port_detail(self, iface, since_minutes=60, agent_ip=None, limit=20):
         """What is actually crossing one interface - the drill-down from
         the per-port view."""

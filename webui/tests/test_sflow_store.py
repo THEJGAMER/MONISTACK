@@ -334,3 +334,68 @@ def test_an_empty_discovery_does_not_wipe_a_good_map(store):
     m.save("ex3300", {})
 
     assert m.load("ex3300") == {501: "ge-0/0/0"}
+
+
+# --- time series / host detail / totals -------------------------------
+
+def test_timeseries_buckets_by_agent(store):
+    """The one view that keeps time. Every other view on the page
+    collapses it away entirely."""
+    _flow(store, "10.0.0.1", "10.0.0.2", 100, agent="a", age_minutes=1)
+    _flow(store, "10.0.0.1", "10.0.0.2", 200, agent="a", age_minutes=1)
+    _flow(store, "10.0.0.3", "10.0.0.4", 50, agent="b", age_minutes=1)
+
+    ts = store.timeseries(since_minutes=60)
+
+    assert set(ts["series"]) == {"a", "b"}
+    assert sum(p["bytes"] for p in ts["series"]["a"]) == 300
+
+
+def test_bucket_size_scales_with_the_window():
+    """A 7-day window at 1-minute resolution is 10,080 points per series -
+    slower to render and less legible than the ~150 a chart needs."""
+    from sflow_store import SFlowStore as S
+
+    assert S.bucket_for(30) == 60
+    assert S.bucket_for(360) == 300
+    assert S.bucket_for(1440) == 900
+    assert S.bucket_for(10080) == 21600
+    assert S.bucket_for(999999) == 21600, "an out-of-range window still returns a usable bucket"
+
+
+def test_host_detail_covers_both_directions_and_labels_them(store):
+    """A host's traffic is split across ip_src and ip_dst; showing only
+    one direction answers half the question and looks complete."""
+    _flow(store, "10.0.0.9", "10.0.0.1", 100)
+    _flow(store, "10.0.0.2", "10.0.0.9", 800)
+
+    flows = store.host_detail("10.0.0.9", since_minutes=60)
+
+    assert {f["direction"] for f in flows} == {"in", "out"}
+    assert sum(int(f["bytes"]) for f in flows) == 900
+
+
+def test_host_detail_excludes_unrelated_conversations(store):
+    _flow(store, "10.0.0.9", "10.0.0.1", 100)
+    _flow(store, "10.0.0.7", "10.0.0.8", 999)
+
+    assert len(store.host_detail("10.0.0.9", since_minutes=60)) == 1
+
+
+def test_totals_summarise_the_window(store):
+    _flow(store, "10.0.0.1", "10.0.0.2", 100, agent="a")
+    _flow(store, "10.0.0.3", "10.0.0.4", 200, agent="b")
+
+    t = store.totals(since_minutes=60)
+
+    assert int(t["bytes"]) == 300
+    assert int(t["records"]) == 2
+    assert int(t["agents"]) == 2
+    assert int(t["talkers"]) == 2
+
+
+def test_totals_are_zero_not_null_on_an_empty_window(store):
+    """A stat tile rendering "null" is worse than one rendering 0."""
+    t = store.totals(since_minutes=60)
+
+    assert int(t["bytes"]) == 0 and int(t["records"]) == 0

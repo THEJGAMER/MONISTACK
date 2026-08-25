@@ -12,7 +12,12 @@ import ColumnLayout from "@cloudscape-design/components/column-layout";
 import Modal from "@cloudscape-design/components/modal";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 
-import { getSflowOverview, getSflowPort } from "./api.js";
+import AreaChart from "@cloudscape-design/components/area-chart";
+import BarChart from "@cloudscape-design/components/bar-chart";
+import Toggle from "@cloudscape-design/components/toggle";
+import TextFilter from "@cloudscape-design/components/text-filter";
+
+import { getSflowOverview, getSflowPort, getSflowHost } from "./api.js";
 
 const WINDOWS = [
   { label: "Last 15 minutes", value: "15" },
@@ -36,6 +41,9 @@ export default function SflowPage({ devices, pushFlash }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [drill, setDrill] = useState(null);
+  const [hostDrill, setHostDrill] = useState(null);
+  const [auto, setAuto] = useState(false);
+  const [filterText, setFilterText] = useState("");
 
   // Options come from the *data* (which agents have actually sent flows),
   // annotated with a device name where the server could match one. Built
@@ -66,6 +74,48 @@ export default function SflowPage({ devices, pushFlash }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Off by default: this page is usually opened to answer a question, not
+  // left up as a dashboard, and a background refresh that silently
+  // reshuffles the table under a cursor is worse than a stale view.
+  useEffect(() => {
+    if (!auto) return undefined;
+    const id = setInterval(load, 30_000);
+    return () => clearInterval(id);
+  }, [auto, load]);
+
+  async function openHost(host) {
+    try {
+      setHostDrill(await getSflowHost(host, { minutes: Number(minutes.value), agent: agent.value || undefined }));
+    } catch (e) {
+      pushFlash("error", `Could not load host detail: ${e.message}`);
+    }
+  }
+
+  // Client-side because the window's data is already here - a round trip
+  // to filter what the browser is holding would be slower and would lose
+  // the charts' context.
+  const q = filterText.trim().toLowerCase();
+  const matches = (...fields) => !q || fields.some((f) => String(f ?? "").toLowerCase().includes(q));
+  const talkers = (data?.top_talkers || []).filter((t) => matches(t.ip_src, t.ip_dst));
+  const hosts = (data?.top_hosts || []).filter((h) => matches(h.host));
+  const protos = (data?.protocol_mix || []).filter((p) => matches(p.service, p.port, p.proto_name));
+  const ports = (data?.per_port || []).filter((p) => matches(p.port, p.iface, p.peer_ip_src));
+
+  // Stacked area over time, one series per switch. Cloudscape's own
+  // categorical order is used rather than hand-picked colours - it is a
+  // validated palette, and the project's design rules mandate its tokens.
+  const tsSeries = Object.entries(data?.timeseries?.series || {}).map(([agentIp, points]) => ({
+    title: nameFor(agentIp),
+    type: "area",
+    data: points.map((pt) => ({ x: new Date(pt.t), y: Number(pt.bytes) })),
+    valueFormatter: bytes,
+  }));
+
+  function nameFor(agentIp) {
+    const a = (data?.agents || []).find((x) => x.peer_ip_src === agentIp);
+    return a?.device_name || agentIp;
+  }
 
   async function openPort(iface, agentIp) {
     try {
@@ -113,7 +163,8 @@ export default function SflowPage({ devices, pushFlash }) {
             variant="h2"
             description="Traffic sampled by the switches themselves and collected by sfacctd. Byte counts are estimates scaled from samples, not exact measurements - useful in relative terms."
             actions={
-              <SpaceBetween size="xs" direction="horizontal">
+              <SpaceBetween size="xs" direction="horizontal" alignItems="center">
+                <Toggle checked={auto} onChange={({ detail }) => setAuto(detail.checked)}>Auto</Toggle>
                 <Select selectedOption={minutes} onChange={({ detail }) => setMinutes(detail.selectedOption)} options={WINDOWS} />
                 <Select selectedOption={agent} onChange={({ detail }) => setAgent(detail.selectedOption)} options={agentOptions} />
                 <Button iconName="refresh" loading={loading} onClick={load}>Refresh</Button>
@@ -124,28 +175,80 @@ export default function SflowPage({ devices, pushFlash }) {
           </Header>
         }
       >
-        {data?.agents?.length ? (
-          <ColumnLayout columns={Math.min(data.agents.length, 3)} variant="text-grid">
-            {data.agents.map((a) => (
-              <div key={a.peer_ip_src}>
-                <Box variant="awsui-key-label">{a.device_name || a.peer_ip_src}</Box>
-                <Box fontSize="display-l" fontWeight="bold">{bytes(a.bytes)}</Box>
-                <Box color="text-status-inactive">
-                  {a.flows} flow records · {a.peer_ip_src}
-                  {!a.platform && " · unrecognised agent"}
-                </Box>
-              </div>
-            ))}
+        {/* Headline figures are stat tiles, not charts - a single number
+            is not a bar chart. */}
+        <SpaceBetween size="l">
+          <ColumnLayout columns={4} variant="text-grid">
+            <div>
+              <Box variant="awsui-key-label">Traffic sampled</Box>
+              <Box fontSize="display-l" fontWeight="bold">{bytes(data?.totals?.bytes)}</Box>
+            </div>
+            <div>
+              <Box variant="awsui-key-label">Flow records</Box>
+              <Box fontSize="display-l" fontWeight="bold">{Number(data?.totals?.records || 0).toLocaleString()}</Box>
+            </div>
+            <div>
+              <Box variant="awsui-key-label">Distinct sources</Box>
+              <Box fontSize="display-l" fontWeight="bold">{Number(data?.totals?.talkers || 0).toLocaleString()}</Box>
+            </div>
+            <div>
+              <Box variant="awsui-key-label">Switches reporting</Box>
+              <Box fontSize="display-l" fontWeight="bold">{data?.agents?.length || 0}</Box>
+              <Box color="text-status-inactive" fontSize="body-s">
+                {(data?.agents || []).map((a) => a.device_name || a.peer_ip_src).join(", ") || "none"}
+              </Box>
+            </div>
           </ColumnLayout>
-        ) : (
-          <StatusIndicator type="warning">No switch reported traffic in this window</StatusIndicator>
-        )}
+
+          {/* Trend over time, stacked by switch. This is the one thing the
+              tables below cannot show - every other view collapses time
+              away entirely. One y-axis, bytes only: never a second scale. */}
+          <AreaChart
+            series={tsSeries}
+            xScaleType="time"
+            height={220}
+            hideFilter
+            xTitle="Time"
+            yTitle="Bytes sampled"
+            ariaLabel="Sampled traffic over time, stacked by switch"
+            i18nStrings={{ xTickFormatter: (t) => t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+                           yTickFormatter: bytes }}
+            empty={<Box color="text-status-inactive">No traffic in this window.</Box>}
+            noMatch={<Box color="text-status-inactive">No traffic matches.</Box>}
+          />
+        </SpaceBetween>
+      </Container>
+
+      <TextFilter
+        filteringText={filterText}
+        onChange={({ detail }) => setFilterText(detail.filteringText)}
+        filteringPlaceholder="Filter by address, port, service or switch..."
+        countText={q ? `${talkers.length + hosts.length + protos.length + ports.length} matches` : ""}
+      />
+
+      {/* Magnitude across identities -> horizontal bars. The table beside
+          it carries the exact numbers; the chart is for reading the shape
+          at a glance, which a table cannot do. */}
+      <Container header={<Header variant="h3" description="Busiest hosts in this window, both directions">Traffic by host</Header>}>
+        <BarChart
+          series={[{ title: "Traffic", type: "bar", data: hosts.slice(0, 10).map((h) => ({ x: h.host, y: Number(h.bytes) })), valueFormatter: bytes }]}
+          horizontalBars
+          hideFilter
+          hideLegend
+          height={260}
+          xTitle="Host"
+          yTitle="Bytes sampled"
+          ariaLabel="Sampled traffic by host"
+          i18nStrings={{ yTickFormatter: bytes }}
+          empty={<Box color="text-status-inactive">No traffic in this window.</Box>}
+          noMatch={<Box color="text-status-inactive">No hosts match.</Box>}
+        />
       </Container>
 
       <ColumnLayout columns={2}>
         <Container header={<Header variant="h3" description="Busiest conversations">Top talkers</Header>}>
           <Table
-            variant="embedded" items={data?.top_talkers || []} empty={empty}
+            variant="embedded" items={talkers} empty={empty}
             trackBy={(t) => `${t.ip_src}-${t.ip_dst}`}
             columnDefinitions={[
               { id: "src", header: "Source", cell: (t) => <Box variant="code">{t.ip_src || "-"}</Box> },
@@ -157,9 +260,14 @@ export default function SflowPage({ devices, pushFlash }) {
 
         <Container header={<Header variant="h3" description="Both directions combined">Top hosts</Header>}>
           <Table
-            variant="embedded" items={data?.top_hosts || []} empty={empty} trackBy="host"
+            variant="embedded" items={hosts} empty={empty} trackBy="host"
             columnDefinitions={[
-              { id: "host", header: "Host", cell: (h) => <Box variant="code">{h.host}</Box> },
+              {
+                id: "host", header: "Host",
+                cell: (h) => (
+                  <Button variant="inline-link" onClick={() => openHost(h.host)}>{h.host}</Button>
+                ),
+              },
               { id: "bytes", header: "Traffic", cell: (h) => bytes(h.bytes) },
               { id: "packets", header: "Packets", cell: (h) => h.packets },
             ]}
@@ -170,7 +278,7 @@ export default function SflowPage({ devices, pushFlash }) {
       <ColumnLayout columns={2}>
         <Container header={<Header variant="h3" description="Keyed on the well-known side of each conversation">Protocol / service mix</Header>}>
           <Table
-            variant="embedded" items={data?.protocol_mix || []} empty={empty}
+            variant="embedded" items={protos} empty={empty}
             trackBy={(p) => `${p.ip_proto}-${p.port}`}
             columnDefinitions={[
               { id: "proto", header: "Proto", cell: (p) => p.proto_name },
@@ -183,7 +291,7 @@ export default function SflowPage({ devices, pushFlash }) {
 
         <Container header={<Header variant="h3" description="Per switch interface - click a row for what's crossing it">Per-port traffic</Header>}>
           <Table
-            variant="embedded" items={data?.per_port || []} empty={empty}
+            variant="embedded" items={ports} empty={empty}
             trackBy={(p) => `${p.peer_ip_src}-${p.iface}`}
             columnDefinitions={[
               {
@@ -205,6 +313,35 @@ export default function SflowPage({ devices, pushFlash }) {
           />
         </Container>
       </ColumnLayout>
+
+      <Modal
+        visible={!!hostDrill}
+        onDismiss={() => setHostDrill(null)}
+        header={hostDrill ? `Traffic involving ${hostDrill.host}` : ""}
+        size="large"
+      >
+        <Table
+          variant="embedded" items={hostDrill?.flows || []} empty={empty}
+          trackBy={(f) => `${f.ip_src}-${f.ip_dst}-${f.port}`}
+          columnDefinitions={[
+            {
+              id: "dir", header: "",
+              // Direction is stated rather than left to be inferred from
+              // which column the address happens to be in.
+              cell: (f) => (
+                <StatusIndicator type={f.direction === "out" ? "info" : "success"}>
+                  {f.direction === "out" ? "out" : "in"}
+                </StatusIndicator>
+              ),
+            },
+            { id: "peer", header: "Peer",
+              cell: (f) => <Box variant="code">{f.direction === "out" ? f.ip_dst : f.ip_src}</Box> },
+            { id: "svc", header: "Service", cell: (f) => f.service || (f.port === 65535 ? "-" : f.port) },
+            { id: "proto", header: "Proto", cell: (f) => f.proto_name },
+            { id: "bytes", header: "Traffic", cell: (f) => bytes(f.bytes) },
+          ]}
+        />
+      </Modal>
 
       <Modal
         visible={!!drill}

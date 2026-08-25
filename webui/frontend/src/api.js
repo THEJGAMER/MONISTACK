@@ -127,6 +127,11 @@ export const getSflowOverview = ({ minutes = 60, agent, limit = 20 } = {}) => {
   if (agent) p.set("agent", agent);
   return api(`/api/sflow/overview?${p.toString()}`, undefined, 30_000);
 };
+export const getSflowHost = (host, { minutes = 60, agent } = {}) => {
+  const p = new URLSearchParams({ minutes: String(minutes) });
+  if (agent) p.set("agent", agent);
+  return api(`/api/sflow/host/${encodeURIComponent(host)}?${p.toString()}`, undefined, 30_000);
+};
 export const getSflowPort = (iface, { minutes = 60, agent } = {}) => {
   const p = new URLSearchParams({ minutes: String(minutes) });
   if (agent) p.set("agent", agent);

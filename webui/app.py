@@ -3344,6 +3344,8 @@ def api_sflow_overview(
         "per_port": SFLOW.per_port(since_minutes=minutes, agent_ip=agent,
                                    platform_for=_sflow_platform_for,
                                    cached_for=_sflow_cached_map_for, limit=limit),
+        "totals": SFLOW.totals(since_minutes=minutes, agent_ip=agent),
+        "timeseries": SFLOW.timeseries(since_minutes=minutes, agent_ip=agent),
     }
 
 
@@ -3363,6 +3365,25 @@ def api_sflow_port(
             iface, _sflow_platform_for(agent),
             cached=(SFLOW_IFINDEX.load(_sflow_device_id_for(agent)) if _sflow_device_id_for(agent) else None)),
         "flows": SFLOW.port_detail(iface, since_minutes=minutes, agent_ip=agent,
+                                   limit=max(1, min(int(limit), 200))),
+    }
+
+
+
+@app.get("/api/sflow/host/{host}")
+def api_sflow_host(
+    host: str,
+    minutes: int = 60,
+    agent: Optional[str] = None,
+    limit: int = 30,
+    user: str = Depends(require_auth_and_db),
+):
+    """Everything involving one address, both directions - "what is this
+    machine actually doing", which no aggregate view can answer."""
+    minutes = max(1, min(int(minutes), 10080))
+    return {
+        "host": host,
+        "flows": SFLOW.host_detail(host, since_minutes=minutes, agent_ip=agent,
                                    limit=max(1, min(int(limit), 200))),
     }
 
