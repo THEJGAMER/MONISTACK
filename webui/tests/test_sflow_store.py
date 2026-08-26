@@ -495,3 +495,139 @@ def test_relative_windows_still_work_untouched(store):
 
     assert len(store.top_talkers(since_minutes=60)) == 1
     assert len(store.top_talkers(since_minutes=600)) == 2
+
+
+# --- the search ------------------------------------------------------
+# The bug this covers: the filter used to run in the browser over the top
+# 20 rows the API had already returned, so anything ranked below that was
+# unfindable no matter how exactly it was typed. Found with a real host
+# sitting 86th of 152.
+
+def _quiet_and_loud(store):
+    """One host far below the top of the ranking, and enough noise above
+    it that a top-N cut would drop it."""
+    for i in range(25):
+        _flow(store, f"10.9.{i}.1", "8.8.8.8", 10_000_000 + i)
+    _flow(store, "192.168.0.125", "192.168.0.1", 1671, sp=50001, dp=445)
+
+
+def test_a_host_below_the_top_n_is_still_found(store):
+    _quiet_and_loud(store)
+
+    assert store.top_hosts(since_minutes=60, limit=20, q="192.168.0.125") != []
+    assert store.top_talkers(since_minutes=60, limit=20, q="192.168.0.125") != []
+
+
+def test_that_host_is_genuinely_outside_the_unfiltered_page(store):
+    """Proves the test above is testing something - if the quiet host
+    happened to rank inside the limit, the search would look like it
+    worked while doing nothing."""
+    _quiet_and_loud(store)
+
+    hosts = [h["host"] for h in store.top_hosts(since_minutes=60, limit=20)]
+
+    assert "192.168.0.125" not in hosts
+
+
+def test_top_hosts_returns_the_match_not_its_peers(store):
+    """Row matching keeps a flow when either end matches, so folding both
+    endpoints together would list the peer beside it."""
+    _quiet_and_loud(store)
+
+    hosts = [h["host"] for h in store.top_hosts(since_minutes=60, q="192.168.0.125")]
+
+    assert hosts == ["192.168.0.125"]
+    assert "192.168.0.1" not in hosts, "the peer belongs in Top talkers, not here"
+
+
+def test_top_talkers_keeps_the_peer_so_the_conversation_is_visible(store):
+    _quiet_and_loud(store)
+
+    row = store.top_talkers(since_minutes=60, q="192.168.0.125")[0]
+
+    assert {row["ip_src"], row["ip_dst"]} == {"192.168.0.125", "192.168.0.1"}
+
+
+def test_a_partial_address_matches(store):
+    _quiet_and_loud(store)
+
+    assert [h["host"] for h in store.top_hosts(since_minutes=60, q="0.125")] == ["192.168.0.125"]
+
+
+def test_searching_by_port_number(store):
+    _quiet_and_loud(store)
+
+    assert store.top_talkers(since_minutes=60, q="445") != []
+    assert store.top_talkers(since_minutes=60, q="9999") == []
+
+
+def test_searching_by_service_name(store):
+    """445 is smb; typing the name should not require knowing the number."""
+    _quiet_and_loud(store)
+
+    rows = store.top_talkers(since_minutes=60, q="smb")
+
+    assert [r["ip_src"] for r in rows] == ["192.168.0.125"]
+
+
+def test_searching_by_interface_ifindex_set(store):
+    """Interface *names* are decoded in Python from an SSH-discovered map,
+    so the caller resolves them to ifIndexes and passes those down."""
+    _quiet_and_loud(store)
+
+    assert store.top_talkers(since_minutes=60, q="Te 1/37", q_ifaces=[2101764]) != []
+    assert store.top_talkers(since_minutes=60, q="Te 1/37", q_ifaces=[999999]) == []
+
+
+def test_the_totals_reflect_the_search(store):
+    """The tiles sit above the tables, so leaving them unfiltered would
+    caption a filtered page with the unfiltered numbers."""
+    _quiet_and_loud(store)
+
+    assert int(store.totals(since_minutes=60, q="192.168.0.125")["records"]) == 1
+
+
+def test_an_empty_search_changes_nothing(store):
+    _quiet_and_loud(store)
+
+    assert len(store.top_hosts(since_minutes=60, limit=20)) == \
+           len(store.top_hosts(since_minutes=60, limit=20, q="   "))
+
+
+def test_a_search_matching_nothing_returns_nothing_rather_than_everything(store):
+    """The failure mode worth guarding: a clause that silently drops out
+    turns a no-match search into an unfiltered page."""
+    _quiet_and_loud(store)
+
+    assert store.top_hosts(since_minutes=60, q="203.0.113.99") == []
+    assert store.totals(since_minutes=60, q="203.0.113.99")["records"] in (0, None)
+
+
+def test_a_service_search_lists_the_hosts_doing_it(store):
+    """"192.168.0.125" means "this machine"; "https" means "whoever is
+    doing this". Narrowing Top hosts by name in the second case empties
+    the panel, since no host is called https."""
+    _quiet_and_loud(store)
+
+    hosts = [h["host"] for h in store.top_hosts(since_minutes=60, q="smb")]
+
+    assert sorted(hosts) == ["192.168.0.1", "192.168.0.125"]
+
+
+def test_an_interface_search_lists_the_hosts_crossing_it(store):
+    _quiet_and_loud(store)
+
+    hosts = store.top_hosts(since_minutes=60, q="Te 1/37", q_ifaces=[2101764])
+
+    assert hosts != []
+
+
+def test_address_likeness_splits_the_two_behaviours():
+    assert sflow_store._looks_like_address("192.168.0.125")
+    assert sflow_store._looks_like_address("0.125")
+    assert sflow_store._looks_like_address("fe80::1")
+    # A bare number is far more often a port than an address fragment.
+    assert not sflow_store._looks_like_address("445")
+    assert not sflow_store._looks_like_address("https")
+    assert not sflow_store._looks_like_address("Te 1/37")
+    assert not sflow_store._looks_like_address("")

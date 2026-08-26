@@ -81,6 +81,13 @@ export default function SflowPage({ devices, pushFlash }) {
   const [hostDrill, setHostDrill] = useState(null);
   const [auto, setAuto] = useState(false);
   const [filterText, setFilterText] = useState("");
+  // Debounced so typing an address is one query, not one per keystroke -
+  // these are aggregates over the whole window, not a lookup.
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    const id = setTimeout(() => setQuery(filterText.trim()), 400);
+    return () => clearTimeout(id);
+  }, [filterText]);
 
   // Options come from the *data* (which agents have actually sent flows),
   // annotated with a device name where the server could match one. Built
@@ -99,14 +106,14 @@ export default function SflowPage({ devices, pushFlash }) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setData(await getSflowOverview({ ...rangeToQuery(range), agent: agent.value || undefined }));
+      setData(await getSflowOverview({ ...rangeToQuery(range), agent: agent.value || undefined, q: query || undefined }));
     } catch (e) {
       pushFlash("error", `Could not load sFlow data: ${e.message}`);
       setData(null);
     } finally {
       setLoading(false);
     }
-  }, [range, agent, pushFlash]);
+  }, [range, agent, query, pushFlash]);
 
   useEffect(() => {
     load();
@@ -129,15 +136,16 @@ export default function SflowPage({ devices, pushFlash }) {
     }
   }
 
-  // Client-side because the window's data is already here - a round trip
-  // to filter what the browser is holding would be slower and would lose
-  // the charts' context.
-  const q = filterText.trim().toLowerCase();
-  const matches = (...fields) => !q || fields.some((f) => String(f ?? "").toLowerCase().includes(q));
-  const talkers = (data?.top_talkers || []).filter((t) => matches(t.ip_src, t.ip_dst));
-  const hosts = (data?.top_hosts || []).filter((h) => matches(h.host));
-  const protos = (data?.protocol_mix || []).filter((p) => matches(p.service, p.port, p.proto_name));
-  const ports = (data?.per_port || []).filter((p) => matches(p.port, p.iface, p.peer_ip_src));
+  // Server-side. Filtering here instead would only ever search the rows
+  // already fetched - the top 20 of the window - so anything ranked below
+  // that was unfindable however precisely it was typed. A host sitting
+  // 86th of 152 returned nothing for its own address, and the box gave no
+  // hint it was searching a truncated list rather than the window.
+  const q = (data?.q || "").toLowerCase();
+  const talkers = data?.top_talkers || [];
+  const hosts = data?.top_hosts || [];
+  const protos = data?.protocol_mix || [];
+  const ports = data?.per_port || [];
 
   // Stacked area over time, one series per switch. Cloudscape's own
   // categorical order is used rather than hand-picked colours - it is a
@@ -190,7 +198,11 @@ export default function SflowPage({ devices, pushFlash }) {
     );
   }
 
-  const empty = <Box color="text-status-inactive">Nothing in this window.</Box>;
+  const empty = (
+    <Box color="text-status-inactive">
+      {q ? `Nothing matching "${data?.q}" in this window.` : "Nothing in this window."}
+    </Box>
+  );
 
   return (
     <SpaceBetween size="l">
@@ -311,8 +323,13 @@ export default function SflowPage({ devices, pushFlash }) {
       <TextFilter
         filteringText={filterText}
         onChange={({ detail }) => setFilterText(detail.filteringText)}
-        filteringPlaceholder="Filter by address, port, service or switch..."
-        countText={q ? `${talkers.length + hosts.length + protos.length + ports.length} matches` : ""}
+        filteringPlaceholder="Search the whole window by address, port, service, interface or switch..."
+        countText={
+          q && !loading
+            ? `${talkers.length + hosts.length + protos.length + ports.length} matches for "${data?.q}"`
+            : ""
+        }
+        filteringAriaLabel="Search sFlow traffic"
       />
 
       {/* Magnitude across identities -> horizontal bars. The table beside

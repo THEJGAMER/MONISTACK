@@ -3367,6 +3367,26 @@ def _sflow_agent_label(agent_ip):
 SFLOW_MAX_SPAN_DAYS = int(os.environ.get("SFLOW_MAX_SPAN_DAYS", "92"))
 
 
+def _sflow_ifaces_matching(q):
+    """ifIndexes whose decoded port name matches `q`.
+
+    Searching for "Te 1/37" has to work, and only this side of the app
+    knows that 2101764 is called that: the name comes from a per-vendor
+    decode over a map discovered by SSH, none of which exists in the
+    database. So the name is resolved to numbers here and the numbers go
+    into the query.
+    """
+    q = (q or "").strip().lower()
+    if not q:
+        return []
+    found = set()
+    for mapping in _SFLOW_IFINDEX_CACHE.values():
+        for ifindex, port in (mapping or {}).items():
+            if q in str(port).lower():
+                found.add(int(ifindex))
+    return sorted(found)
+
+
 def _sflow_window(minutes, start, end):
     """Resolves the time range for one request, once, for every view.
 
@@ -3410,6 +3430,7 @@ def api_sflow_overview(
     limit: int = 20,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    q: Optional[str] = None,
     user: str = Depends(require_auth_and_db),
 ):
     """Everything the sFlow page needs in one round trip - every view over
@@ -3427,6 +3448,12 @@ def api_sflow_overview(
     # One query for every device's map, rather than per row.
     _SFLOW_IFINDEX_CACHE.clear()
     _SFLOW_IFINDEX_CACHE.update(SFLOW_IFINDEX.load_all())
+    # The search runs in SQL, before ranking - see _match_clause. Applied
+    # to the ranked rows instead it could only ever find what was already
+    # in the top `limit`, which is how a host sitting 86th of 152 became
+    # unfindable by typing its own address.
+    q = (q or "").strip()[:100] or None
+    find = {"q": q, "q_ifaces": _sflow_ifaces_matching(q)}
     return {
         "available": SFLOW.available(),
         # The window actually queried, not the one requested - they differ
@@ -3436,6 +3463,7 @@ def api_sflow_overview(
         "end": end_dt.isoformat(),
         "minutes": round((end_dt - start_dt).total_seconds() / 60),
         "clamped_to_days": SFLOW_MAX_SPAN_DAYS if clamped else None,
+        "q": q,
         # Built from the data, not the device registry: an agent whose
         # agent-id differs from its management IP would otherwise be
         # unselectable in the UI - which is exactly what happened with the
@@ -3446,13 +3474,13 @@ def api_sflow_overview(
              "platform": _sflow_platform_for(a["peer_ip_src"])}
             for a in SFLOW.agents(**win)
         ],
-        "top_talkers": SFLOW.top_talkers(agent_ip=agent, limit=limit, **win),
-        "top_hosts": SFLOW.top_hosts(agent_ip=agent, limit=limit, **win),
-        "protocol_mix": SFLOW.protocol_mix(agent_ip=agent, limit=limit, **win),
+        "top_talkers": SFLOW.top_talkers(agent_ip=agent, limit=limit, **win, **find),
+        "top_hosts": SFLOW.top_hosts(agent_ip=agent, limit=limit, **win, **find),
+        "protocol_mix": SFLOW.protocol_mix(agent_ip=agent, limit=limit, **win, **find),
         "per_port": SFLOW.per_port(agent_ip=agent, platform_for=_sflow_platform_for,
-                                   cached_for=_sflow_cached_map_for, limit=limit, **win),
-        "totals": SFLOW.totals(agent_ip=agent, **win),
-        "timeseries": SFLOW.timeseries(agent_ip=agent, **win),
+                                   cached_for=_sflow_cached_map_for, limit=limit, **win, **find),
+        "totals": SFLOW.totals(agent_ip=agent, **win, **find),
+        "timeseries": SFLOW.timeseries(agent_ip=agent, **win, **find),
     }
 
 

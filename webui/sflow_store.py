@@ -94,6 +94,81 @@ def service_name(port):
         return None
 
 
+def _ports_named(q):
+    """Port numbers whose well-known service name contains `q`, so typing
+    "https" finds 443 without the user knowing the number."""
+    ql = q.lower()
+    return sorted(p for p, name in _PORT_NAMES.items() if ql in name)
+
+
+def _protos_named(q):
+    ql = q.lower()
+    return sorted(n for n, name in _PROTO_NAMES.items() if ql in name)
+
+
+def _looks_like_address(q):
+    """Whether `q` could be part of an IP address rather than a service,
+    interface or protocol name.
+
+    Decides whether Top hosts narrows to the host itself or shows the
+    hosts carrying the matched traffic - two opposite answers that are
+    each right for a different kind of search. "192.168.0.125" means
+    "this machine"; "https" means "whoever is doing this". Requiring a
+    dot or colon keeps a bare number ("445") on the port side, where it
+    is far more often meant.
+    """
+    q = (q or "").strip()
+    if not q or not any(c in q for c in ".:"):
+        return False
+    return all(c in "0123456789abcdefABCDEF.:" for c in q)
+
+
+def _match_clause(q, ifaces=None):
+    """What a single search box can mean, as SQL over flow rows.
+
+    The box is one field, so the text is tried against every column it
+    could plausibly name rather than asking the user which they meant.
+
+    The important part is *where* this runs: before aggregation and
+    ranking, not after. Filtering the returned rows in the browser can
+    only ever find what already made the top 20 - a quiet host (86th of
+    152 in the hour this was found) was invisible and unfindable no
+    matter what was typed, and the box gave no hint that it was only
+    searching what it had.
+
+    `ifaces` is the caller's reverse lookup of interface *names* to
+    ifIndexes; the name only exists after a per-vendor decode in Python,
+    so SQL cannot derive it.
+    """
+    q = (q or "").strip()
+    if not q:
+        return None, []
+    like = f"%{q}%"
+    clauses = ["ip_src ILIKE %s", "ip_dst ILIKE %s", "peer_ip_src ILIKE %s"]
+    params = [like, like, like]
+
+    if q.isdigit() and 0 <= int(q) <= 65535:
+        clauses.append("(port_src = %s OR port_dst = %s)")
+        params += [int(q), int(q)]
+
+    named = _ports_named(q)
+    if named:
+        clauses.append("(port_src = ANY(%s) OR port_dst = ANY(%s))")
+        params += [named, named]
+
+    protos = _protos_named(q)
+    if protos:
+        clauses.append("ip_proto = ANY(%s)")
+        params.append(protos)
+
+    if ifaces:
+        ifaces = [int(i) for i in ifaces]
+        clauses.append("(iface_in = ANY(%s) OR iface_out = ANY(%s))")
+        params += [ifaces, ifaces]
+
+    return "(" + " OR ".join(clauses) + ")", params
+
+
 class IfIndexMap:
     """Cached SNMP ifIndex -> port-name lookup, per device.
 
@@ -175,7 +250,7 @@ class SFlowStore:
         return start, end
 
     def _window(self, since_minutes=None, agent_ip=None, iface=None,
-                start=None, end=None):
+                start=None, end=None, q=None, q_ifaces=None):
         """Builds the WHERE shared by every view. Time always leads, since
         both indexes on this table are (something, stamp_inserted DESC)."""
         if start is not None or end is not None:
@@ -196,6 +271,10 @@ class SFlowStore:
         if iface is not None:
             clauses.append("(iface_in = %s OR iface_out = %s)")
             params += [int(iface), int(iface)]
+        match, mparams = _match_clause(q, q_ifaces)
+        if match:
+            clauses.append(match)
+            params += mparams
         return " AND ".join(clauses), params
 
     def available(self):
@@ -243,8 +322,8 @@ class SFlowStore:
 
     # --- the four views ----------------------------------------------
 
-    def top_talkers(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None):
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
+    def top_talkers(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None, q=None, q_ifaces=None):
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
         rows = self.db.query(
             f"""SELECT ip_src, ip_dst, SUM(bytes) AS bytes, SUM(packets) AS packets,
                        COUNT(*) AS samples
@@ -255,28 +334,40 @@ class SFlowStore:
         )
         return [dict(r) for r in rows]
 
-    def top_hosts(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None):
+    def top_hosts(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None, q=None, q_ifaces=None):
         """Per-host totals, counting a host's traffic in both directions -
         "who is using the bandwidth" rather than "which pair is busiest".
         A conversation view alone hides a host spread across many peers."""
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
+        # A second, narrower filter on the aggregated host, but only for
+        # an address-like search. The row-level match keeps a flow when
+        # *either* endpoint matches, so folding both endpoints together
+        # would list every peer of the searched-for host beside it - and
+        # this view answers "how much did this host move" (the peers are
+        # what Top talkers is for). Applied to a service or interface
+        # search, though, the same filter empties the panel: no host is
+        # named "https".
+        host_filter, host_params = "", ()
+        if _looks_like_address(q):
+            host_filter = "AND host ILIKE %s"
+            host_params = (f"%{q.strip()}%",)
         rows = self.db.query(
             f"""SELECT host, SUM(bytes) AS bytes, SUM(packets) AS packets FROM (
                     SELECT ip_src AS host, bytes, packets FROM sflow_flows WHERE {where}
                     UNION ALL
                     SELECT ip_dst AS host, bytes, packets FROM sflow_flows WHERE {where}
-                ) t WHERE host IS NOT NULL
+                ) t WHERE host IS NOT NULL {host_filter}
                 GROUP BY host ORDER BY bytes DESC NULLS LAST LIMIT %s""",
-            tuple(params) + tuple(params) + (int(limit),),
+            tuple(params) + tuple(params) + host_params + (int(limit),),
         )
         return [dict(r) for r in rows]
 
-    def protocol_mix(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None):
+    def protocol_mix(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None, q=None, q_ifaces=None):
         """Traffic by service. Keyed on the *lower* of the two ports:
         an ephemeral source port is noise, and the well-known side is what
         identifies the service - without this, one HTTPS server appears as
         hundreds of separate rows, one per client port."""
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
         rows = self.db.query(
             f"""SELECT ip_proto,
                        LEAST(COALESCE(port_src, 65535), COALESCE(port_dst, 65535)) AS port,
@@ -295,7 +386,7 @@ class SFlowStore:
         return out
 
     def per_port(self, since_minutes=60, agent_ip=None, platform_for=None,
-                 cached_for=None, limit=50, start=None, end=None):
+                 cached_for=None, limit=50, start=None, end=None, q=None, q_ifaces=None):
         """Traffic per switch interface, in and out kept separate so a
         one-directional problem (a port only ever receiving) is visible
         rather than averaged away.
@@ -308,7 +399,7 @@ class SFlowStore:
         `platform_for` is a callable agent_ip -> platform (or None), so
         each row is decoded with its own switch's encoding rather than one
         platform applied to every agent."""
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
         rows = self.db.query(
             f"""SELECT peer_ip_src, iface, SUM(in_bytes) AS in_bytes, SUM(out_bytes) AS out_bytes,
                        SUM(in_pkts) AS in_packets, SUM(out_pkts) AS out_packets FROM (
@@ -333,7 +424,7 @@ class SFlowStore:
             out.append(d)
         return out
 
-    def timeseries(self, since_minutes=60, agent_ip=None, bucket_seconds=None, start=None, end=None):
+    def timeseries(self, since_minutes=60, agent_ip=None, bucket_seconds=None, start=None, end=None, q=None, q_ifaces=None):
         """Bytes per time bucket per agent - the one thing the tables on
         this page cannot show, since every other view collapses time away.
 
@@ -347,7 +438,7 @@ class SFlowStore:
             if start is not None and end is not None:
                 span = max(1, (end - start).total_seconds() / 60)
             bucket_seconds = self.bucket_for(span)
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
         rows = self.db.query(
             f"""SELECT peer_ip_src,
                        to_timestamp(floor(extract(epoch FROM stamp_inserted) / %s) * %s) AS bucket,
@@ -399,10 +490,10 @@ class SFlowStore:
             out.append(d)
         return out
 
-    def totals(self, since_minutes=60, agent_ip=None, start=None, end=None):
+    def totals(self, since_minutes=60, agent_ip=None, start=None, end=None, q=None, q_ifaces=None):
         """Headline figures for the stat row. A single number is a stat
         tile, not a chart - see the page."""
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
         row = self.db.query_one(
             f"""SELECT COALESCE(SUM(bytes),0) AS bytes, COALESCE(SUM(packets),0) AS packets,
                        COUNT(*) AS records,
