@@ -43,6 +43,13 @@ const SERVICE_FIELDS = [
     placeholder: "(derived from Prometheus URL)",
   },
   {
+    key: "sflow_collector",
+    label: "sFlow collector",
+    description:
+      "Where sfacctd runs, as host:port. The webui never connects to it - flows arrive via Postgres - so this is not a connection string. It is the address the health check names when sFlow goes quiet, so \"no flows\" comes with somewhere to look.",
+    placeholder: "192.168.0.155:6343",
+  },
+  {
     key: "exporter_url",
     label: "Exporter URL",
     description:
@@ -170,7 +177,7 @@ export default function SettingsPage({ pushFlash }) {
         header={
           <Header
             variant="h2"
-            description="Live reachability of everything the webui talks to. Refreshes every 30s."
+            description="Whether each service answers, and whether data is still arriving from the two that feed this app. Refreshes every 30s."
             actions={
               <Button iconName="refresh" loading={healthLoading} onClick={refreshHealth}>
                 Check now
@@ -196,11 +203,18 @@ export default function SettingsPage({ pushFlash }) {
               {
                 id: "status",
                 header: "Status",
+                // A freshness check reads red when the far end is up but
+                // silent, so "unreachable" would send someone to debug the
+                // wrong thing entirely.
                 cell: (c) =>
                   c.ok ? (
-                    <StatusIndicator type="success">reachable</StatusIndicator>
+                    <StatusIndicator type="success">
+                      {c.kind === "flow" ? "flowing" : "reachable"}
+                    </StatusIndicator>
                   ) : (
-                    <StatusIndicator type="error">unreachable</StatusIndicator>
+                    <StatusIndicator type="error">
+                      {c.kind === "flow" ? "no data" : "unreachable"}
+                    </StatusIndicator>
                   ),
               },
               { id: "target", header: "Target", cell: (c) => <Box variant="code">{c.target || "-"}</Box> },

@@ -92,6 +92,11 @@ OCCURRENCE_CLOSE_GRACE_SECONDS = int(os.environ.get("OCCURRENCE_CLOSE_GRACE_SECO
 # silent for a while, and this should flag "the pipeline is dead", not
 # "the switches had nothing to say for ten minutes".
 SYSLOG_STALE_AFTER_SECONDS = int(os.environ.get("SYSLOG_STALE_AFTER_SECONDS", "1800"))
+# Same idea for sFlow. Shorter than syslog's window because sFlow is
+# continuous by nature - a switch with any traffic at all samples
+# constantly, so silence means the pipeline is broken rather than "nothing
+# happened to be said".
+SFLOW_STALE_AFTER_SECONDS = int(os.environ.get("SFLOW_STALE_AFTER_SECONDS", "600"))
 PAGER = paging.PagingController(ALERTMANAGER, PAGE_DELAY_SECONDS)
 # Holds placed before an alarm exists as an occurrence, keyed by signature.
 # A hold has to be in place *before* Alertmanager dispatches (group_wait is
@@ -109,6 +114,9 @@ PROMETHEUS_RELOAD_URL = os.environ.get("PROMETHEUS_RELOAD_URL", "http://promethe
 # Not scraped by the webui (Prometheus does that) - held only so the
 # Settings page can report whether the exporter is actually reachable.
 EXPORTER_URL = os.environ.get("EXPORTER_URL", "http://s4048-exporter:9101")
+# Where sfacctd runs. Never connected to - flows arrive via Postgres - but
+# named by the health panel so "no flows" comes with somewhere to look.
+SFLOW_COLLECTOR = os.environ.get("SFLOW_COLLECTOR", "")
 
 # Deployment config (Postgres DSN, Loki URL) lives in a small JSON file on
 # the webui-data volume, editable from the in-app Settings page - see
@@ -1029,13 +1037,16 @@ def _apply_service_settings(settings_dict):
     precisely when it's needed. An admin whose Postgres is down must still
     be able to correct the Alertmanager or Loki address."""
     global LOKI_URL, LOKI, ALERTMANAGER_URL, PROMETHEUS_URL, PROMETHEUS_RELOAD_URL
-    global EXPORTER_URL, ALERTMANAGER, PAGER
+    global EXPORTER_URL, ALERTMANAGER, PAGER, SFLOW_COLLECTOR
     LOKI_URL = settings_dict.get("loki_url") or settings_store.DEFAULT_LOKI_URL
     LOKI = LokiClient(LOKI_URL)
     ALERTMANAGER_URL = settings_dict.get("alertmanager_url") or ALERTMANAGER_URL
     PROMETHEUS_URL = settings_dict.get("prometheus_url") or PROMETHEUS_URL
     PROMETHEUS_RELOAD_URL = settings_store.reload_url_for(settings_dict) or PROMETHEUS_RELOAD_URL
     EXPORTER_URL = settings_dict.get("exporter_url") or EXPORTER_URL
+    # Blank is a legitimate value here ("not recorded"), so this one is
+    # assigned as given rather than falling back to the previous value.
+    SFLOW_COLLECTOR = settings_dict.get("sflow_collector", SFLOW_COLLECTOR) or ""
     # Rebuilt rather than mutated so a URL change takes effect immediately
     # instead of at the next restart. PAGER holds its own reference to the
     # client, so it has to be rebuilt too or it keeps talking to the old
@@ -1149,6 +1160,8 @@ class SettingsUpdateRequest(BaseModel):
     # prometheus_url" (settings.reload_url_for).
     prometheus_reload_url: Optional[str] = None
     exporter_url: Optional[str] = None
+    # Blank is meaningful: "collector address not recorded".
+    sflow_collector: Optional[str] = None
 
 
 @app.get("/api/setup/status")
@@ -1236,6 +1249,7 @@ def api_get_settings(user: str = Depends(require_auth)):
         "prometheus_url": PROMETHEUS_URL,
         "prometheus_reload_url": PROMETHEUS_RELOAD_URL,
         "exporter_url": EXPORTER_URL,
+        "sflow_collector": SFLOW_COLLECTOR,
         "db_error": DB_ERROR,
     }
 
@@ -1311,6 +1325,29 @@ def api_settings_health(user: str = Depends(require_auth)):
             checks.append({"name": "Syslog flow", "target": LOKI_URL, "ok": False,
                            "detail": f"could not query Loki: {e}"})
 
+    # sFlow health is "are flows arriving", not "can we reach the
+    # collector": sfacctd listens on UDP and exposes no HTTP or TCP
+    # endpoint, so a connection probe would read red while it worked
+    # perfectly. Freshness also covers every failure mode - collector
+    # down, switch stopped sampling, network path lost - rather than one.
+    if SFLOW is not None and STORE is not None and DB_ERROR is None:
+        target = SFLOW_COLLECTOR or "collector address not set"
+        try:
+            age = SFLOW.newest_age_seconds()
+            if age is None:
+                checks.append({"name": "sFlow flow", "target": target, "ok": False,
+                               "detail": "no flow records have ever arrived"})
+            else:
+                checks.append({
+                    "name": "sFlow flow", "target": target,
+                    "ok": age <= SFLOW_STALE_AFTER_SECONDS,
+                    "detail": (f"last flow {age/60:.0f} min ago" if age > 90
+                               else f"last flow {age:.0f}s ago"),
+                })
+        except Exception as e:
+            checks.append({"name": "sFlow flow", "target": target, "ok": False,
+                           "detail": f"could not query flows: {e}"})
+
     for name, url, path in (
         ("Loki", LOKI_URL, "/ready"),
         ("Alertmanager", ALERTMANAGER_URL, "/-/healthy"),
@@ -1320,6 +1357,15 @@ def api_settings_health(user: str = Depends(require_auth)):
         base = (url or "").rstrip("/")
         ok_, detail = _probe(f"{base}{path}" if base else "")
         checks.append({"name": name, "target": url, "ok": ok_, "detail": detail})
+
+    # Two of these ask "is data still arriving?", not "does the endpoint
+    # answer?". A stale pipeline and an unreachable host are different
+    # failures with different first moves, so the panel must not call
+    # them by the same word - Loki answered /ready for the whole seven
+    # days that no syslog was reaching it.
+    flow_checks = {"Syslog flow", "sFlow flow"}
+    for c in checks:
+        c["kind"] = "flow" if c["name"] in flow_checks else "reach"
 
     return {"checks": checks}
 
@@ -1336,7 +1382,8 @@ def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_
         submitted = submitted.strip()
         # prometheus_reload_url is legitimately blank (it derives from
         # prometheus_url); the rest fall back rather than being blanked.
-        new_settings[key] = submitted or ("" if key == "prometheus_reload_url" else fallback)
+        blank_ok = key in ("prometheus_reload_url", "sflow_collector")
+        new_settings[key] = submitted or ("" if blank_ok else fallback)
 
     # The service URLs are applied and saved first, and never gated behind
     # Postgres: this page is where a broken deployment gets fixed, so an

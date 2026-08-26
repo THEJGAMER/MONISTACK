@@ -36,6 +36,12 @@ SERVICE_SETTINGS = (
     # Not used to scrape (Prometheus does that) - only so the Settings page
     # can show whether the exporter is actually up.
     ("exporter_url", "EXPORTER_URL", "http://s4048-exporter:9101"),
+    # Where sfacctd listens. The webui never talks to it - flows arrive via
+    # Postgres - so this is not a connection string but the address the
+    # health panel names when sFlow goes quiet, so "no flows" comes with
+    # "and here is the host to go and look at". host:port, e.g.
+    # "192.168.0.155:6343".
+    ("sflow_collector", "SFLOW_COLLECTOR", ""),
 )
 
 

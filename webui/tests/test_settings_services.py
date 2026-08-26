@@ -257,3 +257,113 @@ def test_a_failing_freshness_query_does_not_break_the_panel(broken_db_client, mo
 
     assert checks["Syslog flow"]["ok"] is False
     assert "Alertmanager" in checks and checks["Alertmanager"]["ok"] is True
+
+
+# --- sFlow collector + flow health -----------------------------------
+# The collector address is configuration, not a connection string: the
+# webui never talks to sfacctd (flows arrive via Postgres). It exists so
+# the health row can say *where to look* when sFlow goes quiet.
+
+class _FakeSflow:
+    def __init__(self, age=None, raises=False):
+        self.age, self.raises = age, raises
+
+    def newest_age_seconds(self):
+        if self.raises:
+            raise RuntimeError("db gone")
+        return self.age
+
+
+def _healthy_db(monkeypatch):
+    monkeypatch.setattr(app_module, "STORE", object())
+    monkeypatch.setattr(app_module, "DB_ERROR", None)
+    monkeypatch.setattr(app_module, "_probe", lambda url, timeout=3: (True, "HTTP 200"))
+    return TestClient(app_module.app)
+
+
+def _checks(client):
+    client.cookies.set("switchboard_session", _session_cookie(app_module, "viewer"))
+    resp = client.get("/api/settings/health")
+    assert resp.status_code == 200, resp.text
+    return {c["name"]: c for c in resp.json()["checks"]}
+
+
+def test_recent_flows_report_healthy(monkeypatch):
+    monkeypatch.setattr(app_module, "SFLOW", _FakeSflow(age=8))
+    monkeypatch.setattr(app_module, "SFLOW_COLLECTOR", "192.168.0.155:6343")
+    row = _checks(_healthy_db(monkeypatch))["sFlow flow"]
+
+    assert row["ok"] is True
+    assert "8s ago" in row["detail"]
+    assert row["target"] == "192.168.0.155:6343", "the row must name where to look"
+
+
+def test_a_stale_pipeline_is_a_failure(monkeypatch):
+    """The failure this exists to catch - the same shape as Vector being
+    found stopped for seven days while everything else looked fine."""
+    monkeypatch.setattr(app_module, "SFLOW", _FakeSflow(age=7 * 24 * 3600))
+    monkeypatch.setattr(app_module, "SFLOW_COLLECTOR", "192.168.0.155:6343")
+
+    assert _checks(_healthy_db(monkeypatch))["sFlow flow"]["ok"] is False
+
+
+def test_never_having_received_a_flow_is_distinguished_from_stale(monkeypatch):
+    monkeypatch.setattr(app_module, "SFLOW", _FakeSflow(age=None))
+    row = _checks(_healthy_db(monkeypatch))["sFlow flow"]
+
+    assert row["ok"] is False
+    # "nothing has ever arrived" needs different advice from "it stopped",
+    # so the two must not share wording.
+    assert "ever arrived" in row["detail"]
+    assert "ago" not in row["detail"]
+
+
+def test_an_unset_collector_still_reports_flow_health(monkeypatch):
+    """The address is a convenience for diagnosis; not having recorded it
+    must not disable the check that actually matters."""
+    monkeypatch.setattr(app_module, "SFLOW", _FakeSflow(age=5))
+    monkeypatch.setattr(app_module, "SFLOW_COLLECTOR", "")
+    row = _checks(_healthy_db(monkeypatch))["sFlow flow"]
+
+    assert row["ok"] is True
+    assert "not set" in row["target"]
+
+
+def test_a_failing_flow_query_does_not_break_the_panel(monkeypatch):
+    monkeypatch.setattr(app_module, "SFLOW", _FakeSflow(raises=True))
+    checks = _checks(_healthy_db(monkeypatch))
+
+    assert checks["sFlow flow"]["ok"] is False
+    assert checks["Alertmanager"]["ok"] is True, "one failing check must not hide the rest"
+
+
+def test_the_collector_address_round_trips_through_settings(monkeypatch):
+    """Blank is a legitimate value ("not recorded"), so it must not fall
+    back to a default the way the URL settings do."""
+    saved = {}
+    monkeypatch.setattr(app_module, "STORE", object())
+    monkeypatch.setattr(app_module, "DB_ERROR", None)
+    monkeypatch.setattr(app_module.settings_store, "load", lambda: {"database_url": "postgresql://u:p@h/db"})
+    monkeypatch.setattr(app_module.settings_store, "save", lambda d: saved.update(d))
+    monkeypatch.setattr(app_module, "_apply_settings", lambda d: None)
+    monkeypatch.setattr(app_module, "_apply_service_settings", lambda d: None)
+    client = TestClient(app_module.app)
+    client.cookies.set("switchboard_session", _session_cookie(app_module, "admin"))
+
+    assert client.put("/api/settings", json={"sflow_collector": "10.1.1.5:6343"}).status_code == 200
+    assert saved["sflow_collector"] == "10.1.1.5:6343"
+
+    assert client.put("/api/settings", json={"sflow_collector": ""}).status_code == 200
+    assert saved["sflow_collector"] == "", "blank must stay blank, not revert to a default"
+
+
+def test_flow_checks_are_labelled_apart_from_reachability_checks(monkeypatch):
+    """A stale pipeline is not an unreachable host, and the panel is what
+    someone reads before deciding which one to go and debug."""
+    monkeypatch.setattr(app_module, "SFLOW", _FakeSflow(age=5))
+    checks = _checks(_healthy_db(monkeypatch))
+
+    assert checks["sFlow flow"]["kind"] == "flow"
+    assert checks["Syslog flow"]["kind"] == "flow"
+    assert checks["Loki"]["kind"] == "reach"
+    assert checks["Postgres"]["kind"] == "reach"

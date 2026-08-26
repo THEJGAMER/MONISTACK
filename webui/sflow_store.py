@@ -171,6 +171,25 @@ class SFlowStore:
             log.warning("could not check sflow availability", exc_info=True)
             return False
 
+    def newest_age_seconds(self):
+        """Seconds since the last flow record arrived, or None if the table
+        is empty.
+
+        The health signal for sFlow. Deliberately *not* a reachability
+        probe of the collector: sfacctd listens on UDP and exposes no
+        HTTP or TCP endpoint, so a connection test against it would fail
+        even when it is working perfectly - a check that is always red is
+        worse than no check. Whether flows are arriving is the thing that
+        actually matters, and it covers every way the pipeline can break
+        (collector down, switch stopped sampling, network path lost)
+        rather than just one.
+        """
+        row = self.db.query_one(
+            "SELECT EXTRACT(EPOCH FROM (now() - MAX(stamp_inserted))) AS age FROM sflow_flows"
+        )
+        age = (row or {}).get("age")
+        return None if age is None else max(0.0, float(age))
+
     def agents(self, since_minutes=60):
         """Switches that have sent flows recently, newest activity first."""
         where, params = self._window(since_minutes)
