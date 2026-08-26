@@ -425,6 +425,37 @@ CREATE INDEX IF NOT EXISTS idx_sflow_stamp ON sflow_flows(stamp_inserted DESC);
 CREATE INDEX IF NOT EXISTS idx_sflow_agent ON sflow_flows(peer_ip_src, stamp_inserted DESC);
 CREATE INDEX IF NOT EXISTS idx_sflow_iface ON sflow_flows(peer_ip_src, iface_in, stamp_inserted DESC);
 
+-- NetFlow, from the firewall rather than the switches. Same shape as
+-- sflow_flows and written by the same pmacct codebase (nfacctd instead of
+-- sfacctd, since pmacct uses one binary per protocol), but a separate
+-- table on purpose.
+--
+-- The two measure the same traffic from different vantage points, so
+-- summing them is wrong: a LAN host talking to the internet crosses both
+-- the S4048 and OPNsense and would be counted twice in any total. They
+-- also differ in kind - sFlow is 1:1024 sampled and renormalized into an
+-- estimate, while this is every flow the firewall saw. Keeping them apart
+-- means a query has to state which vantage point it means instead of
+-- quietly blending an estimate with an exact count.
+CREATE TABLE IF NOT EXISTS netflow_flows (
+    id BIGSERIAL PRIMARY KEY,
+    peer_ip_src TEXT NOT NULL,
+    iface_in BIGINT,
+    iface_out BIGINT,
+    ip_src TEXT,
+    ip_dst TEXT,
+    port_src INTEGER,
+    port_dst INTEGER,
+    ip_proto TEXT,
+    packets BIGINT NOT NULL DEFAULT 0,
+    bytes BIGINT NOT NULL DEFAULT 0,
+    stamp_inserted TIMESTAMPTZ NOT NULL DEFAULT now(),
+    stamp_updated TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_netflow_stamp ON netflow_flows(stamp_inserted DESC);
+CREATE INDEX IF NOT EXISTS idx_netflow_agent ON netflow_flows(peer_ip_src, stamp_inserted DESC);
+CREATE INDEX IF NOT EXISTS idx_netflow_iface ON netflow_flows(peer_ip_src, iface_in, stamp_inserted DESC);
+
 -- sFlow reports interfaces as SNMP ifIndex integers, which mean nothing to
 -- a human. Dell OS9 encodes them arithmetically (verified against the real
 -- switch), but Junos does not - its values are irregular (501, 503, 525,

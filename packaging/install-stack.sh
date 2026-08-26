@@ -36,9 +36,6 @@ SB_DATA="$SB_HOME/data"
 SB_CONF=/etc/switchboard
 ALERT_RULES_FILE="$SB_DATA/prometheus-alerts.yml"
 SFLOW_CONF=/etc/pmacct/sfacctd.conf
-# /run, not /var/run: systemd warns about PIDFile= under the legacy path,
-# and the collector config is generated to match this.
-SFLOW_PIDFILE=/run/sfacctd.pid
 SFLOW_MARKER=/etc/pmacct/.switchboard-commit
 
 ASSUME_YES=0
@@ -1092,13 +1089,13 @@ install_sflow() {
   run mkdir -p /etc/pmacct
   if [[ $DRY_RUN -eq 0 ]]; then
     SB_PORT="$port" SB_HOST="$db_host" SB_DB="$db_name" SB_USER="$db_user" \
-    SB_PASS="$db_pass" SB_PID="$SFLOW_PIDFILE" \
+    SB_PASS="$db_pass" \
     python3 - "$REPO_DIR/sflow/sfacctd.conf" "$SFLOW_CONF" <<'PY'
 import os, re, sys
 src, dst = sys.argv[1], sys.argv[2]
 subs = {"sfacctd_port": os.environ["SB_PORT"], "sql_host": os.environ["SB_HOST"],
         "sql_db": os.environ["SB_DB"], "sql_user": os.environ["SB_USER"],
-        "sql_passwd": os.environ["SB_PASS"], "pidfile": os.environ["SB_PID"]}
+        "sql_passwd": os.environ["SB_PASS"]}
 out, seen = [], set()
 for line in open(src):
     m = re.match(r"^(\s*)([a-z_]+)(\s*:\s*)(.*)$", line)
@@ -1120,6 +1117,14 @@ PY
     write_commit_marker "$SFLOW_MARKER"
   fi
 
+  # Type=simple with `daemonize: false` in the config, not Type=forking
+  # with a PIDFile. The forking form is racy both ways: systemd can read
+  # the pid file before pmacct writes it, and a stale one makes it adopt
+  # a process it does not own ("Supervising process N which is not our
+  # child") - after which the unit reports success while nothing is
+  # collecting. Hit live on the NetFlow daemon. This also puts pmacct's
+  # own logging in the journal.
+  #
   # PGPORT because pmacct's pgsql plugin has no sql_port setting - it
   # hands libpq a NULL port and takes the default. On a non-5432 Postgres
   # that is a connection to nowhere, with the port you carefully entered
@@ -1131,8 +1136,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=forking
-PIDFile=$SFLOW_PIDFILE
+Type=simple
 Environment=PGPORT=$db_port
 ExecStart=/usr/sbin/sfacctd -f $SFLOW_CONF
 Restart=on-failure
