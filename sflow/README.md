@@ -39,6 +39,32 @@ Two settings that are not optional and cost real time to discover:
   colliding with the webui, which is the real creator of the table
   (`ERROR: relation "sflow_flows" already exists` on every purge).
 
+## Installing a collector
+
+```bash
+sudo packaging/install-stack.sh --bundle collector
+```
+
+Installs pmacct, asks for the listen port and the Postgres details, and
+**tests both before writing any config**: that the database is reachable,
+that `sflow_flows` exists, and that the user can actually INSERT into it.
+That last check is the one worth having - a read-only user lets sfacctd
+start, connect, and look healthy while discarding every 60s flush into a
+log nobody is tailing.
+
+After starting the service it sends one synthetic sFlow datagram and waits
+for it to appear in Postgres, which proves the whole path without any
+switch being configured yet, then deletes the test rows.
+
+To ask what is arriving on a port without installing anything:
+
+```bash
+sudo packaging/install-stack.sh --test-sflow 6343
+```
+
+It reports each sender's IP and its **agent-id separately**, because those
+differ more often than expected - see "Agent identity" below.
+
 ## Verifying without touching the switches
 
 ```bash
