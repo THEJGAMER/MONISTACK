@@ -16,16 +16,53 @@ import AreaChart from "@cloudscape-design/components/area-chart";
 import BarChart from "@cloudscape-design/components/bar-chart";
 import Toggle from "@cloudscape-design/components/toggle";
 import TextFilter from "@cloudscape-design/components/text-filter";
+import DateRangePicker from "@cloudscape-design/components/date-range-picker";
 
 import { getSflowOverview, getSflowPort, getSflowHost } from "./api.js";
 
-const WINDOWS = [
-  { label: "Last 15 minutes", value: "15" },
-  { label: "Last hour", value: "60" },
-  { label: "Last 6 hours", value: "360" },
-  { label: "Last 24 hours", value: "1440" },
-  { label: "Last 7 days", value: "10080" },
-];
+// One control for the entire page. Every panel here - the tiles, the
+// chart and all four tables - is served by a single request carrying this
+// window, and the drill-down modals carry it too, so there is never a
+// panel showing a different span from the one named at the top.
+const RANGE_PRESETS = [
+  { key: "1h",  amount: 1,  unit: "hour" },
+  { key: "3h",  amount: 3,  unit: "hour" },
+  { key: "6h",  amount: 6,  unit: "hour" },
+  { key: "12h", amount: 12, unit: "hour" },
+  { key: "1d",  amount: 1,  unit: "day" },
+  { key: "7d",  amount: 7,  unit: "day" },
+].map((r) => ({ ...r, type: "relative" }));
+
+const DEFAULT_RANGE = { type: "relative", amount: 1, unit: "hour", key: "1h" };
+
+const UNIT_MINUTES = { second: 1 / 60, minute: 1, hour: 60, day: 1440, week: 10080, month: 43200, year: 525600 };
+
+// The picker speaks relative-or-absolute; the API speaks minutes-or-ISO.
+// Absolute ranges are converted to UTC here because the server treats a
+// naive timestamp as UTC, and letting the browser's local offset go
+// unstated would shift the window by hours without saying so.
+function rangeToQuery(range) {
+  if (!range) return { minutes: 60 };
+  if (range.type === "absolute") {
+    return {
+      minutes: 60,
+      start: new Date(range.startDate).toISOString(),
+      end: new Date(range.endDate).toISOString(),
+    };
+  }
+  const mins = Math.max(1, Math.round(range.amount * (UNIT_MINUTES[range.unit] || 1)));
+  return { minutes: mins };
+}
+
+function rangeLabel(range) {
+  if (!range) return "";
+  if (range.type === "absolute") {
+    const fmt = (d) => new Date(d).toLocaleString();
+    return `${fmt(range.startDate)} to ${fmt(range.endDate)}`;
+  }
+  const n = range.amount;
+  return `last ${n} ${range.unit}${n === 1 ? "" : "s"}`;
+}
 
 function bytes(n) {
   const v = Number(n || 0);
@@ -36,7 +73,7 @@ function bytes(n) {
 }
 
 export default function SflowPage({ devices, pushFlash }) {
-  const [minutes, setMinutes] = useState(WINDOWS[1]);
+  const [range, setRange] = useState(DEFAULT_RANGE);
   const [agent, setAgent] = useState({ label: "All switches", value: "" });
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -62,14 +99,14 @@ export default function SflowPage({ devices, pushFlash }) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setData(await getSflowOverview({ minutes: Number(minutes.value), agent: agent.value || undefined }));
+      setData(await getSflowOverview({ ...rangeToQuery(range), agent: agent.value || undefined }));
     } catch (e) {
       pushFlash("error", `Could not load sFlow data: ${e.message}`);
       setData(null);
     } finally {
       setLoading(false);
     }
-  }, [minutes, agent, pushFlash]);
+  }, [range, agent, pushFlash]);
 
   useEffect(() => {
     load();
@@ -86,7 +123,7 @@ export default function SflowPage({ devices, pushFlash }) {
 
   async function openHost(host) {
     try {
-      setHostDrill(await getSflowHost(host, { minutes: Number(minutes.value), agent: agent.value || undefined }));
+      setHostDrill(await getSflowHost(host, { ...rangeToQuery(range), agent: agent.value || undefined }));
     } catch (e) {
       pushFlash("error", `Could not load host detail: ${e.message}`);
     }
@@ -122,7 +159,7 @@ export default function SflowPage({ devices, pushFlash }) {
       // Scoped to the switch that owns this ifIndex, not the page filter -
       // otherwise the drill-down mixes two switches' identically-numbered
       // interfaces together.
-      setDrill(await getSflowPort(iface, { minutes: Number(minutes.value), agent: agentIp }));
+      setDrill(await getSflowPort(iface, { ...rangeToQuery(range), agent: agentIp }));
     } catch (e) {
       pushFlash("error", `Could not load port detail: ${e.message}`);
     }
@@ -157,15 +194,67 @@ export default function SflowPage({ devices, pushFlash }) {
 
   return (
     <SpaceBetween size="l">
+      {data?.clamped_to_days ? (
+        <Alert type="info" header="Showing a shorter range than requested">
+          These views aggregate every flow record in the range, so they are capped at{" "}
+          {data.clamped_to_days} days. The most recent {data.clamped_to_days} days of the range
+          you picked are shown. Nothing has been deleted - the older data is still there.
+        </Alert>
+      ) : null}
       <Container
         header={
           <Header
             variant="h2"
-            description="Traffic sampled by the switches themselves and collected by sfacctd. Counts are raw sampled bytes (1 packet in 1024), not scaled to real traffic - proportional and comparable between switches, but not absolute volumes."
+            description={
+              // The window is named once, here, because it governs every
+              // panel below - naming it per panel would invite the reader
+              // to think each could differ.
+              `Traffic sampled by the switches themselves (1 packet in 1024) and scaled back up by sfacctd, so these are estimates of real traffic. `
+              + `Showing ${rangeLabel(range)} across every panel on this page.`
+            }
             actions={
               <SpaceBetween size="xs" direction="horizontal" alignItems="center">
                 <Toggle checked={auto} onChange={({ detail }) => setAuto(detail.checked)}>Auto</Toggle>
-                <Select selectedOption={minutes} onChange={({ detail }) => setMinutes(detail.selectedOption)} options={WINDOWS} />
+                <DateRangePicker
+                  value={range}
+                  onChange={({ detail }) => setRange(detail.value)}
+                  relativeOptions={RANGE_PRESETS}
+                  rangeSelectorMode="default"
+                  placeholder="Choose a time range"
+                  hideTimeOffset
+                  isValidRange={(r) => {
+                    if (!r) return { valid: false, errorMessage: "Pick a range." };
+                    if (r.type === "absolute") {
+                      if (!r.startDate || !r.endDate) {
+                        return { valid: false, errorMessage: "Both a start and an end date are needed." };
+                      }
+                      if (new Date(r.startDate) >= new Date(r.endDate)) {
+                        return { valid: false, errorMessage: "The start must be before the end." };
+                      }
+                    } else if (!r.amount || r.amount <= 0) {
+                      return { valid: false, errorMessage: "The range must be a positive length." };
+                    }
+                    return { valid: true };
+                  }}
+                  i18nStrings={{
+                    relativeModeTitle: "Relative range",
+                    absoluteModeTitle: "Absolute range",
+                    relativeRangeSelectionHeading: "Choose a range",
+                    customRelativeRangeOptionLabel: "Custom range",
+                    customRelativeRangeOptionDescription: "Any number of minutes, hours or days back from now",
+                    customRelativeRangeUnitLabel: "Unit of time",
+                    customRelativeRangeDurationLabel: "Duration",
+                    startDateLabel: "Start date", startTimeLabel: "Start time",
+                    endDateLabel: "End date", endTimeLabel: "End time",
+                    clearButtonLabel: "Clear", cancelButtonLabel: "Cancel", applyButtonLabel: "Apply",
+                    formatRelativeRange: (r) => `Last ${r.amount} ${r.unit}${r.amount === 1 ? "" : "s"}`,
+                    formatUnit: (unit, n) => (n === 1 ? unit : `${unit}s`),
+                    dateTimeConstraintText: "Local time, applied to every panel on this page.",
+                    todayAriaLabel: "Today",
+                    nextMonthAriaLabel: "Next month",
+                    previousMonthAriaLabel: "Previous month",
+                  }}
+                />
                 <Select selectedOption={agent} onChange={({ detail }) => setAgent(detail.selectedOption)} options={agentOptions} />
                 <Button iconName="refresh" loading={loading} onClick={load}>Refresh</Button>
               </SpaceBetween>
@@ -180,7 +269,7 @@ export default function SflowPage({ devices, pushFlash }) {
         <SpaceBetween size="l">
           <ColumnLayout columns={4} variant="text-grid">
             <div>
-              <Box variant="awsui-key-label">Traffic sampled</Box>
+              <Box variant="awsui-key-label">Traffic (estimated)</Box>
               <Box fontSize="display-l" fontWeight="bold">{bytes(data?.totals?.bytes)}</Box>
             </div>
             <div>
@@ -209,7 +298,7 @@ export default function SflowPage({ devices, pushFlash }) {
             height={220}
             hideFilter
             xTitle="Time"
-            yTitle="Bytes sampled"
+            yTitle="Bytes (estimated)"
             ariaLabel="Sampled traffic over time, stacked by switch"
             i18nStrings={{ xTickFormatter: (t) => t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
                            yTickFormatter: bytes }}
@@ -237,7 +326,7 @@ export default function SflowPage({ devices, pushFlash }) {
           hideLegend
           height={260}
           xTitle="Host"
-          yTitle="Bytes sampled"
+          yTitle="Bytes (estimated)"
           ariaLabel="Sampled traffic by host"
           i18nStrings={{ yTickFormatter: bytes }}
           empty={<Box color="text-status-inactive">No traffic in this window.</Box>}

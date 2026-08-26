@@ -122,21 +122,25 @@ export const getSettingsHealth = () => api("/api/settings/health");
 // sFlow traffic views. One request returns all four panels over the same
 // window - four separate calls could each land in a different window and
 // disagree with each other.
-export const getSflowOverview = ({ minutes = 60, agent, limit = 20 } = {}) => {
-  const p = new URLSearchParams({ minutes: String(minutes), limit: String(limit) });
-  if (agent) p.set("agent", agent);
-  return api(`/api/sflow/overview?${p.toString()}`, undefined, 30_000);
-};
-export const getSflowHost = (host, { minutes = 60, agent } = {}) => {
+// Every sFlow request carries the same window, relative or absolute, so
+// the drill-downs cover exactly the span the page behind them shows.
+const sflowWindow = ({ minutes = 60, agent, start, end } = {}) => {
   const p = new URLSearchParams({ minutes: String(minutes) });
   if (agent) p.set("agent", agent);
-  return api(`/api/sflow/host/${encodeURIComponent(host)}?${p.toString()}`, undefined, 30_000);
+  // Absolute bounds win server-side; minutes is still sent as the
+  // fallback a clamped or unparseable range resolves to.
+  if (start && end) { p.set("start", start); p.set("end", end); }
+  return p;
 };
-export const getSflowPort = (iface, { minutes = 60, agent } = {}) => {
-  const p = new URLSearchParams({ minutes: String(minutes) });
-  if (agent) p.set("agent", agent);
-  return api(`/api/sflow/port/${iface}?${p.toString()}`, undefined, 30_000);
+export const getSflowOverview = (opts = {}) => {
+  const p = sflowWindow(opts);
+  p.set("limit", String(opts.limit ?? 20));
+  return api(`/api/sflow/overview?${p.toString()}`, undefined, 60_000);
 };
+export const getSflowHost = (host, opts = {}) =>
+  api(`/api/sflow/host/${encodeURIComponent(host)}?${sflowWindow(opts).toString()}`, undefined, 60_000);
+export const getSflowPort = (iface, opts = {}) =>
+  api(`/api/sflow/port/${iface}?${sflowWindow(opts).toString()}`, undefined, 60_000);
 
 export const getResult = (filename) => api(`/api/results/${filename}`);
 export const deleteResult = (filename) => api(`/api/results/${filename}`, { method: "DELETE" });

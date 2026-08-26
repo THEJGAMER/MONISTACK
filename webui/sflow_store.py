@@ -11,19 +11,20 @@ so "top talkers over the last hour" is a sum over ~60 rows per flow rather
 than a scan across raw samples.
 
 A note on what these numbers mean: sFlow *samples* - the switch reports
-one packet in N (1:1024 on both switches here). These counts are the raw
-sampled bytes, deliberately **not** scaled up by the sampling rate.
+one packet in N (1:1024 on both switches here). sfacctd renormalizes,
+multiplying each sample by its own sampling rate, so these are estimates
+of real traffic rather than raw sampled bytes.
 
-pmacct can renormalize (multiply by the rate to estimate real traffic),
-and it was tried and measured against ground truth - the SSH-polled
-interface counters this app already collects. It was accurate for the
-Juniper but ~15x too high for the Dell, implying >10 Gbit/s on 10G links.
-So the numbers here are proportional to real traffic and comparable
-between switches, but are not absolute volumes, and the UI says exactly
-that instead of calling them estimates. See sflow/sfacctd.conf.
+Verified against a known load: during a ~40 Gbit/s bidirectional iperf
+run these figures read ~43 Gbit/s, and ~5.1-5.5 Gbit/s across four 10G
+ports, both inside sFlow's sampling variance. An earlier note here said
+renormalisation ran ~15x high on the Dell; that was a bad measurement -
+a 10-minute sFlow window compared against a 30-minute average of the
+SSH-polled counters that was mostly idle - and not a property of the
+switch. See sflow/sfacctd.conf, which records the same correction.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger("webui.sflow")
 
@@ -146,11 +147,49 @@ class SFlowStore:
 
     # --- shared -------------------------------------------------------
 
-    def _window(self, since_minutes, agent_ip=None, iface=None):
+    def resolve_window(self, since_minutes=None, start=None, end=None):
+        """Turns whatever the caller asked for into one concrete
+        (start, end) pair.
+
+        Resolved once per request and then handed to every view, rather
+        than letting each query evaluate now() for itself. Six queries
+        anchoring to six different now()s means the panels on a page
+        cover measurably different spans - the page claims one window and
+        shows several - and the gap widens the slower the page is, which
+        is precisely when someone is studying it closely.
+
+        The clock is the *database's*, not this host's. The webui and
+        Postgres are different machines here, so resolving in Python
+        would shift every window by whatever skew lies between them.
+        sfacctd's timestamps are written on the database side too, so
+        this keeps a single clock across the whole path.
+        """
+        if start is not None and end is not None:
+            return start, end
+        row = self.db.query_one("SELECT now() AS now")
+        now = (row or {}).get("now") or datetime.now(timezone.utc)
+        if end is None:
+            end = now
+        if start is None:
+            start = end - timedelta(minutes=int(since_minutes or 60))
+        return start, end
+
+    def _window(self, since_minutes=None, agent_ip=None, iface=None,
+                start=None, end=None):
         """Builds the WHERE shared by every view. Time always leads, since
         both indexes on this table are (something, stamp_inserted DESC)."""
-        clauses = ["stamp_inserted > now() - (%s || ' minutes')::interval"]
-        params = [str(int(since_minutes))]
+        if start is not None or end is not None:
+            # Half-open: exclusive lower bound, inclusive upper, so two
+            # adjacent windows tile without both claiming the row that
+            # lands exactly on the boundary between them.
+            clauses, params = [], []
+            if start is not None:
+                clauses.append("stamp_inserted > %s"); params.append(start)
+            if end is not None:
+                clauses.append("stamp_inserted <= %s"); params.append(end)
+        else:
+            clauses = ["stamp_inserted > now() - (%s || ' minutes')::interval"]
+            params = [str(int(since_minutes or 60))]
         if agent_ip:
             clauses.append("peer_ip_src = %s")
             params.append(agent_ip)
@@ -190,9 +229,9 @@ class SFlowStore:
         age = (row or {}).get("age")
         return None if age is None else max(0.0, float(age))
 
-    def agents(self, since_minutes=60):
+    def agents(self, since_minutes=60, start=None, end=None):
         """Switches that have sent flows recently, newest activity first."""
-        where, params = self._window(since_minutes)
+        where, params = self._window(since_minutes, start=start, end=end)
         rows = self.db.query(
             f"""SELECT peer_ip_src, COUNT(*) AS flows, SUM(bytes) AS bytes,
                        MAX(stamp_inserted) AS last_seen
@@ -204,8 +243,8 @@ class SFlowStore:
 
     # --- the four views ----------------------------------------------
 
-    def top_talkers(self, since_minutes=60, agent_ip=None, limit=20):
-        where, params = self._window(since_minutes, agent_ip)
+    def top_talkers(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None):
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
         rows = self.db.query(
             f"""SELECT ip_src, ip_dst, SUM(bytes) AS bytes, SUM(packets) AS packets,
                        COUNT(*) AS samples
@@ -216,11 +255,11 @@ class SFlowStore:
         )
         return [dict(r) for r in rows]
 
-    def top_hosts(self, since_minutes=60, agent_ip=None, limit=20):
+    def top_hosts(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None):
         """Per-host totals, counting a host's traffic in both directions -
         "who is using the bandwidth" rather than "which pair is busiest".
         A conversation view alone hides a host spread across many peers."""
-        where, params = self._window(since_minutes, agent_ip)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
         rows = self.db.query(
             f"""SELECT host, SUM(bytes) AS bytes, SUM(packets) AS packets FROM (
                     SELECT ip_src AS host, bytes, packets FROM sflow_flows WHERE {where}
@@ -232,12 +271,12 @@ class SFlowStore:
         )
         return [dict(r) for r in rows]
 
-    def protocol_mix(self, since_minutes=60, agent_ip=None, limit=20):
+    def protocol_mix(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None):
         """Traffic by service. Keyed on the *lower* of the two ports:
         an ephemeral source port is noise, and the well-known side is what
         identifies the service - without this, one HTTPS server appears as
         hundreds of separate rows, one per client port."""
-        where, params = self._window(since_minutes, agent_ip)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
         rows = self.db.query(
             f"""SELECT ip_proto,
                        LEAST(COALESCE(port_src, 65535), COALESCE(port_dst, 65535)) AS port,
@@ -256,7 +295,7 @@ class SFlowStore:
         return out
 
     def per_port(self, since_minutes=60, agent_ip=None, platform_for=None,
-                 cached_for=None, limit=50):
+                 cached_for=None, limit=50, start=None, end=None):
         """Traffic per switch interface, in and out kept separate so a
         one-directional problem (a port only ever receiving) is visible
         rather than averaged away.
@@ -269,7 +308,7 @@ class SFlowStore:
         `platform_for` is a callable agent_ip -> platform (or None), so
         each row is decoded with its own switch's encoding rather than one
         platform applied to every agent."""
-        where, params = self._window(since_minutes, agent_ip)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
         rows = self.db.query(
             f"""SELECT peer_ip_src, iface, SUM(in_bytes) AS in_bytes, SUM(out_bytes) AS out_bytes,
                        SUM(in_pkts) AS in_packets, SUM(out_pkts) AS out_packets FROM (
@@ -294,7 +333,7 @@ class SFlowStore:
             out.append(d)
         return out
 
-    def timeseries(self, since_minutes=60, agent_ip=None, bucket_seconds=None):
+    def timeseries(self, since_minutes=60, agent_ip=None, bucket_seconds=None, start=None, end=None):
         """Bytes per time bucket per agent - the one thing the tables on
         this page cannot show, since every other view collapses time away.
 
@@ -304,8 +343,11 @@ class SFlowStore:
         to render and less legible than the ~150 a chart actually needs.
         """
         if bucket_seconds is None:
-            bucket_seconds = self.bucket_for(since_minutes)
-        where, params = self._window(since_minutes, agent_ip)
+            span = since_minutes
+            if start is not None and end is not None:
+                span = max(1, (end - start).total_seconds() / 60)
+            bucket_seconds = self.bucket_for(span)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
         rows = self.db.query(
             f"""SELECT peer_ip_src,
                        to_timestamp(floor(extract(epoch FROM stamp_inserted) / %s) * %s) AS bucket,
@@ -333,11 +375,11 @@ class SFlowStore:
                 return seconds
         return 21600
 
-    def host_detail(self, host, since_minutes=60, agent_ip=None, limit=30):
+    def host_detail(self, host, since_minutes=60, agent_ip=None, limit=30, start=None, end=None):
         """Everything involving one address, in both directions - the
         answer to "what is this machine actually doing", which none of the
         aggregate views can give."""
-        where, params = self._window(since_minutes, agent_ip)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
         rows = self.db.query(
             f"""SELECT ip_src, ip_dst, ip_proto,
                        LEAST(COALESCE(port_src, 65535), COALESCE(port_dst, 65535)) AS port,
@@ -357,10 +399,10 @@ class SFlowStore:
             out.append(d)
         return out
 
-    def totals(self, since_minutes=60, agent_ip=None):
+    def totals(self, since_minutes=60, agent_ip=None, start=None, end=None):
         """Headline figures for the stat row. A single number is a stat
         tile, not a chart - see the page."""
-        where, params = self._window(since_minutes, agent_ip)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end)
         row = self.db.query_one(
             f"""SELECT COALESCE(SUM(bytes),0) AS bytes, COALESCE(SUM(packets),0) AS packets,
                        COUNT(*) AS records,
@@ -371,10 +413,10 @@ class SFlowStore:
         )
         return dict(row) if row else {}
 
-    def port_detail(self, iface, since_minutes=60, agent_ip=None, limit=20):
+    def port_detail(self, iface, since_minutes=60, agent_ip=None, limit=20, start=None, end=None):
         """What is actually crossing one interface - the drill-down from
         the per-port view."""
-        where, params = self._window(since_minutes, agent_ip, iface=iface)
+        where, params = self._window(since_minutes, agent_ip, iface=iface, start=start, end=end)
         rows = self.db.query(
             f"""SELECT ip_src, ip_dst, ip_proto,
                        LEAST(COALESCE(port_src, 65535), COALESCE(port_dst, 65535)) AS port,

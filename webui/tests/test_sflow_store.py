@@ -399,3 +399,99 @@ def test_totals_are_zero_not_null_on_an_empty_window(store):
     t = store.totals(since_minutes=60)
 
     assert int(t["bytes"]) == 0 and int(t["records"]) == 0
+
+
+# --- the time window -------------------------------------------------
+# One control drives every panel on the sFlow page, so the window has to
+# mean exactly the same thing to all of them.
+
+from datetime import timedelta  # noqa: E402
+
+
+def _now(store):
+    return store.db.query_one("SELECT now() AS now")["now"]
+
+
+def test_an_absolute_window_excludes_flows_outside_it(store):
+    _flow(store, "10.0.0.1", "8.8.8.8", 100, age_minutes=200)   # before
+    _flow(store, "10.0.0.2", "8.8.8.8", 200, age_minutes=120)   # inside
+    _flow(store, "10.0.0.3", "8.8.8.8", 400, age_minutes=10)    # after
+    now = _now(store)
+
+    rows = store.top_talkers(start=now - timedelta(minutes=180), end=now - timedelta(minutes=60))
+
+    assert [r["ip_src"] for r in rows] == ["10.0.0.2"]
+
+
+def test_the_window_is_half_open_so_adjacent_ranges_do_not_double_count(store):
+    """Two ranges that meet at a boundary must together count each row
+    once - a chart built from tiled windows would otherwise show a spike
+    at every join."""
+    # Inserted at a timestamp equal to the boundary itself. Deriving the
+    # row's age and the boundary separately does not test this: `now()`
+    # advances between the two, the row lands just inside one window, and
+    # the boundary rule is never exercised at all.
+    edge = _now(store) - timedelta(minutes=30)
+    store.db.execute(
+        """INSERT INTO sflow_flows (peer_ip_src, ip_src, ip_dst, packets, bytes, stamp_inserted)
+           VALUES ('192.168.4.106', '10.0.0.1', '8.8.8.8', 1, 100, %s)""", (edge,))
+
+    older = store.totals(start=edge - timedelta(minutes=30), end=edge)
+    newer = store.totals(start=edge, end=_now(store))
+
+    assert int(older["records"] or 0) == 1, "a row on the boundary belongs to the window ending there"
+    assert int(newer["records"] or 0) == 0, "and not also to the one starting there"
+
+
+def test_resolve_window_turns_minutes_into_concrete_bounds(store):
+    start, end = store.resolve_window(since_minutes=90)
+
+    assert (end - start) == timedelta(minutes=90)
+    # Anchored to the database's clock, not this process's - the two run
+    # on different hosts in production.
+    assert abs((end - _now(store)).total_seconds()) < 5
+
+
+def test_resolve_window_leaves_an_explicit_range_alone(store):
+    a, b = _now(store) - timedelta(days=3), _now(store) - timedelta(days=1)
+
+    assert store.resolve_window(since_minutes=60, start=a, end=b) == (a, b)
+
+
+def test_every_view_agrees_when_handed_one_resolved_window(store):
+    """The property the whole page rests on. Before this, each view
+    evaluated now() in its own query, so a slow page could show panels
+    covering measurably different spans while claiming one range."""
+    _flow(store, "10.0.0.1", "8.8.8.8", 100, age_minutes=5)
+    _flow(store, "10.0.0.2", "8.8.8.8", 200, age_minutes=400)
+    start, end = store.resolve_window(since_minutes=60)
+    win = {"start": start, "end": end}
+
+    assert int(store.totals(**win)["records"]) == 1
+    assert len(store.top_talkers(**win)) == 1
+    assert len(store.top_hosts(**win)) == 2          # both ends of the one flow
+    assert len(store.agents(**win)) == 1
+    assert len(store.protocol_mix(**win)) == 1
+    assert sum(len(v) for v in store.timeseries(**win)["series"].values()) == 1
+
+
+def test_bucket_size_follows_the_absolute_span_not_the_minutes_default(store):
+    """An absolute range leaves `since_minutes` at its default, so a
+    chart over a week would be bucketed as if it were an hour - 10,080
+    points per series instead of the ~150 a chart can show."""
+    now = _now(store)
+    week = store.timeseries(start=now - timedelta(days=7), end=now)
+    hour = store.timeseries(start=now - timedelta(hours=1), end=now)
+
+    assert week["bucket_seconds"] > hour["bucket_seconds"]
+    assert week["bucket_seconds"] == store.bucket_for(7 * 24 * 60)
+
+
+def test_relative_windows_still_work_untouched(store):
+    """The absolute path is additive: nothing that only passes minutes
+    should change behaviour."""
+    _flow(store, "10.0.0.1", "8.8.8.8", 100, age_minutes=5)
+    _flow(store, "10.0.0.2", "8.8.8.8", 200, age_minutes=400)
+
+    assert len(store.top_talkers(since_minutes=60)) == 1
+    assert len(store.top_talkers(since_minutes=600)) == 2

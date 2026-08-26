@@ -3357,24 +3357,85 @@ def _sflow_agent_label(agent_ip):
     return None
 
 
+# The widest absolute range the sFlow views will run. Not a retention
+# limit - nothing is deleted, and all history is kept on purpose - but a
+# query bound: these are GROUP BYs over every row in the span, and at
+# ~340k rows/day a year's range is a hundred million rows and a page that
+# appears to hang. A clamped request still succeeds and reports the window
+# it actually used, so the UI can say so rather than quietly showing
+# something narrower than was asked for.
+SFLOW_MAX_SPAN_DAYS = int(os.environ.get("SFLOW_MAX_SPAN_DAYS", "92"))
+
+
+def _sflow_window(minutes, start, end):
+    """Resolves the time range for one request, once, for every view.
+
+    Returns (start, end, clamped). Absolute bounds win over `minutes`
+    when both are given, since an explicit range is the more specific
+    request.
+    """
+    def _parse(v):
+        if not v:
+            return None
+        try:
+            # The browser sends a trailing Z, which fromisoformat only
+            # accepts from 3.11 - normalise rather than reject.
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(400, f"not a valid ISO 8601 timestamp: {v}")
+        # A naive timestamp is ambiguous and guessing wrong shifts the
+        # whole window silently. UTC is what the UI sends.
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    start_dt, end_dt = _parse(start), _parse(end)
+    if start_dt and end_dt and start_dt >= end_dt:
+        raise HTTPException(400, "start must be before end")
+
+    minutes = max(1, min(int(minutes), 10080))
+    start_dt, end_dt = SFLOW.resolve_window(since_minutes=minutes, start=start_dt, end=end_dt)
+
+    clamped = False
+    widest = timedelta(days=SFLOW_MAX_SPAN_DAYS)
+    if end_dt - start_dt > widest:
+        # Keep the end and move the start: someone asking for a very wide
+        # range almost always wants the recent end of it.
+        start_dt, clamped = end_dt - widest, True
+    return start_dt, end_dt, clamped
+
+
 @app.get("/api/sflow/overview")
 def api_sflow_overview(
     minutes: int = 60,
     agent: Optional[str] = None,
     limit: int = 20,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     user: str = Depends(require_auth_and_db),
 ):
-    """Everything the sFlow page needs in one round trip - four views over
-    the same time window, which is cheaper and more consistent than four
-    requests that could each land in a different window."""
-    minutes = max(1, min(int(minutes), 10080))  # 1 min .. 7 days
+    """Everything the sFlow page needs in one round trip - every view over
+    the same time window, which is cheaper and more consistent than
+    separate requests that could each land in a different window.
+
+    `minutes` is the relative form, `start`/`end` (ISO 8601) an absolute
+    range. Both resolve to one concrete pair before any query runs, and
+    that pair comes back in the response so the page can state the span
+    it is actually showing.
+    """
+    start_dt, end_dt, clamped = _sflow_window(minutes, start, end)
+    win = {"start": start_dt, "end": end_dt}
     limit = max(1, min(int(limit), 200))
     # One query for every device's map, rather than per row.
     _SFLOW_IFINDEX_CACHE.clear()
     _SFLOW_IFINDEX_CACHE.update(SFLOW_IFINDEX.load_all())
     return {
         "available": SFLOW.available(),
-        "minutes": minutes,
+        # The window actually queried, not the one requested - they differ
+        # when a span is clamped, and a page that cannot tell the two
+        # apart will label a chart with a range it is not showing.
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
+        "minutes": round((end_dt - start_dt).total_seconds() / 60),
+        "clamped_to_days": SFLOW_MAX_SPAN_DAYS if clamped else None,
         # Built from the data, not the device registry: an agent whose
         # agent-id differs from its management IP would otherwise be
         # unselectable in the UI - which is exactly what happened with the
@@ -3383,16 +3444,15 @@ def api_sflow_overview(
             {**a,
              "device_name": _sflow_agent_label(a["peer_ip_src"]),
              "platform": _sflow_platform_for(a["peer_ip_src"])}
-            for a in SFLOW.agents(since_minutes=minutes)
+            for a in SFLOW.agents(**win)
         ],
-        "top_talkers": SFLOW.top_talkers(since_minutes=minutes, agent_ip=agent, limit=limit),
-        "top_hosts": SFLOW.top_hosts(since_minutes=minutes, agent_ip=agent, limit=limit),
-        "protocol_mix": SFLOW.protocol_mix(since_minutes=minutes, agent_ip=agent, limit=limit),
-        "per_port": SFLOW.per_port(since_minutes=minutes, agent_ip=agent,
-                                   platform_for=_sflow_platform_for,
-                                   cached_for=_sflow_cached_map_for, limit=limit),
-        "totals": SFLOW.totals(since_minutes=minutes, agent_ip=agent),
-        "timeseries": SFLOW.timeseries(since_minutes=minutes, agent_ip=agent),
+        "top_talkers": SFLOW.top_talkers(agent_ip=agent, limit=limit, **win),
+        "top_hosts": SFLOW.top_hosts(agent_ip=agent, limit=limit, **win),
+        "protocol_mix": SFLOW.protocol_mix(agent_ip=agent, limit=limit, **win),
+        "per_port": SFLOW.per_port(agent_ip=agent, platform_for=_sflow_platform_for,
+                                   cached_for=_sflow_cached_map_for, limit=limit, **win),
+        "totals": SFLOW.totals(agent_ip=agent, **win),
+        "timeseries": SFLOW.timeseries(agent_ip=agent, **win),
     }
 
 
@@ -3402,16 +3462,20 @@ def api_sflow_port(
     minutes: int = 60,
     agent: Optional[str] = None,
     limit: int = 20,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     user: str = Depends(require_auth_and_db),
 ):
     """Drill-down: what is actually crossing one interface."""
-    minutes = max(1, min(int(minutes), 10080))
+    start_dt, end_dt, _ = _sflow_window(minutes, start, end)
     return {
         "iface": iface,
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
         "port": sflow_store.ifindex_to_port(
             iface, _sflow_platform_for(agent),
             cached=(SFLOW_IFINDEX.load(_sflow_device_id_for(agent)) if _sflow_device_id_for(agent) else None)),
-        "flows": SFLOW.port_detail(iface, since_minutes=minutes, agent_ip=agent,
+        "flows": SFLOW.port_detail(iface, agent_ip=agent, start=start_dt, end=end_dt,
                                    limit=max(1, min(int(limit), 200))),
     }
 
@@ -3423,14 +3487,18 @@ def api_sflow_host(
     minutes: int = 60,
     agent: Optional[str] = None,
     limit: int = 30,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     user: str = Depends(require_auth_and_db),
 ):
     """Everything involving one address, both directions - "what is this
     machine actually doing", which no aggregate view can answer."""
-    minutes = max(1, min(int(minutes), 10080))
+    start_dt, end_dt, _ = _sflow_window(minutes, start, end)
     return {
         "host": host,
-        "flows": SFLOW.host_detail(host, since_minutes=minutes, agent_ip=agent,
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
+        "flows": SFLOW.host_detail(host, agent_ip=agent, start=start_dt, end=end_dt,
                                    limit=max(1, min(int(limit), 200))),
     }
 
