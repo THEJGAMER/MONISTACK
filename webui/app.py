@@ -50,6 +50,7 @@ import compliance
 import hardware_alerting
 import interface_alerting
 import retention
+import dns_cache
 import sflow_store
 from ssh_client import SwitchSSH, SwitchSSHError
 from status_poller import StatusPoller
@@ -347,6 +348,8 @@ ALERT_RULES = None
 INTERFACE_ALERT_RULES = None
 COMMAND_HISTORY = None
 FAVORITES = None
+DNS = dns_cache.DnsCache()
+
 SFLOW = None
 NETFLOW = None
 SFLOW_IFINDEX = None
@@ -3397,6 +3400,40 @@ def _sflow_ifaces_matching(q):
     return sorted(found)
 
 
+def _annotate_hostnames(payload):
+    """Attach reverse-DNS names to the addresses in a flow payload.
+
+    Done here rather than per-view so one batch of lookups covers the
+    whole page - the same address usually appears in several panels, and
+    resolving it once per panel would multiply the work by four for no
+    extra information.
+    """
+    ips = set()
+    for row in payload.get("top_talkers", []):
+        ips.update((row.get("ip_src"), row.get("ip_dst")))
+    for row in payload.get("top_hosts", []):
+        ips.add(row.get("host"))
+    names = DNS.reverse_many(ips)
+    if not names:
+        return payload
+    for row in payload.get("top_talkers", []):
+        row["ip_src_host"] = names.get(row.get("ip_src"))
+        row["ip_dst_host"] = names.get(row.get("ip_dst"))
+    for row in payload.get("top_hosts", []):
+        row["host_name"] = names.get(row.get("host"))
+    return payload
+
+
+def _name_flow_ends(rows):
+    """Reverse-DNS both endpoints of a list of raw flow rows."""
+    ips = {r.get("ip_src") for r in rows} | {r.get("ip_dst") for r in rows}
+    names = DNS.reverse_many(ips)
+    for r in rows:
+        r["ip_src_host"] = names.get(r.get("ip_src"))
+        r["ip_dst_host"] = names.get(r.get("ip_dst"))
+    return rows
+
+
 def _flow_store(source):
     """The store for one vantage point, or a 400 for anything else.
 
@@ -3481,8 +3518,12 @@ def api_sflow_overview(
     # in the top `limit`, which is how a host sitting 86th of 152 became
     # unfindable by typing its own address.
     q = (q or "").strip()[:100] or None
-    find = {"q": q, "q_ifaces": _sflow_ifaces_matching(q)}
-    return {
+    # A hostname search resolves to addresses and matches those. Without
+    # this, typing a name a table is already *showing* returns nothing,
+    # because the name is annotation - only the address is in the table.
+    q_hosts = DNS.forward(q) if (q and dns_cache.looks_like_hostname(q)) else []
+    find = {"q": q, "q_ifaces": _sflow_ifaces_matching(q), "q_hosts": q_hosts}
+    payload = {
         "available": store.available(),
         "source": source,
         # Flows whose byte counter hit the exporter's 32-bit field. Real
@@ -3493,7 +3534,8 @@ def api_sflow_overview(
         # volume they represent. Only NetFlow can hit this; sFlow's
         # counters are renormalized estimates, not exporter counters.
         "capped_rows": store.capped_rows(**win, agent_ip=agent, q=q,
-                                         q_ifaces=find["q_ifaces"]) if source == "firewall" else 0,
+                                         q_ifaces=find["q_ifaces"],
+                                         q_hosts=find["q_hosts"]) if source == "firewall" else 0,
         # The window actually queried, not the one requested - they differ
         # when a span is clamped, and a page that cannot tell the two
         # apart will label a chart with a range it is not showing.
@@ -3502,6 +3544,9 @@ def api_sflow_overview(
         "minutes": round((end_dt - start_dt).total_seconds() / 60),
         "clamped_to_days": SFLOW_MAX_SPAN_DAYS if clamped else None,
         "q": q,
+        # So the page can say "matched the 3 addresses this name resolves
+        # to" rather than appearing to search text it never searched.
+        "q_resolved_to": q_hosts or None,
         # Built from the data, not the device registry: an agent whose
         # agent-id differs from its management IP would otherwise be
         # unselectable in the UI - which is exactly what happened with the
@@ -3520,6 +3565,7 @@ def api_sflow_overview(
         "totals": store.totals(agent_ip=agent, **win, **find),
         "timeseries": store.timeseries(agent_ip=agent, **win, **find),
     }
+    return _annotate_hostnames(payload)
 
 
 @app.get("/api/sflow/port/{iface}")
@@ -3543,8 +3589,9 @@ def api_sflow_port(
         "port": sflow_store.ifindex_to_port(
             iface, _sflow_platform_for(agent),
             cached=(SFLOW_IFINDEX.load(_sflow_device_id_for(agent)) if _sflow_device_id_for(agent) else None)),
-        "flows": store.port_detail(iface, agent_ip=agent, start=start_dt, end=end_dt,
-                                   limit=max(1, min(int(limit), 200))),
+        "flows": _name_flow_ends(store.port_detail(
+            iface, agent_ip=agent, start=start_dt, end=end_dt,
+            limit=max(1, min(int(limit), 200)))),
     }
 
 
@@ -3568,8 +3615,10 @@ def api_sflow_host(
         "host": host,
         "start": start_dt.isoformat(),
         "end": end_dt.isoformat(),
-        "flows": store.host_detail(host, agent_ip=agent, start=start_dt, end=end_dt,
-                                   limit=max(1, min(int(limit), 200))),
+        "host_name": (DNS.reverse_many([host]) or {}).get(host),
+        "flows": _name_flow_ends(store.host_detail(
+            host, agent_ip=agent, start=start_dt, end=end_dt,
+            limit=max(1, min(int(limit), 200)))),
     }
 
 

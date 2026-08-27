@@ -123,7 +123,7 @@ def _looks_like_address(q):
     return all(c in "0123456789abcdefABCDEF.:" for c in q)
 
 
-def _match_clause(q, ifaces=None):
+def _match_clause(q, ifaces=None, hosts=None):
     """What a single search box can mean, as SQL over flow rows.
 
     The box is one field, so the text is tried against every column it
@@ -137,8 +137,10 @@ def _match_clause(q, ifaces=None):
     searching what it had.
 
     `ifaces` is the caller's reverse lookup of interface *names* to
-    ifIndexes; the name only exists after a per-vendor decode in Python,
-    so SQL cannot derive it.
+    ifIndexes, and `hosts` the addresses a hostname resolved to. Both
+    exist for the same reason: the text someone typed names something
+    that is not in any column - a decoded port name, a DNS name - so the
+    caller translates it into values that are, and SQL matches those.
     """
     q = (q or "").strip()
     if not q:
@@ -165,6 +167,11 @@ def _match_clause(q, ifaces=None):
         ifaces = [int(i) for i in ifaces]
         clauses.append("(iface_in = ANY(%s) OR iface_out = ANY(%s))")
         params += [ifaces, ifaces]
+
+    if hosts:
+        hosts = [str(h) for h in hosts]
+        clauses.append("(ip_src = ANY(%s) OR ip_dst = ANY(%s))")
+        params += [hosts, hosts]
 
     return "(" + " OR ".join(clauses) + ")", params
 
@@ -279,7 +286,7 @@ class SFlowStore:
         return start, end
 
     def _window(self, since_minutes=None, agent_ip=None, iface=None,
-                start=None, end=None, q=None, q_ifaces=None):
+                start=None, end=None, q=None, q_ifaces=None, q_hosts=None):
         """Builds the WHERE shared by every view. Time always leads, since
         both indexes on this table are (something, stamp_inserted DESC)."""
         if start is not None or end is not None:
@@ -300,7 +307,7 @@ class SFlowStore:
         if iface is not None:
             clauses.append("(iface_in = %s OR iface_out = %s)")
             params += [int(iface), int(iface)]
-        match, mparams = _match_clause(q, q_ifaces)
+        match, mparams = _match_clause(q, q_ifaces, q_hosts)
         if match:
             clauses.append(match)
             params += mparams
@@ -351,8 +358,8 @@ class SFlowStore:
 
     # --- the four views ----------------------------------------------
 
-    def top_talkers(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None, q=None, q_ifaces=None):
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
+    def top_talkers(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None, q=None, q_ifaces=None, q_hosts=None):
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces, q_hosts=q_hosts)
         rows = self.db.query(
             f"""SELECT ip_src, ip_dst, SUM(bytes) AS bytes, SUM(packets) AS packets,
                        COUNT(*) AS samples
@@ -363,11 +370,11 @@ class SFlowStore:
         )
         return [dict(r) for r in rows]
 
-    def top_hosts(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None, q=None, q_ifaces=None):
+    def top_hosts(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None, q=None, q_ifaces=None, q_hosts=None):
         """Per-host totals, counting a host's traffic in both directions -
         "who is using the bandwidth" rather than "which pair is busiest".
         A conversation view alone hides a host spread across many peers."""
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces, q_hosts=q_hosts)
         # A second, narrower filter on the aggregated host, but only for
         # an address-like search. The row-level match keeps a flow when
         # *either* endpoint matches, so folding both endpoints together
@@ -377,7 +384,7 @@ class SFlowStore:
         # search, though, the same filter empties the panel: no host is
         # named "https".
         host_filter, host_params = "", ()
-        if _looks_like_address(q):
+        if _looks_like_address(q) and not q_hosts:
             host_filter = "AND host ILIKE %s"
             host_params = (f"%{q.strip()}%",)
         rows = self.db.query(
@@ -391,12 +398,12 @@ class SFlowStore:
         )
         return [dict(r) for r in rows]
 
-    def protocol_mix(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None, q=None, q_ifaces=None):
+    def protocol_mix(self, since_minutes=60, agent_ip=None, limit=20, start=None, end=None, q=None, q_ifaces=None, q_hosts=None):
         """Traffic by service. Keyed on the *lower* of the two ports:
         an ephemeral source port is noise, and the well-known side is what
         identifies the service - without this, one HTTPS server appears as
         hundreds of separate rows, one per client port."""
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces, q_hosts=q_hosts)
         rows = self.db.query(
             f"""SELECT ip_proto,
                        LEAST(COALESCE(port_src, 65535), COALESCE(port_dst, 65535)) AS port,
@@ -415,7 +422,7 @@ class SFlowStore:
         return out
 
     def per_port(self, since_minutes=60, agent_ip=None, platform_for=None,
-                 cached_for=None, limit=50, start=None, end=None, q=None, q_ifaces=None):
+                 cached_for=None, limit=50, start=None, end=None, q=None, q_ifaces=None, q_hosts=None):
         """Traffic per switch interface, in and out kept separate so a
         one-directional problem (a port only ever receiving) is visible
         rather than averaged away.
@@ -428,7 +435,7 @@ class SFlowStore:
         `platform_for` is a callable agent_ip -> platform (or None), so
         each row is decoded with its own switch's encoding rather than one
         platform applied to every agent."""
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces, q_hosts=q_hosts)
         rows = self.db.query(
             f"""SELECT peer_ip_src, iface, SUM(in_bytes) AS in_bytes, SUM(out_bytes) AS out_bytes,
                        SUM(in_pkts) AS in_packets, SUM(out_pkts) AS out_packets FROM (
@@ -453,7 +460,7 @@ class SFlowStore:
             out.append(d)
         return out
 
-    def timeseries(self, since_minutes=60, agent_ip=None, bucket_seconds=None, start=None, end=None, q=None, q_ifaces=None):
+    def timeseries(self, since_minutes=60, agent_ip=None, bucket_seconds=None, start=None, end=None, q=None, q_ifaces=None, q_hosts=None):
         """Bytes per time bucket per agent - the one thing the tables on
         this page cannot show, since every other view collapses time away.
 
@@ -467,7 +474,7 @@ class SFlowStore:
             if start is not None and end is not None:
                 span = max(1, (end - start).total_seconds() / 60)
             bucket_seconds = self.bucket_for(span)
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces, q_hosts=q_hosts)
         rows = self.db.query(
             f"""SELECT peer_ip_src,
                        to_timestamp(floor(extract(epoch FROM stamp_inserted) / %s) * %s) AS bucket,
@@ -509,10 +516,10 @@ class SFlowStore:
     CAPPED_BYTES = 4_200_000_000
 
     def capped_rows(self, since_minutes=None, agent_ip=None, start=None, end=None,
-                    q=None, q_ifaces=None):
+                    q=None, q_ifaces=None, q_hosts=None):
         """How many rows in this window hit the exporter's byte ceiling."""
         where, params = self._window(since_minutes, agent_ip, start=start, end=end,
-                                     q=q, q_ifaces=q_ifaces)
+                                     q=q, q_ifaces=q_ifaces, q_hosts=q_hosts)
         row = self.db.query_one(
             f"SELECT COUNT(*) AS n FROM {self.table} WHERE {where} AND bytes > %s",
             tuple(params) + (self.CAPPED_BYTES,),
@@ -543,10 +550,10 @@ class SFlowStore:
             out.append(d)
         return out
 
-    def totals(self, since_minutes=60, agent_ip=None, start=None, end=None, q=None, q_ifaces=None):
+    def totals(self, since_minutes=60, agent_ip=None, start=None, end=None, q=None, q_ifaces=None, q_hosts=None):
         """Headline figures for the stat row. A single number is a stat
         tile, not a chart - see the page."""
-        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces)
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end, q=q, q_ifaces=q_ifaces, q_hosts=q_hosts)
         row = self.db.query_one(
             f"""SELECT COALESCE(SUM(bytes),0) AS bytes, COALESCE(SUM(packets),0) AS packets,
                        COUNT(*) AS records,

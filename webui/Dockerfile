@@ -14,8 +14,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # registry; see common/README or exporter.py's docstring) rather than each
 # keeping its own copy, which is exactly what let exporter/ssh_client.py go
 # stale (Dell OS9-only, no Junos/OPNsense/private-key support) before this.
-COPY common/db.py common/store.py common/devices.py common/ssh_client.py common/metrics.py common/junos_parsers.py common/devices.yaml .
-COPY webui/app.py webui/auth.py webui/occurrences.py webui/paging.py webui/commands.py webui/command_history.py webui/results_store.py webui/retention.py webui/sflow_store.py webui/status_poller.py webui/loki_client.py webui/alertmanager_client.py webui/alert_rules.py webui/alert_acks.py webui/audit.py webui/hardware_alerting.py webui/interface_alerting.py webui/parsers.py webui/opnsense_parsers.py webui/summarize.py webui/settings.py webui/topology.py webui/topology_store.py webui/trending.py webui/logging_setup.py webui/scheduler.py webui/compliance.py .
+# Globs, never a hand-written module list. Naming files individually is
+# what shipped a ModuleNotFoundError restart loop here the moment a new
+# module was added and missed - the same failure packaging/install-stack.sh
+# already carries a comment about, in a second place nobody thought to
+# check. Every .py in these directories is meant to ship; the webui's
+# tests live in webui/tests/, not at the top level.
+COPY common/*.py common/devices.yaml ./
+COPY webui/*.py ./
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 RUN mkdir -p /app/data
 

@@ -90,6 +90,23 @@ function rangeLabel(range) {
   return `last ${n} ${range.unit}${n === 1 ? "" : "s"}`;
 }
 
+// Address above, resolved name below. The address stays the primary
+// line: it is what the flow record actually contains, it is unique, and
+// it is what someone pastes into the search box. The name is context -
+// helpful when it exists, absent without comment when it does not, since
+// most public addresses have no PTR record at all.
+function Addr({ ip, name }) {
+  if (!ip) return "-";
+  return (
+    <div>
+      <Box variant="code">{ip}</Box>
+      {name ? (
+        <Box color="text-status-inactive" fontSize="body-s">{name}</Box>
+      ) : null}
+    </div>
+  );
+}
+
 function bytes(n) {
   const v = Number(n || 0);
   if (v >= 1e9) return `${(v / 1e9).toFixed(2)} GB`;
@@ -373,10 +390,13 @@ export default function SflowPage({ devices, pushFlash }) {
       <TextFilter
         filteringText={filterText}
         onChange={({ detail }) => setFilterText(detail.filteringText)}
-        filteringPlaceholder="Search the whole window by address, port, service, interface or switch..."
+        filteringPlaceholder="Search by address, hostname, port, service, interface or switch..."
         countText={
           q && !loading
             ? `${talkers.length + hosts.length + protos.length + ports.length} matches for "${data?.q}"`
+              + (data?.q_resolved_to
+                  ? ` (resolved to ${data.q_resolved_to.join(", ")})`
+                  : "")
             : ""
         }
         filteringAriaLabel="Search sFlow traffic"
@@ -387,7 +407,13 @@ export default function SflowPage({ devices, pushFlash }) {
           at a glance, which a table cannot do. */}
       <Container header={<Header variant="h3" description="Busiest hosts in this window, both directions">Traffic by host</Header>}>
         <BarChart
-          series={[{ title: "Traffic", type: "bar", data: hosts.slice(0, 10).map((h) => ({ x: h.host, y: Number(h.bytes) })), valueFormatter: bytes }]}
+          // An empty series array, not one series holding no points:
+          // Cloudscape shows `empty`/`noMatch` only when there are no
+          // series at all, so the second form renders a bare pair of axes
+          // where the "nothing matched" message should be.
+          series={hosts.length
+            ? [{ title: "Traffic", type: "bar", data: hosts.slice(0, 10).map((h) => ({ x: h.host, y: Number(h.bytes) })), valueFormatter: bytes }]
+            : []}
           horizontalBars
           hideFilter
           hideLegend
@@ -407,8 +433,8 @@ export default function SflowPage({ devices, pushFlash }) {
             variant="embedded" items={talkers} empty={empty}
             trackBy={(t) => `${t.ip_src}-${t.ip_dst}`}
             columnDefinitions={[
-              { id: "src", header: "Source", cell: (t) => <Box variant="code">{t.ip_src || "-"}</Box> },
-              { id: "dst", header: "Destination", cell: (t) => <Box variant="code">{t.ip_dst || "-"}</Box> },
+              { id: "src", header: "Source", cell: (t) => <Addr ip={t.ip_src} name={t.ip_src_host} /> },
+              { id: "dst", header: "Destination", cell: (t) => <Addr ip={t.ip_dst} name={t.ip_dst_host} /> },
               { id: "bytes", header: "Traffic", cell: (t) => bytes(t.bytes) },
             ]}
           />
@@ -421,7 +447,12 @@ export default function SflowPage({ devices, pushFlash }) {
               {
                 id: "host", header: "Host",
                 cell: (h) => (
-                  <Button variant="inline-link" onClick={() => openHost(h.host)}>{h.host}</Button>
+                  <div>
+                    <Button variant="inline-link" onClick={() => openHost(h.host)}>{h.host}</Button>
+                    {h.host_name ? (
+                      <Box color="text-status-inactive" fontSize="body-s">{h.host_name}</Box>
+                    ) : null}
+                  </div>
                 ),
               },
               { id: "bytes", header: "Traffic", cell: (h) => bytes(h.bytes) },
@@ -473,7 +504,9 @@ export default function SflowPage({ devices, pushFlash }) {
       <Modal
         visible={!!hostDrill}
         onDismiss={() => setHostDrill(null)}
-        header={hostDrill ? `Traffic involving ${hostDrill.host}` : ""}
+        header={hostDrill
+          ? `Traffic involving ${hostDrill.host}` + (hostDrill.host_name ? ` (${hostDrill.host_name})` : "")
+          : ""}
         size="large"
       >
         <Table
@@ -509,8 +542,8 @@ export default function SflowPage({ devices, pushFlash }) {
           variant="embedded" items={drill?.flows || []} empty={empty}
           trackBy={(f) => `${f.ip_src}-${f.ip_dst}-${f.port}`}
           columnDefinitions={[
-            { id: "src", header: "Source", cell: (f) => <Box variant="code">{f.ip_src || "-"}</Box> },
-            { id: "dst", header: "Destination", cell: (f) => <Box variant="code">{f.ip_dst || "-"}</Box> },
+            { id: "src", header: "Source", cell: (f) => <Addr ip={f.ip_src} name={f.ip_src_host} /> },
+            { id: "dst", header: "Destination", cell: (f) => <Addr ip={f.ip_dst} name={f.ip_dst_host} /> },
             { id: "svc", header: "Service", cell: (f) => f.service || (f.port === 65535 ? "-" : f.port) },
             { id: "proto", header: "Proto", cell: (f) => f.proto_name },
             { id: "bytes", header: "Traffic", cell: (f) => bytes(f.bytes) },
