@@ -631,3 +631,46 @@ def test_address_likeness_splits_the_two_behaviours():
     assert not sflow_store._looks_like_address("https")
     assert not sflow_store._looks_like_address("Te 1/37")
     assert not sflow_store._looks_like_address("")
+
+
+# --- the two vantage points ------------------------------------------
+
+def test_the_source_selects_the_table(store):
+    assert sflow_store.SFlowStore(store.db, source="switches").table == "sflow_flows"
+    assert sflow_store.SFlowStore(store.db, source="firewall").table == "netflow_flows"
+
+
+def test_an_unknown_source_is_refused_at_construction(store):
+    """The table name is interpolated into SQL - it cannot be a bound
+    parameter - so it must never be able to carry a caller's string."""
+    with pytest.raises(ValueError):
+        sflow_store.SFlowStore(store.db, source="'; DROP TABLE sflow_flows; --")
+    with pytest.raises(ValueError):
+        sflow_store.SFlowStore(store.db, source="netflow_flows")   # the value, not the key
+
+
+def test_capped_rows_counts_only_those_at_the_ceiling(store):
+    _flow(store, "10.0.0.1", "8.8.8.8", 500)
+    _flow(store, "10.0.0.2", "8.8.8.8", 4_294_901_889)   # at the 32-bit ceiling
+    _flow(store, "10.0.0.3", "8.8.8.8", 3_000_000_000)   # large but under it
+
+    assert store.capped_rows(since_minutes=60) == 1
+
+
+def test_capped_rows_respects_the_window_and_the_search(store):
+    _flow(store, "10.0.0.2", "8.8.8.8", 4_294_901_889, age_minutes=5)
+    _flow(store, "10.0.0.9", "8.8.8.8", 4_294_901_889, age_minutes=400)
+
+    assert store.capped_rows(since_minutes=60) == 1
+    assert store.capped_rows(since_minutes=600) == 2
+    assert store.capped_rows(since_minutes=600, q="10.0.0.9") == 1
+
+
+def test_capped_rows_are_still_included_in_the_totals(store):
+    """Reported, not filtered: they are a small share of rows and a large
+    share of bytes, so dropping them removes more traffic than keeping
+    them understates."""
+    _flow(store, "10.0.0.2", "8.8.8.8", 4_294_901_889)
+
+    assert int(store.totals(since_minutes=60)["bytes"]) == 4_294_901_889
+    assert len(store.top_talkers(since_minutes=60)) == 1

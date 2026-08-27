@@ -348,6 +348,7 @@ INTERFACE_ALERT_RULES = None
 COMMAND_HISTORY = None
 FAVORITES = None
 SFLOW = None
+NETFLOW = None
 SFLOW_IFINDEX = None
 OCCURRENCES = None
 AUDIT = None
@@ -960,7 +961,7 @@ def _load_database(dsn):
     so callers (setup wizard, Settings save) can report a clear error
     without disturbing whatever was working before the attempt."""
     global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES
-    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW, SFLOW_IFINDEX
+    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW, SFLOW_IFINDEX, NETFLOW
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
@@ -972,7 +973,8 @@ def _load_database(dsn):
     new_audit = audit.AuditLog(new_db)
     new_command_history = command_history.CommandHistoryStore(new_db)
     new_favorites = command_history.CommandFavoritesStore(new_db)
-    new_sflow = sflow_store.SFlowStore(new_db)
+    new_sflow = sflow_store.SFlowStore(new_db, source="switches")
+    new_netflow = sflow_store.SFlowStore(new_db, source="firewall")
     new_ifindex = sflow_store.IfIndexMap(new_db)
     DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES = (
         new_db, new_store, new_results, new_topology_store, new_schedules, new_alert_rules, new_interface_alert_rules
@@ -980,6 +982,7 @@ def _load_database(dsn):
     OCCURRENCES, AUDIT = new_occurrences, new_audit
     COMMAND_HISTORY, FAVORITES = new_command_history, new_favorites
     SFLOW = new_sflow
+    NETFLOW = new_netflow
     SFLOW_IFINDEX = new_ifindex
 
     _migrate_legacy_json_devices()
@@ -1330,22 +1333,29 @@ def api_settings_health(user: str = Depends(require_auth)):
     # endpoint, so a connection probe would read red while it worked
     # perfectly. Freshness also covers every failure mode - collector
     # down, switch stopped sampling, network path lost - rather than one.
-    if SFLOW is not None and STORE is not None and DB_ERROR is None:
+    # Both flow pipelines get the same freshness check. NetFlow has an
+    # extra way to go quiet that sFlow does not: v9 sends data records and
+    # the templates describing them separately, so an exporter that stops
+    # re-sending templates leaves the collector receiving traffic and
+    # storing none of it.
+    for label, store_ in (("sFlow flow", SFLOW), ("NetFlow flow", NETFLOW)):
+        if store_ is None or STORE is None or DB_ERROR is not None:
+            continue
         target = SFLOW_COLLECTOR or "collector address not set"
         try:
-            age = SFLOW.newest_age_seconds()
+            age = store_.newest_age_seconds()
             if age is None:
-                checks.append({"name": "sFlow flow", "target": target, "ok": False,
+                checks.append({"name": label, "target": target, "ok": False,
                                "detail": "no flow records have ever arrived"})
             else:
                 checks.append({
-                    "name": "sFlow flow", "target": target,
+                    "name": label, "target": target,
                     "ok": age <= SFLOW_STALE_AFTER_SECONDS,
                     "detail": (f"last flow {age/60:.0f} min ago" if age > 90
                                else f"last flow {age:.0f}s ago"),
                 })
         except Exception as e:
-            checks.append({"name": "sFlow flow", "target": target, "ok": False,
+            checks.append({"name": label, "target": target, "ok": False,
                            "detail": f"could not query flows: {e}"})
 
     for name, url, path in (
@@ -1363,7 +1373,7 @@ def api_settings_health(user: str = Depends(require_auth)):
     # failures with different first moves, so the panel must not call
     # them by the same word - Loki answered /ready for the whole seven
     # days that no syslog was reaching it.
-    flow_checks = {"Syslog flow", "sFlow flow"}
+    flow_checks = {"Syslog flow", "sFlow flow", "NetFlow flow"}
     for c in checks:
         c["kind"] = "flow" if c["name"] in flow_checks else "reach"
 
@@ -3387,7 +3397,23 @@ def _sflow_ifaces_matching(q):
     return sorted(found)
 
 
-def _sflow_window(minutes, start, end):
+def _flow_store(source):
+    """The store for one vantage point, or a 400 for anything else.
+
+    Never a default: which vantage point a number came from changes what
+    it means, and silently picking one would let a caller read firewall
+    figures believing they were switch figures.
+    """
+    if source not in sflow_store.FLOW_TABLES:
+        raise HTTPException(400, f"unknown source: {source!r} (expected one of "
+                                 f"{', '.join(sorted(sflow_store.FLOW_TABLES))})")
+    store = SFLOW if source == "switches" else NETFLOW
+    if store is None:
+        raise HTTPException(503, "flow store not configured")
+    return store
+
+
+def _sflow_window(store, minutes, start, end):
     """Resolves the time range for one request, once, for every view.
 
     Returns (start, end, clamped). Absolute bounds win over `minutes`
@@ -3412,7 +3438,7 @@ def _sflow_window(minutes, start, end):
         raise HTTPException(400, "start must be before end")
 
     minutes = max(1, min(int(minutes), 10080))
-    start_dt, end_dt = SFLOW.resolve_window(since_minutes=minutes, start=start_dt, end=end_dt)
+    start_dt, end_dt = store.resolve_window(since_minutes=minutes, start=start_dt, end=end_dt)
 
     clamped = False
     widest = timedelta(days=SFLOW_MAX_SPAN_DAYS)
@@ -3431,6 +3457,7 @@ def api_sflow_overview(
     start: Optional[str] = None,
     end: Optional[str] = None,
     q: Optional[str] = None,
+    source: str = "switches",
     user: str = Depends(require_auth_and_db),
 ):
     """Everything the sFlow page needs in one round trip - every view over
@@ -3442,7 +3469,8 @@ def api_sflow_overview(
     that pair comes back in the response so the page can state the span
     it is actually showing.
     """
-    start_dt, end_dt, clamped = _sflow_window(minutes, start, end)
+    store = _flow_store(source)
+    start_dt, end_dt, clamped = _sflow_window(store, minutes, start, end)
     win = {"start": start_dt, "end": end_dt}
     limit = max(1, min(int(limit), 200))
     # One query for every device's map, rather than per row.
@@ -3455,7 +3483,17 @@ def api_sflow_overview(
     q = (q or "").strip()[:100] or None
     find = {"q": q, "q_ifaces": _sflow_ifaces_matching(q)}
     return {
-        "available": SFLOW.available(),
+        "available": store.available(),
+        "source": source,
+        # Flows whose byte counter hit the exporter's 32-bit field. Real
+        # traffic, under-reported - the packet count on these stays
+        # honest while the byte count stops at 4 GiB, which is why they
+        # are surfaced rather than dropped: they are ~0.01% of rows but
+        # ~40% of bytes, so hiding them would quietly delete most of the
+        # volume they represent. Only NetFlow can hit this; sFlow's
+        # counters are renormalized estimates, not exporter counters.
+        "capped_rows": store.capped_rows(**win, agent_ip=agent, q=q,
+                                         q_ifaces=find["q_ifaces"]) if source == "firewall" else 0,
         # The window actually queried, not the one requested - they differ
         # when a span is clamped, and a page that cannot tell the two
         # apart will label a chart with a range it is not showing.
@@ -3472,15 +3510,15 @@ def api_sflow_overview(
             {**a,
              "device_name": _sflow_agent_label(a["peer_ip_src"]),
              "platform": _sflow_platform_for(a["peer_ip_src"])}
-            for a in SFLOW.agents(**win)
+            for a in store.agents(**win)
         ],
-        "top_talkers": SFLOW.top_talkers(agent_ip=agent, limit=limit, **win, **find),
-        "top_hosts": SFLOW.top_hosts(agent_ip=agent, limit=limit, **win, **find),
-        "protocol_mix": SFLOW.protocol_mix(agent_ip=agent, limit=limit, **win, **find),
-        "per_port": SFLOW.per_port(agent_ip=agent, platform_for=_sflow_platform_for,
+        "top_talkers": store.top_talkers(agent_ip=agent, limit=limit, **win, **find),
+        "top_hosts": store.top_hosts(agent_ip=agent, limit=limit, **win, **find),
+        "protocol_mix": store.protocol_mix(agent_ip=agent, limit=limit, **win, **find),
+        "per_port": store.per_port(agent_ip=agent, platform_for=_sflow_platform_for,
                                    cached_for=_sflow_cached_map_for, limit=limit, **win, **find),
-        "totals": SFLOW.totals(agent_ip=agent, **win, **find),
-        "timeseries": SFLOW.timeseries(agent_ip=agent, **win, **find),
+        "totals": store.totals(agent_ip=agent, **win, **find),
+        "timeseries": store.timeseries(agent_ip=agent, **win, **find),
     }
 
 
@@ -3492,10 +3530,12 @@ def api_sflow_port(
     limit: int = 20,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    source: str = "switches",
     user: str = Depends(require_auth_and_db),
 ):
     """Drill-down: what is actually crossing one interface."""
-    start_dt, end_dt, _ = _sflow_window(minutes, start, end)
+    store = _flow_store(source)
+    start_dt, end_dt, _ = _sflow_window(store, minutes, start, end)
     return {
         "iface": iface,
         "start": start_dt.isoformat(),
@@ -3503,7 +3543,7 @@ def api_sflow_port(
         "port": sflow_store.ifindex_to_port(
             iface, _sflow_platform_for(agent),
             cached=(SFLOW_IFINDEX.load(_sflow_device_id_for(agent)) if _sflow_device_id_for(agent) else None)),
-        "flows": SFLOW.port_detail(iface, agent_ip=agent, start=start_dt, end=end_dt,
+        "flows": store.port_detail(iface, agent_ip=agent, start=start_dt, end=end_dt,
                                    limit=max(1, min(int(limit), 200))),
     }
 
@@ -3517,16 +3557,18 @@ def api_sflow_host(
     limit: int = 30,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    source: str = "switches",
     user: str = Depends(require_auth_and_db),
 ):
     """Everything involving one address, both directions - "what is this
     machine actually doing", which no aggregate view can answer."""
-    start_dt, end_dt, _ = _sflow_window(minutes, start, end)
+    store = _flow_store(source)
+    start_dt, end_dt, _ = _sflow_window(store, minutes, start, end)
     return {
         "host": host,
         "start": start_dt.isoformat(),
         "end": end_dt.isoformat(),
-        "flows": SFLOW.host_detail(host, agent_ip=agent, start=start_dt, end=end_dt,
+        "flows": store.host_detail(host, agent_ip=agent, start=start_dt, end=end_dt,
                                    limit=max(1, min(int(limit), 200))),
     }
 

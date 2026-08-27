@@ -216,9 +216,38 @@ class IfIndexMap:
         return out
 
 
+# The two tables this store can read. A whitelist, not a passthrough:
+# the table name is interpolated into SQL (it cannot be a bound
+# parameter), so it must never be able to carry anything a caller chose.
+FLOW_TABLES = {
+    "switches": "sflow_flows",
+    "firewall": "netflow_flows",
+}
+
+
 class SFlowStore:
-    def __init__(self, db):
+    """Flow views over one vantage point.
+
+    The same queries serve sFlow from the switches and NetFlow from the
+    firewall, because both tables have identical columns - one store, two
+    instances, rather than a parallel set of near-identical methods.
+
+    They are never queried together. The two see the same traffic from
+    different places: a LAN host reaching the internet crosses both the
+    S4048 and the firewall, so any sum double-counts. They also differ in
+    kind - sFlow is 1:1024 sampled and renormalized into an estimate,
+    NetFlow is every flow the firewall saw. Which vantage point you mean
+    is a question the caller has to answer, so it is a parameter here and
+    a visible control in the UI rather than a default anyone can drift
+    into.
+    """
+
+    def __init__(self, db, source="switches"):
+        if source not in FLOW_TABLES:
+            raise ValueError(f"unknown flow source: {source!r}")
         self.db = db
+        self.source = source
+        self.table = FLOW_TABLES[source]
 
     # --- shared -------------------------------------------------------
 
@@ -283,7 +312,7 @@ class SFlowStore:
         "no switch has ever sent us anything" - those need very different
         advice."""
         try:
-            row = self.db.query_one("SELECT COUNT(*) AS n FROM sflow_flows")
+            row = self.db.query_one(f"SELECT COUNT(*) AS n FROM {self.table}")
             return bool(row and row["n"])
         except Exception:
             log.warning("could not check sflow availability", exc_info=True)
@@ -303,7 +332,7 @@ class SFlowStore:
         rather than just one.
         """
         row = self.db.query_one(
-            "SELECT EXTRACT(EPOCH FROM (now() - MAX(stamp_inserted))) AS age FROM sflow_flows"
+            f"SELECT EXTRACT(EPOCH FROM (now() - MAX(stamp_inserted))) AS age FROM {self.table}"
         )
         age = (row or {}).get("age")
         return None if age is None else max(0.0, float(age))
@@ -314,7 +343,7 @@ class SFlowStore:
         rows = self.db.query(
             f"""SELECT peer_ip_src, COUNT(*) AS flows, SUM(bytes) AS bytes,
                        MAX(stamp_inserted) AS last_seen
-                  FROM sflow_flows WHERE {where}
+                  FROM {self.table} WHERE {where}
                  GROUP BY peer_ip_src ORDER BY bytes DESC NULLS LAST""",
             tuple(params),
         )
@@ -327,7 +356,7 @@ class SFlowStore:
         rows = self.db.query(
             f"""SELECT ip_src, ip_dst, SUM(bytes) AS bytes, SUM(packets) AS packets,
                        COUNT(*) AS samples
-                  FROM sflow_flows WHERE {where}
+                  FROM {self.table} WHERE {where}
                  GROUP BY ip_src, ip_dst
                  ORDER BY bytes DESC NULLS LAST LIMIT %s""",
             tuple(params) + (int(limit),),
@@ -353,9 +382,9 @@ class SFlowStore:
             host_params = (f"%{q.strip()}%",)
         rows = self.db.query(
             f"""SELECT host, SUM(bytes) AS bytes, SUM(packets) AS packets FROM (
-                    SELECT ip_src AS host, bytes, packets FROM sflow_flows WHERE {where}
+                    SELECT ip_src AS host, bytes, packets FROM {self.table} WHERE {where}
                     UNION ALL
-                    SELECT ip_dst AS host, bytes, packets FROM sflow_flows WHERE {where}
+                    SELECT ip_dst AS host, bytes, packets FROM {self.table} WHERE {where}
                 ) t WHERE host IS NOT NULL {host_filter}
                 GROUP BY host ORDER BY bytes DESC NULLS LAST LIMIT %s""",
             tuple(params) + tuple(params) + host_params + (int(limit),),
@@ -372,7 +401,7 @@ class SFlowStore:
             f"""SELECT ip_proto,
                        LEAST(COALESCE(port_src, 65535), COALESCE(port_dst, 65535)) AS port,
                        SUM(bytes) AS bytes, SUM(packets) AS packets
-                  FROM sflow_flows WHERE {where}
+                  FROM {self.table} WHERE {where}
                  GROUP BY ip_proto, port
                  ORDER BY bytes DESC NULLS LAST LIMIT %s""",
             tuple(params) + (int(limit),),
@@ -405,10 +434,10 @@ class SFlowStore:
                        SUM(in_pkts) AS in_packets, SUM(out_pkts) AS out_packets FROM (
                     SELECT peer_ip_src, iface_in AS iface, bytes AS in_bytes, 0 AS out_bytes,
                            packets AS in_pkts, 0 AS out_pkts
-                      FROM sflow_flows WHERE {where} AND iface_in IS NOT NULL
+                      FROM {self.table} WHERE {where} AND iface_in IS NOT NULL
                     UNION ALL
                     SELECT peer_ip_src, iface_out AS iface, 0, bytes, 0, packets
-                      FROM sflow_flows WHERE {where} AND iface_out IS NOT NULL
+                      FROM {self.table} WHERE {where} AND iface_out IS NOT NULL
                 ) t GROUP BY peer_ip_src, iface
                 ORDER BY (SUM(in_bytes) + SUM(out_bytes)) DESC NULLS LAST LIMIT %s""",
             tuple(params) + tuple(params) + (int(limit),),
@@ -443,7 +472,7 @@ class SFlowStore:
             f"""SELECT peer_ip_src,
                        to_timestamp(floor(extract(epoch FROM stamp_inserted) / %s) * %s) AS bucket,
                        SUM(bytes) AS bytes, SUM(packets) AS packets
-                  FROM sflow_flows WHERE {where}
+                  FROM {self.table} WHERE {where}
                  GROUP BY peer_ip_src, bucket ORDER BY bucket""",
             (int(bucket_seconds), int(bucket_seconds)) + tuple(params),
         )
@@ -466,6 +495,30 @@ class SFlowStore:
                 return seconds
         return 21600
 
+    # A NetFlow v9 IN_BYTES field is 4 bytes wide (confirmed off the wire
+    # against this exporter), so no single flow record can carry more
+    # than 4 GiB. Rows sitting at that boundary are real traffic whose
+    # byte count stopped there while its packet count kept going - which
+    # is exactly how they are recognised: their bytes-per-packet collapses
+    # far below the ~1300 the rest of the table shows.
+    #
+    # Deliberately reported, not filtered. They are around 0.01% of rows
+    # and 40% of bytes, so dropping them would silently remove most of
+    # the volume they stand for, and keeping them silently understates it.
+    # Saying so is the only honest option.
+    CAPPED_BYTES = 4_200_000_000
+
+    def capped_rows(self, since_minutes=None, agent_ip=None, start=None, end=None,
+                    q=None, q_ifaces=None):
+        """How many rows in this window hit the exporter's byte ceiling."""
+        where, params = self._window(since_minutes, agent_ip, start=start, end=end,
+                                     q=q, q_ifaces=q_ifaces)
+        row = self.db.query_one(
+            f"SELECT COUNT(*) AS n FROM {self.table} WHERE {where} AND bytes > %s",
+            tuple(params) + (self.CAPPED_BYTES,),
+        )
+        return int((row or {}).get("n") or 0)
+
     def host_detail(self, host, since_minutes=60, agent_ip=None, limit=30, start=None, end=None):
         """Everything involving one address, in both directions - the
         answer to "what is this machine actually doing", which none of the
@@ -475,7 +528,7 @@ class SFlowStore:
             f"""SELECT ip_src, ip_dst, ip_proto,
                        LEAST(COALESCE(port_src, 65535), COALESCE(port_dst, 65535)) AS port,
                        SUM(bytes) AS bytes, SUM(packets) AS packets
-                  FROM sflow_flows
+                  FROM {self.table}
                  WHERE {where} AND (ip_src = %s OR ip_dst = %s)
                  GROUP BY ip_src, ip_dst, ip_proto, port
                  ORDER BY bytes DESC NULLS LAST LIMIT %s""",
@@ -499,7 +552,7 @@ class SFlowStore:
                        COUNT(*) AS records,
                        COUNT(DISTINCT ip_src) AS talkers,
                        COUNT(DISTINCT peer_ip_src) AS agents
-                  FROM sflow_flows WHERE {where}""",
+                  FROM {self.table} WHERE {where}""",
             tuple(params),
         )
         return dict(row) if row else {}
@@ -512,7 +565,7 @@ class SFlowStore:
             f"""SELECT ip_src, ip_dst, ip_proto,
                        LEAST(COALESCE(port_src, 65535), COALESCE(port_dst, 65535)) AS port,
                        SUM(bytes) AS bytes, SUM(packets) AS packets
-                  FROM sflow_flows WHERE {where}
+                  FROM {self.table} WHERE {where}
                  GROUP BY ip_src, ip_dst, ip_proto, port
                  ORDER BY bytes DESC NULLS LAST LIMIT %s""",
             tuple(params) + (int(limit),),

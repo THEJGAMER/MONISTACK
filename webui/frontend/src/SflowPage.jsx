@@ -33,6 +33,32 @@ const RANGE_PRESETS = [
   { key: "7d",  amount: 7,  unit: "day" },
 ].map((r) => ({ ...r, type: "relative" }));
 
+// The two vantage points. Never combined: a LAN host reaching the
+// internet crosses both the switches and the firewall, so summing them
+// double-counts, and they differ in kind besides - sFlow is 1:1024
+// sampled and scaled back up, NetFlow is every flow the firewall saw.
+// Making it a visible choice is the point; there is no "both".
+const SOURCES = [
+  { label: "Switches (sFlow)", value: "switches" },
+  { label: "Firewall (NetFlow)", value: "firewall" },
+];
+
+// Wording that has to follow the vantage point. Calling OPNsense a
+// "switch", or the firewall's exact counts "estimated", quietly asserts
+// the thing this whole split exists to prevent - that the two sets of
+// numbers are the same kind of number.
+const SOURCE_WORDS = {
+  switches: { device: "switch", devices: "Switches", all: "All switches",
+              measure: "estimated", iface: "Per switch interface" },
+  firewall: { device: "exporter", devices: "Exporters", all: "All exporters",
+              measure: "measured", iface: "Per firewall interface" },
+};
+
+const SOURCE_NOTE = {
+  switches: "Sampled by the switches themselves, 1 packet in 1024, scaled back up by sfacctd - so these are estimates of real traffic.",
+  firewall: "Every flow the firewall recorded, not sampled. Interfaces show as raw SNMP ifIndex numbers: naming them needs a per-vendor decode this app does not have for OPNsense.",
+};
+
 const DEFAULT_RANGE = { type: "relative", amount: 1, unit: "hour", key: "1h" };
 
 const UNIT_MINUTES = { second: 1 / 60, minute: 1, hour: 60, day: 1440, week: 10080, month: 43200, year: 525600 };
@@ -74,7 +100,9 @@ function bytes(n) {
 
 export default function SflowPage({ devices, pushFlash }) {
   const [range, setRange] = useState(DEFAULT_RANGE);
+  const [source, setSource] = useState(SOURCES[0]);
   const [agent, setAgent] = useState({ label: "All switches", value: "" });
+  const words = SOURCE_WORDS[source.value];
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [drill, setDrill] = useState(null);
@@ -96,7 +124,7 @@ export default function SflowPage({ devices, pushFlash }) {
   // what happened with the EX3300 reporting 192.168.5.10 while registered
   // at 192.168.4.1.
   const agentOptions = [
-    { label: "All switches", value: "" },
+    { label: words.all, value: "" },
     ...(data?.agents || []).map((a) => ({
       label: a.device_name ? `${a.device_name} (${a.peer_ip_src})` : a.peer_ip_src,
       value: a.peer_ip_src,
@@ -106,18 +134,25 @@ export default function SflowPage({ devices, pushFlash }) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setData(await getSflowOverview({ ...rangeToQuery(range), agent: agent.value || undefined, q: query || undefined }));
+      setData(await getSflowOverview({ ...rangeToQuery(range), source: source.value, agent: agent.value || undefined, q: query || undefined }));
     } catch (e) {
       pushFlash("error", `Could not load sFlow data: ${e.message}`);
       setData(null);
     } finally {
       setLoading(false);
     }
-  }, [range, agent, query, pushFlash]);
+  }, [range, source, agent, query, pushFlash]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // An agent filter belongs to one vantage point - the firewall is not in
+  // the switch list and vice versa - so carrying it across would filter
+  // everything out and look like "no data".
+  useEffect(() => {
+    setAgent({ label: SOURCE_WORDS[source.value].all, value: "" });
+  }, [source]);
 
   // Off by default: this page is usually opened to answer a question, not
   // left up as a dashboard, and a background refresh that silently
@@ -130,7 +165,7 @@ export default function SflowPage({ devices, pushFlash }) {
 
   async function openHost(host) {
     try {
-      setHostDrill(await getSflowHost(host, { ...rangeToQuery(range), agent: agent.value || undefined }));
+      setHostDrill(await getSflowHost(host, { ...rangeToQuery(range), source: source.value, agent: agent.value || undefined }));
     } catch (e) {
       pushFlash("error", `Could not load host detail: ${e.message}`);
     }
@@ -167,7 +202,7 @@ export default function SflowPage({ devices, pushFlash }) {
       // Scoped to the switch that owns this ifIndex, not the page filter -
       // otherwise the drill-down mixes two switches' identically-numbered
       // interfaces together.
-      setDrill(await getSflowPort(iface, { ...rangeToQuery(range), agent: agentIp }));
+      setDrill(await getSflowPort(iface, { ...rangeToQuery(range), source: source.value, agent: agentIp }));
     } catch (e) {
       pushFlash("error", `Could not load port detail: ${e.message}`);
     }
@@ -206,6 +241,17 @@ export default function SflowPage({ devices, pushFlash }) {
 
   return (
     <SpaceBetween size="l">
+      {data?.capped_rows ? (
+        <Alert type="info" header="Some flows are larger than the exporter can report">
+          {data.capped_rows} flow{data.capped_rows === 1 ? "" : "s"} in this window hit the
+          firewall's 32-bit byte counter and stopped at 4 GiB. Their packet counts are still
+          accurate, so the real traffic is higher than the byte totals below - typically a few
+          hundredths of a percent of rows, but a large share of the bytes. They are shown rather
+          than hidden, since dropping them would remove more traffic than keeping them
+          understates. A shorter active-flow timeout on OPNsense would export these before they
+          reach the limit.
+        </Alert>
+      ) : null}
       {data?.clamped_to_days ? (
         <Alert type="info" header="Showing a shorter range than requested">
           These views aggregate every flow record in the range, so they are capped at{" "}
@@ -221,12 +267,16 @@ export default function SflowPage({ devices, pushFlash }) {
               // The window is named once, here, because it governs every
               // panel below - naming it per panel would invite the reader
               // to think each could differ.
-              `Traffic sampled by the switches themselves (1 packet in 1024) and scaled back up by sfacctd, so these are estimates of real traffic. `
-              + `Showing ${rangeLabel(range)} across every panel on this page.`
+              `${SOURCE_NOTE[source.value]} Showing ${rangeLabel(range)} across every panel on this page.`
             }
             actions={
               <SpaceBetween size="xs" direction="horizontal" alignItems="center">
                 <Toggle checked={auto} onChange={({ detail }) => setAuto(detail.checked)}>Auto</Toggle>
+                <Select
+                  selectedOption={source}
+                  onChange={({ detail }) => setSource(detail.selectedOption)}
+                  options={SOURCES}
+                />
                 <DateRangePicker
                   value={range}
                   onChange={({ detail }) => setRange(detail.value)}
@@ -272,7 +322,7 @@ export default function SflowPage({ devices, pushFlash }) {
               </SpaceBetween>
             }
           >
-            Traffic (sFlow)
+            Traffic
           </Header>
         }
       >
@@ -281,7 +331,7 @@ export default function SflowPage({ devices, pushFlash }) {
         <SpaceBetween size="l">
           <ColumnLayout columns={4} variant="text-grid">
             <div>
-              <Box variant="awsui-key-label">Traffic (estimated)</Box>
+              <Box variant="awsui-key-label">Traffic ({words.measure})</Box>
               <Box fontSize="display-l" fontWeight="bold">{bytes(data?.totals?.bytes)}</Box>
             </div>
             <div>
@@ -293,7 +343,7 @@ export default function SflowPage({ devices, pushFlash }) {
               <Box fontSize="display-l" fontWeight="bold">{Number(data?.totals?.talkers || 0).toLocaleString()}</Box>
             </div>
             <div>
-              <Box variant="awsui-key-label">Switches reporting</Box>
+              <Box variant="awsui-key-label">{words.devices} reporting</Box>
               <Box fontSize="display-l" fontWeight="bold">{data?.agents?.length || 0}</Box>
               <Box color="text-status-inactive" fontSize="body-s">
                 {(data?.agents || []).map((a) => a.device_name || a.peer_ip_src).join(", ") || "none"}
@@ -310,7 +360,7 @@ export default function SflowPage({ devices, pushFlash }) {
             height={220}
             hideFilter
             xTitle="Time"
-            yTitle="Bytes (estimated)"
+            yTitle={`Bytes (${words.measure})`}
             ariaLabel="Sampled traffic over time, stacked by switch"
             i18nStrings={{ xTickFormatter: (t) => t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
                            yTickFormatter: bytes }}
@@ -343,7 +393,7 @@ export default function SflowPage({ devices, pushFlash }) {
           hideLegend
           height={260}
           xTitle="Host"
-          yTitle="Bytes (estimated)"
+          yTitle={`Bytes (${words.measure})`}
           ariaLabel="Sampled traffic by host"
           i18nStrings={{ yTickFormatter: bytes }}
           empty={<Box color="text-status-inactive">No traffic in this window.</Box>}
@@ -395,7 +445,7 @@ export default function SflowPage({ devices, pushFlash }) {
           />
         </Container>
 
-        <Container header={<Header variant="h3" description="Per switch interface - click a row for what's crossing it">Per-port traffic</Header>}>
+        <Container header={<Header variant="h3" description={`${words.iface} - click a row for what's crossing it`}>Per-port traffic</Header>}>
           <Table
             variant="embedded" items={ports} empty={empty}
             trackBy={(p) => `${p.peer_ip_src}-${p.iface}`}
@@ -412,7 +462,7 @@ export default function SflowPage({ devices, pushFlash }) {
               },
               // Shown because an ifIndex only means anything relative to
               // the switch that issued it.
-              { id: "switch", header: "Switch", cell: (p) => p.peer_ip_src },
+              { id: "switch", header: words.devices.replace(/es$/, "").replace(/s$/, ""), cell: (p) => p.peer_ip_src },
               { id: "in", header: "In", cell: (p) => bytes(p.in_bytes) },
               { id: "out", header: "Out", cell: (p) => bytes(p.out_bytes) },
             ]}

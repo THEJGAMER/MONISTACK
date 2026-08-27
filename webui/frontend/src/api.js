@@ -124,10 +124,13 @@ export const getSettingsHealth = () => api("/api/settings/health");
 // disagree with each other.
 // Every sFlow request carries the same window, relative or absolute, so
 // the drill-downs cover exactly the span the page behind them shows.
-const sflowWindow = ({ minutes = 60, agent, start, end, q } = {}) => {
+const sflowWindow = ({ minutes = 60, agent, start, end, q, source } = {}) => {
   const p = new URLSearchParams({ minutes: String(minutes) });
   if (agent) p.set("agent", agent);
   if (q) p.set("q", q);
+  // Which vantage point. Always sent explicitly - the two views must
+  // never be confused for each other, so the drill-downs carry it too.
+  if (source) p.set("source", source);
   // Absolute bounds win server-side; minutes is still sent as the
   // fallback a clamped or unparseable range resolves to.
   if (start && end) { p.set("start", start); p.set("end", end); }

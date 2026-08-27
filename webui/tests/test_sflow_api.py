@@ -35,8 +35,15 @@ class _FakeSflow:
 
 @pytest.fixture
 def win(monkeypatch):
-    monkeypatch.setattr(app_module, "SFLOW", _FakeSflow())
-    return app_module._sflow_window
+    """The window resolver, bound to a stand-in store.
+
+    The store is an argument rather than a global because there are two
+    vantage points now (switches/sFlow and firewall/NetFlow) and each
+    resolves against its own table."""
+    store = _FakeSflow()
+    monkeypatch.setattr(app_module, "SFLOW", store)
+    monkeypatch.setattr(app_module, "NETFLOW", store)
+    return lambda *a: app_module._sflow_window(store, *a)
 
 
 def test_minutes_resolve_to_a_concrete_span(win):

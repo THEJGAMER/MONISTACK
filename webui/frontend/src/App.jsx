@@ -297,7 +297,7 @@ export default function App() {
               { type: "link", text: "Devices", href: "#/devices" },
               { type: "link", text: "Topology", href: "#/topology" },
               { type: "link", text: "Trends", href: "#/trends" },
-              { type: "link", text: "Traffic (sFlow)", href: "#/sflow" },
+              { type: "link", text: "Traffic", href: "#/sflow" },
               { type: "link", text: "Saved Results", href: "#/results" },
               { type: "divider" },
               { type: "link", text: "Bulk Run", href: "#/bulk-run" },
