@@ -10,6 +10,7 @@ import { applyMode, applyDensity, Mode, Density } from "@cloudscape-design/globa
 
 import SetupWizard from "./SetupWizard.jsx";
 import AccessDeniedPage from "./AccessDeniedPage.jsx";
+import LoginFailedPage from "./LoginFailedPage.jsx";
 import { getDevices, getCommands, getSetupStatus, getCurrentUser, logout } from "./api.js";
 import { AuthProvider, useHasRole } from "./AuthContext.jsx";
 
@@ -81,6 +82,10 @@ export default function App() {
   // must not run for this route, or it immediately bounces back to
   // Keycloak before the page (and its Log out button) can ever render.
   const deniedMatch = activeHref.match(/^#\/access-denied\/?(.*)$/);
+  // Same exclusion, same reason: no session exists on this route, so the
+  // identity check below would bounce straight back to Keycloak - which is
+  // the loop the page is there to stop.
+  const loginFailedMatch = activeHref.match(/^#\/login-failed\/?(.*)$/);
   const [devices, setDevices] = useState([]);
   const [commandTree, setCommandTree] = useState([]);
   const [flashes, setFlashes] = useState([]);
@@ -154,7 +159,7 @@ export default function App() {
   // confirmed done (no point sending someone to Keycloak before there's
   // even a deployment to log in to).
   useEffect(() => {
-    if (!configured || deniedMatch) return;
+    if (!configured || deniedMatch || loginFailedMatch) return;
     (async () => {
       try {
         setUser(await getCurrentUser());
@@ -162,10 +167,10 @@ export default function App() {
         window.location.href = "/api/auth/login";
       }
     })();
-  }, [configured, deniedMatch]);
+  }, [configured, deniedMatch, loginFailedMatch]);
 
   useEffect(() => {
-    if (!configured || !user || deniedMatch) return;
+    if (!configured || !user || deniedMatch || loginFailedMatch) return;
     (async () => {
       try {
         const [devs, cmds] = await Promise.all([getDevices(), getCommands()]);
@@ -177,7 +182,7 @@ export default function App() {
         setLoaded(true);
       }
     })();
-  }, [configured, user, deniedMatch, pushFlash]);
+  }, [configured, user, deniedMatch, loginFailedMatch, pushFlash]);
 
   // "#/alarms/6da766d164443d00" -> section "alarms", param "6da766d164443d00".
   // Only the Alarms page takes a path parameter today; everything else is a
@@ -233,6 +238,9 @@ export default function App() {
 
   if (deniedMatch) {
     return <AccessDeniedPage username={deniedMatch[1] ? decodeURIComponent(deniedMatch[1]) : null} />;
+  }
+  if (loginFailedMatch) {
+    return <LoginFailedPage reason={loginFailedMatch[1] ? decodeURIComponent(loginFailedMatch[1]) : null} />;
   }
 
   if (!user) {

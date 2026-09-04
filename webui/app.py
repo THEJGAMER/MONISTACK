@@ -1435,6 +1435,49 @@ def _check_callback_rate_limit(ip):
             raise HTTPException(status_code=429, detail="too many login attempts, try again shortly")
 
 
+# A stale callback is the common case, not an error worth showing anyone.
+# The OIDC state and nonce live in the session cookie; if that expired, was
+# cleared, or the callback URL was re-opened from history, Authlib rejects
+# the exchange even though nothing is actually wrong - and the user, who
+# usually still has a live Keycloak SSO session, is one redirect away from
+# being logged in. So the callback restarts the login instead of dead-ending
+# on a JSON 401.
+#
+# The obvious hazard is a redirect loop: a genuinely broken setup (wrong
+# client secret, clock skew, a revoked client) fails every time, and
+# retrying forever would spin the browser between two hosts with nothing on
+# screen. So attempts are counted in their own short-lived cookie - not the
+# session, which is the very thing that may be missing - and once the count
+# is exhausted the failure is shown as a real page.
+LOGIN_RETRY_COOKIE = "switchboard_login_retry"
+MAX_LOGIN_RETRIES = int(os.environ.get("OIDC_MAX_LOGIN_RETRIES", "2"))
+
+
+def _login_retry_count(request):
+    try:
+        return max(0, int(request.cookies.get(LOGIN_RETRY_COOKIE, "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _clear_login_retries(response):
+    response.delete_cookie(LOGIN_RETRY_COOKIE, path="/")
+    return response
+
+
+def _retry_login(request, attempts, reason):
+    """Send the browser back through Keycloak for one more attempt."""
+    response = RedirectResponse(url="/api/auth/login", status_code=302)
+    response.set_cookie(
+        LOGIN_RETRY_COOKIE, str(attempts + 1),
+        max_age=300, httponly=True, samesite="lax",
+        secure=SESSION_COOKIE_SECURE, path="/",
+    )
+    log.info("OIDC callback failed (%s) - retrying login, attempt %d of %d",
+             reason, attempts + 1, MAX_LOGIN_RETRIES)
+    return response
+
+
 @app.get("/api/auth/login")
 async def api_auth_login(request: Request):
     if oidc_client is None:
@@ -1451,11 +1494,20 @@ async def api_auth_callback(request: Request):
     if oidc_client is None:
         raise HTTPException(status_code=503, detail="OIDC is not configured")
     _check_callback_rate_limit(request.client.host if request.client else "unknown")
+    attempts = _login_retry_count(request)
     try:
         token = await oidc_client.authorize_access_token(request)
     except Exception as e:
-        log.warning("OIDC callback failed: %s", e)
-        raise HTTPException(status_code=401, detail="OIDC login failed")
+        if attempts < MAX_LOGIN_RETRIES:
+            return _retry_login(request, attempts, e)
+        # Retried and still failing, so this is not a stale cookie. Show a
+        # page rather than a bare JSON 401: it names the underlying error,
+        # and it carries a Log out button, which is the one control that
+        # actually breaks the cycle - it ends the Keycloak session that
+        # keeps silently re-authenticating into the same failure.
+        log.warning("OIDC callback failed after %d retries: %s", attempts, e)
+        return _clear_login_retries(
+            RedirectResponse(url=f"/#/login-failed/{quote(str(e)[:200])}", status_code=302))
     claims = token.get("userinfo") or {}
     # Also check the /userinfo endpoint directly, not just the ID token - a
     # Keycloak client-role mapper can be scoped to one and not the other
@@ -1484,7 +1536,7 @@ async def api_auth_callback(request: Request):
         if AUDIT is not None:
             AUDIT.record(username, "auth.denied", detail={"reason": "no client role assigned"})
         log.warning("user=%s authenticated via OIDC but has no switchboard client role - denying", username)
-        return RedirectResponse(url=f"/#/access-denied/{quote(username)}")
+        return _clear_login_retries(RedirectResponse(url=f"/#/access-denied/{quote(username)}"))
     request.session["username"] = username
     request.session["email"] = claims.get("email")
     request.session["role"] = role
@@ -1510,7 +1562,7 @@ async def api_auth_callback(request: Request):
     if AUDIT is not None:
         AUDIT.record(username, "auth.login", detail={"role": role})
     log.info("user=%s logged in via OIDC (role=%s)", username, role)
-    return RedirectResponse(url="/")
+    return _clear_login_retries(RedirectResponse(url="/"))
 
 
 @app.get("/api/auth/logout")
