@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Switchboard stack installer - native systemd, no Docker anywhere.
 #
-# Installs any combination of the six services (webui, prometheus,
-# alertmanager, grafana, exporter, sflow) onto this host, either
+# Installs any combination of the seven services (webui, prometheus,
+# alertmanager, grafana, exporter, sflow, syslog) onto this host, either
 # individually or as a pre-set bundle. Detects what is already installed, and can update
 # in place rather than reinstalling.
 #
@@ -26,6 +26,8 @@ PROMETHEUS_VERSION="2.55.1"
 ALERTMANAGER_VERSION="0.27.0"
 GRAFANA_VERSION="11.3.1"
 NODE_MAJOR="20"
+# The version the syslog VRL was written and verified against.
+VECTOR_VERSION="0.57.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -36,6 +38,9 @@ SB_DATA="$SB_HOME/data"
 SB_CONF=/etc/switchboard
 ALERT_RULES_FILE="$SB_DATA/prometheus-alerts.yml"
 SFLOW_CONF=/etc/pmacct/sfacctd.conf
+SYSLOG_CONF=/etc/vector/vector.yaml
+SYSLOG_CANDIDATE=/etc/vector/vector.candidate.yaml
+SYSLOG_MARKER=/etc/vector/.switchboard-commit
 SFLOW_MARKER=/etc/pmacct/.switchboard-commit
 
 ASSUME_YES=0
@@ -119,7 +124,7 @@ ask_secret() {
 
 # ---------------------------------------------------------------- modules
 
-ALL_MODULES=(webui prometheus alertmanager grafana exporter sflow)
+ALL_MODULES=(webui prometheus alertmanager grafana exporter sflow syslog)
 
 module_desc() {
   case "$1" in
@@ -129,6 +134,7 @@ module_desc() {
     grafana)      echo "Grafana v$GRAFANA_VERSION (port 3000)";;
     exporter)     echo "SSH-polling metrics exporter (port 9101)";;
     sflow)        echo "sFlow collector - sfacctd into Postgres (UDP 6343)";;
+    syslog)       echo "Syslog receiver - Vector v$VECTOR_VERSION into Loki (UDP/TCP 514)";;
   esac
 }
 
@@ -140,6 +146,7 @@ module_unit() {
     grafana)      echo "grafana";;
     exporter)     echo "s4048-exporter";;
     sflow)        echo "sfacctd";;
+    syslog)       echo "vector";;
   esac
 }
 
@@ -153,7 +160,11 @@ bundle_modules() {
     # cannot compete with the webui, and it is the only module whose
     # install is incomplete until the switches are reconfigured.
     collector)  echo "sflow";;
-    all)        echo "webui prometheus alertmanager grafana exporter sflow";;
+    # Both receivers on one box: neither needs anything the other has, and
+    # keeping ingest off the webui host means a flood of flows or log
+    # lines cannot starve the thing people are looking at.
+    ingest)     echo "sflow syslog";;
+    all)        echo "webui prometheus alertmanager grafana exporter sflow syslog";;
     *)          echo "";;
   esac
 }
@@ -163,6 +174,7 @@ bundle_desc() {
     app)        echo "webui + Prometheus together, sharing the alert-rules file on local disk (no NFS/CIFS/SMB needed)";;
     monitoring) echo "Prometheus + Alertmanager + Grafana - the metrics/alerting side, no webui";;
     collector)  echo "sFlow collector only - for a dedicated LXC/VM the switches sample into";;
+    ingest)     echo "Both receivers - sFlow and syslog - on one dedicated host";;
     all)        echo "Everything on this one host";;
   esac
 }
@@ -217,6 +229,9 @@ installed_version() {
     sflow)
       [[ -f "$SFLOW_CONF" ]] || return 0
       read_commit_marker "$SFLOW_MARKER";;
+    syslog)
+      [[ -f "$SYSLOG_CONF" ]] || return 0
+      read_commit_marker "$SYSLOG_MARKER";;
   esac
 }
 
@@ -228,6 +243,7 @@ target_version() {
     webui)        (cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null) || echo "unknown";;
     exporter)     (cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null) || echo "unknown";;
     sflow)        (cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null) || echo "unknown";;
+    syslog)       (cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null) || echo "unknown";;
   esac
 }
 
@@ -1162,6 +1178,229 @@ EOF
   fi
 }
 
+# ------------------------------------------------------------ syslog
+#
+# Vector, receiving syslog from the switches on 514 and shipping parsed
+# events to Loki. syslog/vector.yaml in the repo is the source of truth -
+# it carries the VRL that turns each vendor's message shape into
+# structured fields, and every line of it was derived from real captured
+# traffic. This installs Vector and deploys that file; it never writes
+# config of its own.
+
+sysl_conf_value() {
+  # sysl_conf_value <regex-with-one-group> - pulls a value back out of the
+  # deployed config so a re-run offers what is already there.
+  [[ -f "$SYSLOG_CONF" ]] || return 0
+  sed -nE "s|$1|\1|p" "$SYSLOG_CONF" | head -1
+}
+
+syslog_loki_test() {
+  # syslog_loki_test <endpoint>
+  #
+  # Checked before anything is deployed. Vector's loki sink is configured
+  # with healthcheck disabled (it has to be - Vector refuses to start if
+  # Loki is briefly down, and losing the syslog receiver because the log
+  # store blinked is the wrong trade), which means a wrong endpoint here
+  # produces a running, healthy-looking Vector that quietly drops every
+  # event. That is precisely the failure that went unnoticed for seven
+  # days once already.
+  local endpoint="${1%/}" out
+  step "Testing the Loki endpoint ($endpoint)"
+  if ! out="$(curl -fsS --max-time 10 "$endpoint/ready" 2>&1)"; then
+    warn "Loki did not answer /ready:"
+    printf '      %s\n' "$out" | head -3
+    return 1
+  fi
+  ok "Loki is ready"
+  # Push access is the part that matters and /ready does not prove it.
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+          -H 'Content-Type: application/json' -X POST \
+          --data '{"streams":[]}' "$endpoint/loki/api/v1/push" 2>/dev/null || echo 000)"
+  case "$code" in
+    2*|400) ok "the push endpoint accepts writes (HTTP $code)";;
+    000)    warn "could not reach $endpoint/loki/api/v1/push"; return 1;;
+    *)      warn "push endpoint answered HTTP $code - Vector's events may be rejected"; return 1;;
+  esac
+  return 0
+}
+
+syslog_endtoend_test() {
+  # syslog_endtoend_test <endpoint>
+  #
+  # Sends one syslog line at the freshly started Vector and looks for it
+  # coming out of Loki. Covers receiver, VRL and sink in one go without
+  # waiting on a switch, so a failure is unambiguously ours.
+  local endpoint="${1%/}" marker="switchboard-install-$(date +%s)" i found
+  [[ $DRY_RUN -eq 1 ]] && return 0
+  step "End-to-end test: syslog line -> Vector -> Loki"
+  command -v logger >/dev/null 2>&1 || { warn "no logger(1) - skipping"; return 2; }
+
+  # A Dell OS9-shaped line, so the VRL's parsing runs rather than just its
+  # passthrough path.
+  logger -n 127.0.0.1 -P 514 -d -t "switchboard" \
+    "%IFMGR-5-ASTATE_UP: Changed interface Admin state to up: Te 1/37 $marker" 2>/dev/null \
+    || { warn "could not send the test line"; return 1; }
+
+  for ((i=0; i<30; i+=3)); do
+    sleep 3
+    if curl -fsS --max-time 10 --get "$endpoint/loki/api/v1/query_range" \
+         --data-urlencode "query={job=\"syslog\"}" \
+         --data-urlencode "limit=200" 2>/dev/null | grep -q "$marker"; then
+      found=1; break
+    fi
+  done
+  if [[ -n "${found:-}" ]]; then
+    ok "the test event reached Loki - receiver, parser and sink all work"
+    return 0
+  fi
+  warn "the test event never reached Loki"
+  say "      journalctl -u vector -n 40 --no-pager"
+  say "      ${C_DIM}Vector logs each event to the console sink too, so if it appears"
+  say "      there but not in Loki, the problem is the sink, not the parsing.${C_RESET}"
+  return 1
+}
+
+install_syslog() {
+  step "Installing the syslog receiver (Vector v$VECTOR_VERSION)"
+  ensure_apt curl ca-certificates
+
+  [[ -f "$REPO_DIR/syslog/vector.yaml" ]] \
+    || die "no syslog/vector.yaml - run this from a full repo checkout"
+
+  # `|| true` is load-bearing: with `set -o pipefail` a missing vector
+  # makes the whole pipeline fail, and a bare assignment failing under
+  # `set -e` aborts the installer before it can install the thing whose
+  # absence it was checking for.
+  local have=""
+  have="$(vector --version 2>/dev/null | awk '{print $2}' || true)"
+  if [[ "$have" == "$VECTOR_VERSION" ]]; then
+    ok "vector $have already installed"
+  else
+    local tmp=/tmp/vector.deb
+    fetch_tarball "https://packages.timber.io/vector/${VECTOR_VERSION}/vector_${VECTOR_VERSION}-1_amd64.deb" "$tmp"
+    step "Installing the package"
+    # apt, not dpkg -i: the .deb has dependencies and apt resolves them
+    # rather than leaving a half-configured package behind.
+    run apt-get install -y -qq "$tmp"
+    run rm -f "$tmp"
+  fi
+
+  local d_loki d_tz loki tz
+  d_loki="$(sysl_conf_value '^[[:space:]]*endpoint:[[:space:]]*(http.*[^[:space:]])[[:space:]]*$')"
+  d_loki="${d_loki:-http://127.0.0.1:3100}"
+  d_tz="$(sysl_conf_value '^.*timezone: "([^"]+)".*$')"
+  d_tz="${d_tz:-$(cat /etc/timezone 2>/dev/null || echo UTC)}"
+  # Overridable from the environment so `-y` can do a real unattended
+  # install rather than only accepting whatever the defaults happen to be.
+  # Without this, automating a rebuild means either answering prompts over
+  # a pty or installing with a Loki address that points nowhere.
+  d_loki="${SB_LOKI_ENDPOINT:-$d_loki}"
+  d_tz="${SB_DEVICE_TZ:-$d_tz}"
+
+  say ""
+  say "  ${C_BOLD}Loki.${C_RESET} Where parsed events are shipped. Vector's healthcheck for"
+  say "  this sink is deliberately off - it must not refuse to start just"
+  say "  because the log store blinked - so a wrong address here gives you a"
+  say "  healthy-looking Vector that silently drops everything."
+  while :; do
+    loki="$(ask '  Loki endpoint' "$d_loki")"
+    syslog_loki_test "$loki" && break
+    if [[ $ASSUME_YES -eq 1 ]]; then
+      warn "continuing anyway (-y) - events may go nowhere"
+      break
+    fi
+    say ""
+    confirm "  Try a different endpoint?" && { d_loki="$loki"; continue; }
+    confirm "  Install anyway with an endpoint that failed the test?" || die "aborted"
+    break
+  done
+
+  say ""
+  say "  ${C_BOLD}Device timezone.${C_RESET} Switches send BSD-syslog timestamps with no UTC"
+  say "  offset, and Vector's syslog source has no setting for the sender's"
+  say "  zone, so it assumes they are already UTC. Getting this wrong shifts"
+  say "  every device_timestamp by the offset - silently, and permanently for"
+  say "  anything already stored. An IANA name, so DST is handled."
+  tz="$(ask '  Timezone the devices report in' "$d_tz")"
+  if [[ $DRY_RUN -eq 0 ]] && ! python3 -c "import zoneinfo,sys; zoneinfo.ZoneInfo(sys.argv[1])" "$tz" 2>/dev/null; then
+    warn "'$tz' is not a zone this host recognises - using it anyway, but check it"
+  fi
+
+  step "Deploying $SYSLOG_CONF from syslog/vector.yaml"
+  run mkdir -p /etc/vector
+  if [[ $DRY_RUN -eq 0 ]]; then
+    SB_LOKI="$loki" SB_TZ="$tz" python3 - "$REPO_DIR/syslog/vector.yaml" "$SYSLOG_CANDIDATE" <<'PY'
+import os, re, sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+subs = 0
+text, n = re.subn(r'(^\s*endpoint:\s*)http\S+', lambda m: m.group(1) + os.environ["SB_LOKI"],
+                  text, count=1, flags=re.M)
+subs += n
+text, n = re.subn(r'(timezone:\s*")[^"]+(")', lambda m: m.group(1) + os.environ["SB_TZ"] + m.group(2), text)
+subs += n
+# Loud rather than silent: if these keys are renamed upstream the file
+# would otherwise deploy with the previous site's address and timezone
+# still baked in, and nothing would say so.
+if n == 0 or subs < 2:
+    raise SystemExit("syslog/vector.yaml has no endpoint:/timezone: line to substitute")
+open(dst, "w").write(text)
+PY
+    ok "wrote $SYSLOG_CANDIDATE"
+  fi
+
+  # The validate gates everything after it. A past deploy moved the
+  # candidate into place and restarted *before* checking the exit code,
+  # and a VRL error (E651) took the whole receiver down for a minute.
+  step "Validating the config before it goes anywhere near the running service"
+  if [[ $DRY_RUN -eq 0 ]]; then
+    if ! vector validate "$SYSLOG_CANDIDATE"; then
+      rm -f "$SYSLOG_CANDIDATE"
+      die "config failed validation - nothing was changed"
+    fi
+    ok "config is valid"
+    if [[ -f "$SYSLOG_CONF" ]]; then
+      run cp "$SYSLOG_CONF" "$SYSLOG_CONF.bak-$(date +%Y%m%d%H%M%S)"
+    fi
+    run mv "$SYSLOG_CANDIDATE" "$SYSLOG_CONF"
+  fi
+
+  # 514 is privileged and Vector's package runs it as the `vector` user,
+  # so without this the service starts and immediately fails to bind -
+  # visible only in the journal.
+  run mkdir -p /etc/systemd/system/vector.service.d
+  if [[ $DRY_RUN -eq 0 ]]; then
+    cat > /etc/systemd/system/vector.service.d/10-switchboard.conf <<'UNIT'
+[Service]
+# Vector binds 514 (syslog), which is privileged, while the package runs
+# it as the unprivileged `vector` user. Granting just this one capability
+# is the narrow fix; running the whole daemon as root is not.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# The config lives in /etc and is read at start; nothing here writes it.
+Restart=on-failure
+RestartSec=5
+UNIT
+    ok "wrote the systemd drop-in (CAP_NET_BIND_SERVICE for port 514)"
+    write_commit_marker "$SYSLOG_MARKER"
+  fi
+
+  enable_now vector
+
+  if [[ $DRY_RUN -eq 0 ]]; then
+    sleep 3
+    if ss -ulnp 2>/dev/null | grep -q ':514 ' && ss -tlnp 2>/dev/null | grep -q ':514 '; then
+      ok "vector is listening on UDP and TCP 514"
+    else
+      warn "vector is not listening on both 514 sockets:"
+      ss -lnp 2>/dev/null | grep ':514 ' | sed 's/^/      /' || true
+      warn "check: journalctl -u vector -n 40 --no-pager"
+    fi
+    syslog_endtoend_test "$loki" || true
+  fi
+}
+
 # ------------------------------------------------------------ dispatch
 
 is_selected() {
@@ -1178,6 +1417,7 @@ install_module() {
     grafana)      install_grafana;;
     exporter)     install_exporter;;
     sflow)        install_sflow;;
+    syslog)       install_syslog;;
     *)            die "unknown module: $1";;
   esac
 }
@@ -1315,7 +1555,7 @@ interactive_menu() {
   do_detect
   say "${C_BOLD}Bundles${C_RESET} (recommended - avoids needing a shared filesystem)"
   local b
-  for b in app monitoring collector all; do
+  for b in app monitoring collector ingest all; do
     printf '  %-12s %s\n' "$b" "$(bundle_desc "$b")"
     printf '  %-12s %s%s%s\n' "" "$C_DIM" "-> $(bundle_modules "$b")" "$C_RESET"
   done
@@ -1352,7 +1592,7 @@ parse_selection() {
 do_list() {
   say "${C_BOLD}Bundles${C_RESET}"
   local b m
-  for b in app monitoring collector all; do
+  for b in app monitoring collector ingest all; do
     printf '  %-12s %s\n' "$b" "$(bundle_desc "$b")"
     printf '  %-12s %s%s%s\n' "" "$C_DIM" "-> $(bundle_modules "$b")" "$C_RESET"
   done
@@ -1408,13 +1648,14 @@ Usage: sudo $0 [options]
   -h, --help            this
 
 Modules:  ${ALL_MODULES[*]}
-Bundles:  app, monitoring, collector, all
+Bundles:  app, monitoring, collector, ingest, all
 
 Examples:
   sudo $0                                  # interactive
   sudo $0 --bundle app                     # webui + prometheus, no shared FS needed
   sudo $0 --install alertmanager,grafana
   sudo $0 --bundle collector               # sFlow collector on its own host
+  sudo $0 --install syslog                 # Vector syslog receiver -> Loki
   sudo $0 --test-sflow                     # is anything sampling to us?
   sudo $0 --update                         # after a git pull
   sudo $0 --detect

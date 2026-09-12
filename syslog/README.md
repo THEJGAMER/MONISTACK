@@ -1,9 +1,38 @@
 # Syslog interpreter (Vector, on the LXC at 192.168.0.144)
 
-The S4048 was already configured to send syslog to `192.168.0.144`, where
-[Vector](https://vector.dev) (already installed there, v0.57.0, running as
-the `vector` systemd service) receives it on UDP+TCP `514`. This directory
-holds the config that turns those raw syslog lines into structured events.
+The switches are configured to send syslog to `192.168.0.144`, where
+[Vector](https://vector.dev) v0.57.0 receives it on UDP+TCP `514` as the
+`vector` systemd service. This directory holds the config that turns those
+raw syslog lines into structured events.
+
+## Installing it
+
+```bash
+sudo packaging/install-stack.sh --install syslog
+```
+
+Installs Vector, deploys `vector.yaml` from this directory, and - the part
+that matters - runs `vector validate` as a **gate** on activation rather
+than as something to eyeball. A past deploy moved the candidate into place
+and restarted before checking the exit code, and one VRL error (E651) took
+the whole receiver down; see the 2026-07-30 changelog entry.
+
+It asks for the Loki endpoint and the devices' timezone, and tests Loki
+before writing anything: this sink runs with `healthcheck: enabled: false`
+(it must, or Vector refuses to start whenever the log store blinks), so a
+wrong address there yields a running, healthy-looking Vector that silently
+drops every event - exactly the failure that went unnoticed for seven days
+once already. Afterwards it sends one syslog line through the whole path
+and looks for it in Loki, so a failure is unambiguous rather than "maybe
+the switch isn't sending".
+
+For an unattended rebuild, `SB_LOKI_ENDPOINT` and `SB_DEVICE_TZ` supply
+those two answers to `-y`.
+
+It also installs a systemd drop-in granting `CAP_NET_BIND_SERVICE`: 514 is
+privileged and Vector's package runs as the unprivileged `vector` user, so
+without it the service starts and fails to bind, visibly only in the
+journal.
 
 `vector.yaml` here is the deployed copy of `/etc/vector/vector.yaml` on that
 LXC — treat this file as the source of truth and push changes to the LXC
@@ -88,6 +117,22 @@ this is the one that turned out to still be live until 07-30, see below),
 `/etc/vector/vector.yaml.bak-20260730072941` (pre-"alarm cleared" fix).
 
 ## Changelog
+
+**2026-09-12** - rebuilt from scratch onto a fresh LXC at 192.168.0.144
+(Debian 13). Nothing was carried over: Vector installed from the pinned
+0.57.0 package, `vector.yaml` deployed from this directory, and the whole
+thing turned into `packaging/install-stack.sh --install syslog` so the
+next rebuild is a command rather than an archaeology exercise. The dated
+`vector.yaml.bak-*` files referenced below lived on the old LXC and are
+gone with it; this directory is the only remaining history.
+
+Verified live after the rebuild: real traffic from both switches parsing
+correctly (`vendor=junos facility=MGD`, `vendor=dell_os9 category=auth
+mnemonic=LOGIN_SUCCESS`), `device_timestamp` matching real UTC to the
+second - so the Australia/Sydney correction survived the rebuild - the
+deployed file byte-identical to this one, all 11 VRL tests passing against
+the real binary on the LXC, and the webui's "Syslog flow" health row
+reading `last event 1s ago`.
 
 **2026-07-30 (later still)** - fixed device timestamps being 10 hours
 fast. The S4048's clock is configured in local time (`show clock detail`
