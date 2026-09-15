@@ -115,6 +115,21 @@ class VapidKeys:
     def available(self):
         return bool(self.public_key and self.private_key_pem)
 
+    def vapid(self):
+        """The parsed key, as the Vapid instance pywebpush wants.
+
+        pywebpush's vapid_private_key is a Vapid, a PEM *file path*, or a
+        raw base64url key - never PEM text. Handing it the text made it
+        parse the PEM as raw DER and fail with "Could not deserialize key
+        data … ASN.1 parsing error", on the first real test page. Parsed
+        once and cached: the key does not change while the process runs.
+        """
+        if getattr(self, "_vapid", None) is None:
+            from py_vapid import Vapid
+            pem = self.private_key_pem
+            self._vapid = Vapid.from_pem(pem.encode() if isinstance(pem, str) else pem)
+        return self._vapid
+
 
 class PushSubscriptionStore:
     def __init__(self, db):
@@ -199,7 +214,7 @@ class PushNotifier:
         from pywebpush import webpush, WebPushException
         try:
             webpush(subscription_info=subscription, data=json.dumps(payload),
-                    vapid_private_key=self.keys.private_key_pem,
+                    vapid_private_key=self.keys.vapid(),
                     vapid_claims={"sub": self.keys.subject}, ttl=3600,
                     headers={"Urgency": "high" if payload.get("severity") == "critical" else "normal"})
             return True, None, False
