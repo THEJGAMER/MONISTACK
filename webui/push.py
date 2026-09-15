@@ -39,6 +39,44 @@ def _rank(sev):
     return SEVERITY_RANK.get((sev or "warning").lower(), 2)
 
 
+def default_vapid_subject(candidates, override=None, placeholder="mailto:switchboard@example.com"):
+    """The VAPID `sub` claim, chosen the way PROXMON's defaultSubject does.
+
+    Push services validate it and Apple rejects a bad one with BadJwtToken,
+    so the fallback chain matters: prefer the https origin users open; then
+    a mailto: on a real hostname (a plain-http URL still names the site);
+    and only then a placeholder that is at least a syntactically valid
+    address on a real domain. An explicit override always wins. Bare IPs
+    and localhost are never used - they are exactly what Apple rejects.
+    """
+    if override and override.strip():
+        return override.strip()
+    from urllib.parse import urlsplit
+    parsed = []
+    for u in candidates or []:
+        if not u:
+            continue
+        try:
+            parts = urlsplit(u.strip())
+        except ValueError:
+            continue
+        host = (parts.hostname or "").lower()
+        if host:
+            parsed.append((parts.scheme, host, parts.port))
+    # Two passes, not first-match: an https origin anywhere in the list
+    # beats a mailto: from an http URL listed before it. (PROXMON's
+    # original is first-match, which makes the answer depend on the order
+    # the URLs happen to be configured in.)
+    for scheme, host, port in parsed:
+        if scheme == "https":
+            return f"https://{host}" + (f":{port}" if port and port != 443 else "")
+    for scheme, host, port in parsed:
+        is_ip = host.count(".") == 3 and all(seg.isdigit() for seg in host.split("."))
+        if "." in host and not is_ip and host != "localhost":
+            return f"mailto:switchboard@{host}"
+    return placeholder
+
+
 class VapidKeys:
     """Generate-once, load-forever key pair on disk."""
 

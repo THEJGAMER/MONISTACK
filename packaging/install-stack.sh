@@ -499,6 +499,11 @@ SESSION_SECRET_KEY=$secret
 SESSION_COOKIE_SECURE=false
 SESSION_TTL_HOURS=12
 
+# Web Push (the in-house pager). The VAPID subject is derived from
+# OIDC_REDIRECT_URI (https origin, else mailto: on its hostname); set this
+# only to override. Push needs HTTPS in the browser regardless.
+PUSH_VAPID_SUBJECT=
+
 # OIDC - login will not work until these are real.
 # See webui/README.md "Login: OIDC against Keycloak".
 OIDC_ISSUER_URL=

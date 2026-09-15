@@ -191,3 +191,36 @@ def test_nothing_is_sent_when_keys_are_unavailable(store):
     n("alarm.opened", _env("alarm.opened"))
 
     assert sent == []
+
+
+# --- the VAPID subject (PROXMON's defaultSubject, ported) ---------------
+# Apple rejects an invalid `sub` with BadJwtToken, so the fallback chain is
+# the difference between iPhones being paged and silently never being.
+
+def test_an_https_url_gives_its_origin():
+    assert push.default_vapid_subject(["https://switchboard.example.com/api/auth/callback"]) == "https://switchboard.example.com"
+
+
+def test_a_plain_http_url_still_names_the_site():
+    """The real case: OIDC_REDIRECT_URI left as http:// behind a TLS proxy.
+    The hostname is real, so a mailto on it is a valid subject."""
+    assert push.default_vapid_subject(["http://switchboard.example.com/api/auth/callback"]) == "mailto:switchboard@switchboard.example.com"
+
+
+def test_https_wins_over_http_regardless_of_order():
+    assert push.default_vapid_subject(["http://a.example.com/x", "https://b.example.com/y"]) == "https://b.example.com"
+
+
+def test_ips_and_localhost_are_never_used():
+    """Exactly what Apple rejects, and what a dev instance is configured with."""
+    assert push.default_vapid_subject(["http://192.168.0.147:8080/x"]) == "mailto:switchboard@example.com"
+    assert push.default_vapid_subject(["http://localhost:8080/x"]) == "mailto:switchboard@example.com"
+    assert push.default_vapid_subject([None, ""]) == "mailto:switchboard@example.com"
+
+
+def test_an_explicit_override_always_wins():
+    assert push.default_vapid_subject(["https://a.example.com"], override="mailto:ops@example.com") == "mailto:ops@example.com"
+
+
+def test_a_non_default_https_port_is_kept():
+    assert push.default_vapid_subject(["https://sb.example.com:8443/x"]) == "https://sb.example.com:8443"

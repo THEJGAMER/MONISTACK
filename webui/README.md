@@ -284,8 +284,10 @@ lock screen.
 It needs HTTPS (push is a secure-context API) and, on iOS, a home-screen
 install. The VAPID key pair is generated once into `data/push_vapid.json`
 (0600); losing it invalidates every subscription, so back it up with the
-rest of `data/`. `PUSH_VAPID_SUBJECT` overrides the VAPID subject (it
-defaults to the https origin from `OIDC_REDIRECT_URI`).
+rest of `data/`. The VAPID subject is derived the way PROXMON does it: the https origin
+from `OIDC_REDIRECT_URI` (or `PUBLIC_URL`), else a `mailto:` on that
+hostname, never an IP or localhost - Apple rejects those.
+`PUSH_VAPID_SUBJECT` overrides it.
 
 Adapted from the PROXMON project's push implementation, then extended for
 paging as above.

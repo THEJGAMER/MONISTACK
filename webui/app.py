@@ -1139,12 +1139,14 @@ def _wire_event_bus():
     WEBHOOK_DISPATCHER = webhooks_module.WebhookDispatcher(WEBHOOKS)
     events.BUS.subscribe(WEBHOOK_DISPATCHER)
     if PUSH_KEYS is None:
-        # VAPID's `sub` claim: push services validate it, and Apple rejects
-        # a bad one outright. The https origin users open is the best
-        # value; a mailto: on a real host is the fallback.
-        redirect = OIDC_REDIRECT_URI or ""
-        subject = os.environ.get("PUSH_VAPID_SUBJECT") or (
-            redirect.split("/api/")[0] if redirect.startswith("https://") else "mailto:switchboard@localhost")
+        # VAPID's `sub` claim, derived the way PROXMON does it: the https
+        # origin if any configured URL is https, else a mailto: on the
+        # site's real hostname, else a placeholder on a real domain.
+        # PUSH_VAPID_SUBJECT overrides. Never a bare IP or localhost -
+        # Apple's push service rejects those outright.
+        subject = push_module.default_vapid_subject(
+            [os.environ.get("PUBLIC_URL"), OIDC_REDIRECT_URI],
+            override=os.environ.get("PUSH_VAPID_SUBJECT"))
         PUSH_KEYS = push_module.VapidKeys(BASE_DIR / "data" / "push_vapid.json", subject)
     PUSH_NOTIFIER = push_module.PushNotifier(PUSH_SUBS, PUSH_KEYS)
     events.BUS.subscribe(PUSH_NOTIFIER)
