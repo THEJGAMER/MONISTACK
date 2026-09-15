@@ -270,13 +270,13 @@ class InterfaceAlertChecker:
             (c["device_id"], c["port"]): c for c in configs if c["enabled"] and c["mode"] == "immediate"
         }
         if not immediate_by_key:
-            return
+            return True   # nothing to ask, so nothing failed
         host_to_device_id = {d.host: d.id for d in devices_by_id.values()}
         try:
             events = loki_client.query_range(filters=['link_event="true"'], limit=100, since_seconds=lookback_seconds)
         except Exception:
             log.warning("syslog-based interface check skipped: Loki unreachable", exc_info=True)
-            return
+            return False  # lets the poll loop back off; see app.PollBackoff
 
         newest_seen = self._last_syslog_ts_ns
         for event in events:
@@ -324,6 +324,7 @@ class InterfaceAlertChecker:
                 self._last_seen_poll_at.pop(key, None)
                 self._alert_started_at.pop(key, None)
         self._last_syslog_ts_ns = newest_seen
+        return True
 
     def reconcile_via_poll(self, configs, get_state_and_polled_at, device_name_for, alertmanager):
         """Safety net for immediate-mode ports, run on a tight ~5s loop

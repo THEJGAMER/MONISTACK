@@ -129,6 +129,17 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
   const [statusRefreshing, setStatusRefreshing] = useState(false);
   const [alarmHistory, setAlarmHistory] = useState([]);
   const [alarmHistoryLoading, setAlarmHistoryLoading] = useState(false);
+  // How far back the Alarm History tab looks. 7 days was the silent
+  // default; now it is a visible choice, since each step up is a wider
+  // Loki query and the tab re-fetches it on its own timer.
+  const ALARM_WINDOWS = [
+    { label: "Last 24 hours", value: "86400" },
+    { label: "Last 7 days", value: "604800" },
+    { label: "Last 30 days", value: "2592000" },
+  ];
+  const [alarmWindow, setAlarmWindow] = useState(ALARM_WINDOWS[1]);
+  const alarmWindowRef = useRef(alarmWindow);
+  alarmWindowRef.current = alarmWindow;
   const [boardItems, setBoardItems] = useState(loadBoardLayout);
   const [history, setHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -274,7 +285,7 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
   async function refreshAlarmHistory(deviceId) {
     setAlarmHistoryLoading(true);
     try {
-      setAlarmHistory(await getAlarmHistory(deviceId));
+      setAlarmHistory(await getAlarmHistory(deviceId, Number(alarmWindowRef.current.value)));
     } catch (e) {
       pushFlash("error", `Could not load alarm history: ${e.message}`);
     } finally {
@@ -300,16 +311,29 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
     refreshFrontPanelStatus(selected.id);
     refreshRecentResults(selected.id);
     refreshSyslog(selected.id, syslogCategory, 200);
-    refreshAlarmHistory(selected.id);
     const t = setInterval(() => {
       refreshStatus(selected.id);
       refreshFrontPanelStatus(selected.id);
       refreshSyslog(selected.id, syslogCategory, syslogLimitRef.current);
-      refreshAlarmHistory(selected.id);
     }, 20000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, syslogCategory]);
+
+  // Alarm history on its own, much slower, timer. It used to ride the
+  // 20-second tick above, which meant a 7-day Loki query every 20s for as
+  // long as a Console tab was open - on Loki's side that one tab was 337
+  // sub-queries per tick into a queue of 100, and the measured result was
+  // 112 errors/min (2026-09-15). Hardware alarms are paged live by the
+  // syslog poller anyway, so this table being five minutes behind costs
+  // nothing; the Refresh button is there for "now".
+  useEffect(() => {
+    if (!selected) return undefined;
+    refreshAlarmHistory(selected.id);
+    const t = setInterval(() => refreshAlarmHistory(selected.id), 5 * 60 * 1000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, alarmWindow]);
 
   const filteredDevices = useMemo(() => {
     const q = filterText.toLowerCase();
@@ -922,13 +946,21 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
                   <Box color="text-status-inactive">Select a device first.</Box>
                 ) : (
                   <SpaceBetween size="m">
-                    <Button
-                      iconName="refresh"
-                      loading={alarmHistoryLoading}
-                      onClick={() => refreshAlarmHistory(selected.id)}
-                    >
-                      Refresh
-                    </Button>
+                    <SpaceBetween size="xs" direction="horizontal" alignItems="center">
+                      <Select
+                        selectedOption={alarmWindow}
+                        onChange={({ detail }) => setAlarmWindow(detail.selectedOption)}
+                        options={ALARM_WINDOWS}
+                      />
+                      <Button
+                        iconName="refresh"
+                        loading={alarmHistoryLoading}
+                        onClick={() => refreshAlarmHistory(selected.id)}
+                      >
+                        Refresh
+                      </Button>
+                      <Box color="text-status-inactive" fontSize="body-s">Refreshes every 5 minutes.</Box>
+                    </SpaceBetween>
                     <Table
                       variant="embedded"
                       loading={alarmHistoryLoading}

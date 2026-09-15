@@ -28,3 +28,41 @@ schema_config:
 
 ruler:
   alertmanager_url: http://localhost:9093
+
+# --- query fan-out --------------------------------------------------
+#
+# Loki's defaults here assume a cluster of queriers behind a frontend.
+# This is one process on one core, and with the defaults a single 7-day
+# log query from the webui became 337 querier executions (measured from
+# one traceID): split_queries_by_interval defaulted to 30m, so 168h
+# became 336 pieces, into a scheduler queue capped at 100. The overflow
+# surfaced as "too many outstanding requests", the frontend's own
+# retries piled more on, and the webui's 3-second syslog pollers - fast
+# queries that never took over 5s themselves - got cancelled behind it.
+# One open Console tab took Loki from 39 queries/min at 0 errors/min to
+# 69 queries/min at 112 errors/min (2026-09-15).
+#
+# None of these makes a query slower; of ~803k range queries over nine
+# days, zero took longer than 5s. They stop cheap work being queued in
+# hundreds of pieces.
+
+query_scheduler:
+  # Default 100. The queue is what overflowed; the work behind it was
+  # never the problem.
+  max_outstanding_requests_per_tenant: 2048
+
+query_range:
+  # Sharding fans each split out further so multiple queriers can share
+  # it. With one querier on one core it is pure queue pressure and no
+  # parallelism.
+  parallelise_shardable_queries: false
+
+limits_config:
+  # Match the 24h index period above: a 7-day query becomes 7 pieces,
+  # not 336. Splitting finer than the index period buys nothing on
+  # filesystem storage.
+  split_queries_by_interval: 24h
+  # Default 32 - how many of one query's pieces run at once. Lower so a
+  # single wide query cannot occupy every querier worker (max_concurrent
+  # defaults to 10) while the pollers' 20-second queries wait.
+  max_query_parallelism: 4

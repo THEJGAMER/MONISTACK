@@ -625,8 +625,9 @@ threading.Thread(target=_interface_alert_loop, daemon=True, name="interface-aler
 # so this polls Loki - a single cheap HTTP query, not an SSH round trip -
 # on a much tighter interval instead of waiting on the device poll cycle.
 def _interface_alert_syslog_loop():
+    backoff = PollBackoff()
     while True:
-        time.sleep(3)
+        time.sleep(backoff.delay)
         if DB is None or INTERFACE_ALERT_RULES is None or LOKI is None:
             continue
         try:
@@ -635,8 +636,10 @@ def _interface_alert_syslog_loop():
             log.exception("interface alert config lookup failed (syslog path)")
             continue
         try:
-            INTERFACE_ALERT_CHECKER.check_via_syslog(configs, LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
+            ok = INTERFACE_ALERT_CHECKER.check_via_syslog(configs, LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
+            backoff.ok() if ok else backoff.failed()
         except Exception:
+            backoff.failed()
             log.exception("interface alert syslog check failed")
 
 
@@ -688,14 +691,45 @@ def _env_and_polled_at_for(device_id):
 # fire and resolve/restart-recovery jobs interface_alerting.py splits
 # across check_once and reconcile_via_poll, since there's no "confirmed
 # down for N seconds" delayed-mode concept to keep separate.
+class PollBackoff:
+    """Sleep schedule for a poll loop that talks to something which can be
+    overloaded.
+
+    The 3-second cadence is right when Loki is healthy - a fan or PSU
+    fault should page within seconds. It is exactly wrong when Loki is
+    behind: two loops on two instances kept firing every 3 seconds into a
+    full queue, each timing out and retrying, so a brief overflow became a
+    sustained one (2026-09-15, 112 errors/min with one Console tab open).
+    Doubling the interval on each consecutive failure, capped, and
+    snapping back on the first success gives the queue room to drain
+    without giving up the fast path when nothing is wrong.
+    """
+
+    def __init__(self, base=3.0, cap=60.0):
+        self.base, self.cap, self.failures = base, cap, 0
+
+    def ok(self):
+        self.failures = 0
+
+    def failed(self):
+        self.failures += 1
+
+    @property
+    def delay(self):
+        return min(self.cap, self.base * (2 ** self.failures))
+
+
 def _hardware_alert_syslog_loop():
+    backoff = PollBackoff()
     while True:
-        time.sleep(3)
+        time.sleep(backoff.delay)
         if LOKI is None:
             continue
         try:
-            HARDWARE_ALERT_CHECKER.check_via_syslog(LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
+            ok = HARDWARE_ALERT_CHECKER.check_via_syslog(LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
+            backoff.ok() if ok else backoff.failed()
         except Exception:
+            backoff.failed()
             log.exception("hardware alert syslog check failed")
 
 
@@ -2342,13 +2376,28 @@ def api_syslog(
 
     try:
         filters = [f'event_category="{category}"'] if category else None
-        events = LOKI.query_range(filters=filters, limit=limit, since_seconds=since_seconds)
+        events = LOKI.query_range(filters=filters, limit=limit, since_seconds=_clamp_window(since_seconds))
     except LokiError as e:
         raise HTTPException(status_code=502, detail=f"Loki unreachable: {e}")
 
     if host_filter is not None:
         events = [e for e in events if e.get("source_ip") == host_filter or e.get("device_host") == host_filter]
     return events[:limit]
+
+
+# Widest window a Loki-backed read may ask for. Not retention (Loki keeps
+# everything, by decision - see loki/README.md) but a fan-out bound: at a
+# 24h split a 30-day query is 30 pieces, which is fine; unbounded, a
+# mistyped or hostile since_seconds turns into thousands.
+LOKI_MAX_WINDOW_SECONDS = 30 * 24 * 3600
+
+
+def _clamp_window(since_seconds):
+    try:
+        v = int(since_seconds)
+    except (TypeError, ValueError):
+        v = 3600
+    return max(60, min(v, LOKI_MAX_WINDOW_SECONDS))
 
 
 @app.get("/api/devices/{device_id}/alarm-history")
@@ -2395,7 +2444,7 @@ def api_alarm_history(
 
     try:
         events = LOKI.query_range(
-            filters=['facility=~"CHMGR|ENVMON|RPM|OSTATE"'], limit=limit, since_seconds=since_seconds
+            filters=['facility=~"CHMGR|ENVMON|RPM|OSTATE"'], limit=limit, since_seconds=_clamp_window(since_seconds)
         )
     except LokiError as e:
         raise HTTPException(status_code=502, detail=f"Loki unreachable: {e}")

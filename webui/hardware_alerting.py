@@ -132,7 +132,10 @@ class HardwareAlertChecker:
             )
         except Exception:
             log.warning("syslog-based hardware check skipped: Loki unreachable", exc_info=True)
-            return
+            # False = the query failed, so the caller's loop can back off.
+            # Distinct from "queried fine, nothing new" - that is a
+            # healthy poll and must not slow the cadence.
+            return False
 
         newest_seen = self._last_syslog_ts_ns
         for event in events:
@@ -162,6 +165,7 @@ class HardwareAlertChecker:
                 self._resolve(key, alertmanager, device_name_for)
                 self._last_posted.pop(key, None)
         self._last_syslog_ts_ns = newest_seen
+        return True
 
     def reconcile_via_poll(self, device_ids, get_env_and_polled_at, device_name_for, alertmanager):
         """Poll-fallback safety net, run on a tight loop (see app.py) -

@@ -189,7 +189,8 @@ export const getSyslog = ({ deviceId, category, limit = 200 } = {}) => {
   return api(`/api/syslog${qs ? `?${qs}` : ""}`);
 };
 
-export const getAlarmHistory = (deviceId) => api(`/api/devices/${deviceId}/alarm-history`);
+export const getAlarmHistory = (deviceId, sinceSeconds) =>
+  api(`/api/devices/${deviceId}/alarm-history${sinceSeconds ? `?since_seconds=${sinceSeconds}` : ""}`);
 
 // Runs several sequential SSH commands per device across the whole fleet
 // (LLDP, ARP, MAC table, port-channel membership) - the routine 60s

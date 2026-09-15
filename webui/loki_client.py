@@ -20,6 +20,14 @@ class LokiError(Exception):
     pass
 
 
+def _is_timeout(err):
+    """urllib wraps a socket timeout as URLError(reason=TimeoutError) on
+    some paths and raises TimeoutError bare on others; treat both alike."""
+    reason = getattr(err, "reason", None)
+    return isinstance(err, TimeoutError) or isinstance(reason, TimeoutError) \
+        or "timed out" in str(reason or err).lower()
+
+
 class LokiClient:
     def __init__(self, base_url, timeout=5):
         self.base_url = base_url.rstrip("/")
@@ -84,12 +92,16 @@ class LokiClient:
             "direction": "backward",
         }
         url = f"{self.base_url}/loki/api/v1/query_range?{urllib.parse.urlencode(params)}"
-        # One quick retry - a query is read-only and idempotent, so
-        # absorbing a single transient blip (the same class of thing
-        # ssh_client.py's connect()/run() retries already handle) is safe
-        # and avoids surfacing "Loki unreachable" to the user for what was
-        # actually just one dropped connection.
-        last_err = None
+        # One quick retry for a dropped connection - a query is read-only
+        # and idempotent, so absorbing a single transient blip is safe.
+        #
+        # But never for a timeout. A timeout means Loki is still working on
+        # the request (its log shows "context canceled" for exactly these);
+        # sending it again half a second later doubles the load at the one
+        # moment Loki is already behind, and with pollers on a 3-second
+        # loop that is how a brief queue overflow became a sustained one.
+        # A timeout is reported, and the next scheduled poll is the retry.
+        data, last_err = None, None
         with metrics.loki_query_duration_seconds.time():
             for attempt in range(2):
                 try:
@@ -98,11 +110,12 @@ class LokiClient:
                     break
                 except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
                     last_err = e
-                    if attempt == 0:
-                        time.sleep(0.5)
-            else:
-                metrics.loki_query_failure_total.inc()
-                raise LokiError(str(last_err)) from last_err
+                    if _is_timeout(e) or attempt == 1:
+                        break
+                    time.sleep(0.5)
+        if data is None:
+            metrics.loki_query_failure_total.inc()
+            raise LokiError(str(last_err)) from last_err
 
         events = []
         for stream in data.get("data", {}).get("result", []):
