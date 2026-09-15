@@ -195,7 +195,7 @@ export const getAlarmHistory = (deviceId, sinceSeconds) =>
 // Runs several sequential SSH commands per device across the whole fleet
 // (LLDP, ARP, MAC table, port-channel membership) - the routine 60s
 // default is right-sized for a single device, not this.
-export const getTopology = () => api("/api/topology", undefined, 180_000);
+export const getTopology = ({ refresh } = {}) => api(`/api/topology${refresh ? "?refresh=1" : ""}`, undefined, 180_000);
 
 export const saveTopologyBaseline = () => api("/api/topology/baseline", { method: "POST" });
 
@@ -321,3 +321,29 @@ export const updateSettings = (body) =>
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+
+
+// --- public API tokens (admin) ------------------------------------------
+export const listApiTokens = () => api("/api/tokens");
+export const createApiToken = (body) =>
+  api("/api/tokens", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+export const revokeApiToken = (id) => api(`/api/tokens/${id}`, { method: "DELETE" });
+
+// --- outbound webhooks (admin) ------------------------------------------
+export const listEvents = () => api("/api/events");
+export const listWebhooks = () => api("/api/webhooks");
+export const createWebhook = (body) =>
+  api("/api/webhooks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+export const updateWebhook = (id, body) =>
+  api(`/api/webhooks/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+export const deleteWebhook = (id) => api(`/api/webhooks/${id}`, { method: "DELETE" });
+export const testWebhook = (id) => api(`/api/webhooks/${id}/test`, { method: "POST" });
+
+// --- web push (per browser) ---------------------------------------------
+export const getPushConfig = () => api("/api/push/config");
+export const subscribePush = (body) =>
+  api("/api/push/subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+export const unsubscribePush = (endpoint) =>
+  api("/api/push/subscribe", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ endpoint }) });
+export const testPush = (endpoint) =>
+  api("/api/push/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ endpoint }) });

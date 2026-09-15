@@ -22,114 +22,6 @@ html, body {
   z-index: 1002;
 }
 
-/* Scoped to the raw command-output panel only - everything else uses
-   Cloudscape components/tokens untouched. A "terminal" reading of device
-   CLI output is a deliberate, distinct surface, not a Cloudscape content
-   area, so a dark monospace treatment here doesn't fight the design
-   system - it's a new kind of content, not an override of an existing one.
-   The ::before strip is a fake macOS-style title bar (three dots) - purely
-   decorative, applied once here so every place that renders CLI output
-   (raw view, and Markdown's code fences via the same class) gets it for
-   free without extra markup. */
-.terminal-output {
-  /* Cloudscape's Box variant="code" renders an inline <code> element by
-     default - vertical padding on an inline element doesn't reserve space
-     in the surrounding block flow, it only paints, so the title-bar strip
-     visually overlapped whatever text came before it instead of pushing
-     content down. Forcing block display (belt-and-suspenders with the
-     `display="block"` prop passed at each call site) fixes that. */
-  display: block;
-  position: relative;
-  /* `!important` is load-bearing here, not laziness. Cloudscape's
-     `Box variant="code"` ships a deliberate anti-override rule:
-       .awsui_box_X.awsui_code-variant_X.awsui_color-default_X:not(#\9)
-     The `:not(#\9)` injects ID-level specificity (~1,3,0) purely so app
-     CSS can't override it - it forces `background: 0 0` (transparent) and
-     `color: <body text>`. A plain `.terminal-output` rule (0,1,0) loses
-     regardless of source order, which is exactly what happened: the
-     ::before title bar rendered correctly (pseudo-element, untargeted by
-     Cloudscape) while the output body silently stayed white-on-dark-text
-     in light mode. Since Cloudscape's rules are not themselves
-     `!important`, an important declaration wins cleanly without having to
-     out-specify the hack with a chain of repeated class selectors. */
-  background: #000 !important;
-  color: #e8eaed !important;
-  font-family: ui-monospace, Menlo, Consolas, monospace !important;
-  font-size: 12.5px !important;
-  line-height: 1.5 !important;
-  white-space: pre-wrap;
-  word-break: break-word;
-  padding: 40px 16px 16px;
-  border-radius: 8px;
-  max-height: 60vh;
-  overflow: auto;
-}
-
-/* Rendered Markdown (comments, composer preview) gets its own subtle grey
-   panel - the light-grey-box-with-a-thin-outline treatment AWS Console
-   itself uses for rendered Markdown/readme content (CloudFormation change
-   set descriptions, Systems Manager runbooks), not a plain Container's
-   plain white body. Keyed off `body.awsui-dark-mode` - the real class this
-   app's own applyMode(mode) call (App.jsx) toggles on <body>, confirmed by
-   reading global-styles' own source rather than guessed - so this switches
-   correctly with the app's existing Light/Dark mode control instead of
-   silently staying light-mode-only colors in dark mode. */
-.markdown-box {
-  background: #f2f3f3;
-  border: 1px solid #d5dbdb;
-  border-radius: 8px;
-  padding: 12px 16px;
-}
-body.awsui-dark-mode .markdown-box {
-  background: #16191f;
-  border-color: #3b4149;
-}
-
-/* ```code fences``` inside a comment's rendered Markdown - deliberately
-   NOT .terminal-output (see MiniMarkdown.jsx's codeStyle prop for why: a
-   comment's fence is something a person typed, not device CLI output, and
-   the fake-terminal treatment there was reported live as wrong for this
-   context). Plain, theme-aware, closer to how Discord/GitHub render an
-   inline fenced block - no title bar, no forced-black background.
-   `!important` is required for the same reason .terminal-output needs it:
-   Cloudscape's own `Box variant="code"` ships an anti-override rule
-   (`:not(#\9)`, ~1,3,0 specificity) that forces a transparent background
-   and default text color, which a plain (0,1,0) class rule can't beat
-   through source order alone. */
-.markdown-code-block {
-  display: block;
-  background: #f2f3f5 !important;
-  color: #2e3338 !important;
-  font-family: ui-monospace, Menlo, Consolas, monospace !important;
-  font-size: 12.5px !important;
-  line-height: 1.5 !important;
-  white-space: pre-wrap;
-  word-break: break-word;
-  padding: 10px 12px;
-  border-radius: 6px;
-  max-height: 60vh;
-  overflow: auto;
-}
-body.awsui-dark-mode .markdown-code-block {
-  background: #2b2d31 !important;
-  color: #dbdee1 !important;
-}
-
-.terminal-output::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 30px;
-  background-color: #101215;
-  border-bottom: 1px solid #23262b;
-  border-radius: 8px 8px 0 0;
-  background-image:
-    radial-gradient(circle 6px at 18px 15px, #ff5f57 100%, transparent 101%),
-    radial-gradient(circle 6px at 38px 15px, #febc2e 100%, transparent 101%),
-    radial-gradient(circle 6px at 58px 15px, #28c840 100%, transparent 101%);
-}
 
 /* Front Panel - a physical hardware visualization has no equivalent stock
    Cloudscape component (same reasoning as .terminal-output above: new kind
@@ -527,4 +419,12 @@ body.awsui-dark-mode .markdown-code-block {
   height: 2px;
   background: #8a8f98;
   clip-path: polygon(15% 0, 85% 0, 100% 100%, 0 100%);
+}
+
+/* Phones: the chassis art is drawn to fixed proportions (traced from the
+   real hardware), so it scrolls sideways rather than squashing - a port
+   cage a third its width is unreadable, and impossible to tap. */
+.switch-chassis-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }

@@ -456,6 +456,59 @@ CREATE INDEX IF NOT EXISTS idx_netflow_stamp ON netflow_flows(stamp_inserted DES
 CREATE INDEX IF NOT EXISTS idx_netflow_agent ON netflow_flows(peer_ip_src, stamp_inserted DESC);
 CREATE INDEX IF NOT EXISTS idx_netflow_iface ON netflow_flows(peer_ip_src, iface_in, stamp_inserted DESC);
 
+-- API tokens: long-lived bearer credentials for scripts and integrations.
+-- Only a SHA-256 of the token is stored; the clear text is shown once at
+-- creation and never again, so a database read cannot mint a login.
+-- Tokens carry their own role (viewer/operator/admin) and never exceed the
+-- role of whoever created them - a viewer cannot hand out an admin token.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    prefix TEXT NOT NULL,
+    role TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ,
+    last_used_at TIMESTAMPTZ,
+    revoked_at TIMESTAMPTZ
+);
+
+-- Outbound webhooks. `events` is a JSON list of event names (or ["*"]).
+-- Deliveries are signed with HMAC-SHA256 over the body using `secret`, so
+-- a receiver can prove the call came from here rather than from anyone
+-- who learned the URL.
+CREATE TABLE IF NOT EXISTS webhooks (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    secret TEXT NOT NULL,
+    events TEXT NOT NULL DEFAULT '["*"]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_delivery_at TIMESTAMPTZ,
+    last_status INTEGER,
+    last_error TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0
+);
+
+-- Web Push subscriptions: one row per browser that opted in. The endpoint
+-- is the browser vendor's push URL and is unique per subscription. Pruned
+-- automatically when the push service says the subscription is gone.
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint TEXT PRIMARY KEY,
+    subscription TEXT NOT NULL,
+    username TEXT NOT NULL,
+    label TEXT,
+    min_severity TEXT NOT NULL DEFAULT 'warning',
+    notify_resolved INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ,
+    failures INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
 -- sFlow reports interfaces as SNMP ifIndex integers, which mean nothing to
 -- a human. Dell OS9 encodes them arithmetically (verified against the real
 -- switch), but Junos does not - its values are irregular (501, 503, 525,

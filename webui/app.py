@@ -50,8 +50,12 @@ import compliance
 import hardware_alerting
 import interface_alerting
 import retention
+import api_tokens
 import dns_cache
+import events
+import push as push_module
 import sflow_store
+import webhooks as webhooks_module
 from ssh_client import SwitchSSH, SwitchSSHError
 from status_poller import StatusPoller
 from store import DeviceStore
@@ -192,22 +196,111 @@ def _is_sid_revoked(sid):
         return sid in _revoked_sids
 
 
+# A per-process JWKS cache for validating Keycloak-issued bearer tokens.
+# Fetched from the issuer's metadata on first use and refreshed hourly (or
+# once immediately on a signature failure - the normal way a key rotation
+# shows up). Never touched by the session-cookie path, which needs no
+# network at all.
+_JWKS = {"keyset": None, "fetched_at": 0.0}
+_JWKS_TTL = 3600
+
+
+def _jwks():
+    now = time.monotonic()
+    if _JWKS["keyset"] is not None and now - _JWKS["fetched_at"] < _JWKS_TTL:
+        return _JWKS["keyset"]
+    import httpx
+    from joserfc.jwk import KeySet
+    meta = httpx.get(f"{OIDC_ISSUER_URL.rstrip('/')}/.well-known/openid-configuration", timeout=10).json()
+    resp = httpx.get(meta["jwks_uri"], timeout=10)
+    resp.raise_for_status()
+    _JWKS["keyset"] = KeySet.import_key_set(resp.json())
+    _JWKS["fetched_at"] = now
+    return _JWKS["keyset"]
+
+
+def _identity_from_keycloak_jwt(token):
+    """(username, role) from a Keycloak access token, or None if it is not
+    one of ours. The same checks an ID token gets at login - signature
+    against the realm's keys, issuer, expiry - and the role comes from the
+    same client-role claim, so a script authenticates exactly as a person
+    does, with exactly the access Keycloak says it has."""
+    if not OIDC_ISSUER_URL:
+        return None
+    from joserfc import jwt as jose_jwt
+    from joserfc.errors import JoseError
+    try:
+        try:
+            claims = jose_jwt.decode(token, _jwks()).claims
+        except JoseError:
+            _JWKS["fetched_at"] = 0.0
+            claims = jose_jwt.decode(token, _jwks()).claims
+    except Exception as e:
+        log.info("bearer token rejected as a Keycloak JWT: %s", e)
+        return None
+    if str(claims.get("iss", "")).rstrip("/") != OIDC_ISSUER_URL.rstrip("/"):
+        return None
+    exp = claims.get("exp")
+    if not exp or exp < time.time():
+        return None
+    username = claims.get("preferred_username") or claims.get("email") or claims.get("sub")
+    role = auth.role_from_claims(claims, OIDC_CLIENT_ID)
+    if not username or role is None:
+        return None
+    return username, role
+
+
+def _identity_from_bearer(request):
+    """(username, role) for an Authorization: Bearer header, or None when
+    there is no such header.
+
+    Two token shapes: our own `sb_...` API tokens (a hash lookup, no
+    network) and Keycloak access tokens (a JWT validated against the
+    realm's keys). Tried in that order because the first is cheap and
+    unambiguous - an API token can never parse as a JWT. A header that is
+    present but accepted by neither is a 401, not a fall-through to the
+    cookie: the caller said how it wants to be identified."""
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return None
+    token = header[7:].strip()
+    if not token:
+        return None
+    if api_tokens.looks_like_token(token):
+        if API_TOKENS is None:
+            raise HTTPException(status_code=503, detail="API tokens unavailable: database not configured")
+        row = API_TOKENS.verify(token)
+        if row is None:
+            raise HTTPException(status_code=401, detail="API token is invalid, expired or revoked")
+        request.state.auth_via = f"api-token:{row['name']}"
+        return f"token:{row['name']}", row["role"]
+    ident = _identity_from_keycloak_jwt(token)
+    if ident is None:
+        raise HTTPException(status_code=401, detail="Bearer token was not accepted")
+    request.state.auth_via = "keycloak-jwt"
+    return ident
+
+
 def require_auth(request: Request):
+    bearer = _identity_from_bearer(request)
+    if bearer is not None:
+        request.state.auth_user, request.state.auth_role = bearer
+        return bearer[0]
     session = request.session
-    # A role is required here, not just a username - api_auth_callback
-    # refuses to create a session at all for a Keycloak login with no
-    # recognized client role, but this is the actual enforcement backstop:
-    # even a read-only route must not treat "logged in" and "has a role"
-    # as the same thing (confirmed live: without this check, a
-    # username-only session could still list every device - a real gap,
-    # not hypothetical).
     if not session.get("username") or not session.get("role") or _session_expired(session):
         raise HTTPException(status_code=401, detail="Not logged in")
     if session.get("sid") and _is_sid_revoked(session["sid"]):
-        # Keycloak told us (via backchannel logout) this session already
-        # ended - the cookie is still validly signed but no longer honored.
         raise HTTPException(status_code=401, detail="Session was ended")
+    request.state.auth_user, request.state.auth_role = session["username"], session["role"]
     return session["username"]
+
+
+def _role_of(request):
+    """The role of whoever this request is - from the bearer token when
+    there was one, else the session. Role checks must read this, not the
+    session directly, or a token-authenticated request is judged by a
+    cookie it did not present."""
+    return getattr(request.state, "auth_role", None) or request.session.get("role")
 
 
 def require_auth_and_db(request: Request):
@@ -235,7 +328,7 @@ def require_role(min_role):
         # (shouldn't happen; api_auth_callback refuses to create one
         # without a real role) must fail role_meets, not silently pass as
         # viewer.
-        role = request.session.get("role")
+        role = _role_of(request)
         if not auth.role_meets(role, min_role):
             raise HTTPException(status_code=403, detail=f"requires {min_role} role, you have {role}")
         return user
@@ -266,7 +359,7 @@ def require_role_no_db(min_role):
     it, unable to recover without direct file/DB access. This must never
     happen again for this route."""
     def _dep(request: Request, user: str = Depends(require_auth)):
-        role = request.session.get("role")
+        role = _role_of(request)
         if not auth.role_meets(role, min_role):
             raise HTTPException(status_code=403, detail=f"requires {min_role} role, you have {role}")
         return user
@@ -276,7 +369,41 @@ def require_role_no_db(min_role):
 require_admin_no_db = require_role_no_db("admin")
 
 
-app = FastAPI(title="Switchboard")
+API_VERSION = "1.0"
+API_DESCRIPTION = """
+Switchboard's HTTP API. Everything the web UI does goes through these
+endpoints, and they are the same endpoints scripts and integrations use.
+
+**Authentication.** Three ways, all yielding the same identity and role:
+
+- the browser session cookie (what the UI uses);
+- `Authorization: Bearer sb_...` with an API token created on the
+  Settings page (or `POST /api/tokens`). Tokens carry a role of their own
+  and never exceed their creator's;
+- `Authorization: Bearer <Keycloak access token>` - a JWT issued by the
+  same realm the UI logs in against. The token's `resource_access`
+  client roles decide the role, exactly as at interactive login.
+
+**Roles.** `viewer` reads; `operator` runs commands and works alarms;
+`admin` changes configuration. Each endpoint states the floor it needs.
+
+**Versioning.** This is v1. Paths are stable; new fields may be added to
+responses at any time and clients should ignore fields they do not know.
+Breaking changes will arrive under a new prefix, not silently here.
+
+**Webhooks.** Register a URL under `/api/webhooks` and Switchboard POSTs
+events to it, signed with `X-Switchboard-Signature: sha256=<hmac>` over
+the raw body. `GET /api/events` lists the event names and what they mean.
+"""
+
+app = FastAPI(
+    title="Switchboard API",
+    version=API_VERSION,
+    description=API_DESCRIPTION,
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+)
 app.add_middleware(GZipMiddleware, minimum_size=500)
 # SameSite=Lax + JSON-only mutating bodies is this app's CSRF defense (no
 # CORS middleware exists or is added, so a cross-site form POST has nowhere
@@ -349,6 +476,12 @@ INTERFACE_ALERT_RULES = None
 COMMAND_HISTORY = None
 FAVORITES = None
 DNS = dns_cache.DnsCache()
+API_TOKENS = None
+WEBHOOKS = None
+WEBHOOK_DISPATCHER = None
+PUSH_SUBS = None
+PUSH_NOTIFIER = None
+PUSH_KEYS = None
 
 SFLOW = None
 NETFLOW = None
@@ -624,6 +757,34 @@ threading.Thread(target=_interface_alert_loop, daemon=True, name="interface-aler
 # already ships that same event to Loki in real time (syslog/vector.yaml),
 # so this polls Loki - a single cheap HTTP query, not an SSH round trip -
 # on a much tighter interval instead of waiting on the device poll cycle.
+class PollBackoff:
+    """Sleep schedule for a poll loop that talks to something which can be
+    overloaded.
+
+    The 3-second cadence is right when Loki is healthy - a fan or PSU
+    fault should page within seconds. It is exactly wrong when Loki is
+    behind: two loops on two instances kept firing every 3 seconds into a
+    full queue, each timing out and retrying, so a brief overflow became a
+    sustained one (2026-09-15, 112 errors/min with one Console tab open).
+    Doubling the interval on each consecutive failure, capped, and
+    snapping back on the first success gives the queue room to drain
+    without giving up the fast path when nothing is wrong.
+    """
+
+    def __init__(self, base=3.0, cap=60.0):
+        self.base, self.cap, self.failures = base, cap, 0
+
+    def ok(self):
+        self.failures = 0
+
+    def failed(self):
+        self.failures += 1
+
+    @property
+    def delay(self):
+        return min(self.cap, self.base * (2 ** self.failures))
+
+
 def _interface_alert_syslog_loop():
     backoff = PollBackoff()
     while True:
@@ -691,32 +852,6 @@ def _env_and_polled_at_for(device_id):
 # fire and resolve/restart-recovery jobs interface_alerting.py splits
 # across check_once and reconcile_via_poll, since there's no "confirmed
 # down for N seconds" delayed-mode concept to keep separate.
-class PollBackoff:
-    """Sleep schedule for a poll loop that talks to something which can be
-    overloaded.
-
-    The 3-second cadence is right when Loki is healthy - a fan or PSU
-    fault should page within seconds. It is exactly wrong when Loki is
-    behind: two loops on two instances kept firing every 3 seconds into a
-    full queue, each timing out and retrying, so a brief overflow became a
-    sustained one (2026-09-15, 112 errors/min with one Console tab open).
-    Doubling the interval on each consecutive failure, capped, and
-    snapping back on the first success gives the queue room to drain
-    without giving up the fast path when nothing is wrong.
-    """
-
-    def __init__(self, base=3.0, cap=60.0):
-        self.base, self.cap, self.failures = base, cap, 0
-
-    def ok(self):
-        self.failures = 0
-
-    def failed(self):
-        self.failures += 1
-
-    @property
-    def delay(self):
-        return min(self.cap, self.base * (2 ** self.failures))
 
 
 def _hardware_alert_syslog_loop():
@@ -992,13 +1127,36 @@ def _backfill_alert_history_fingerprints():
     log.info("backfilled fingerprints for %d alert history row(s)", filled)
 
 
+def _wire_event_bus():
+    """Subscribe the webhook dispatcher and push notifier to the event bus.
+    Runs on every (re)configuration; the bus is process-global, so the
+    previous subscribers are removed first rather than accumulated."""
+    global WEBHOOK_DISPATCHER, PUSH_NOTIFIER, PUSH_KEYS
+    if WEBHOOK_DISPATCHER is not None:
+        events.BUS.unsubscribe(WEBHOOK_DISPATCHER)
+    if PUSH_NOTIFIER is not None:
+        events.BUS.unsubscribe(PUSH_NOTIFIER)
+    WEBHOOK_DISPATCHER = webhooks_module.WebhookDispatcher(WEBHOOKS)
+    events.BUS.subscribe(WEBHOOK_DISPATCHER)
+    if PUSH_KEYS is None:
+        # VAPID's `sub` claim: push services validate it, and Apple rejects
+        # a bad one outright. The https origin users open is the best
+        # value; a mailto: on a real host is the fallback.
+        redirect = OIDC_REDIRECT_URI or ""
+        subject = os.environ.get("PUSH_VAPID_SUBJECT") or (
+            redirect.split("/api/")[0] if redirect.startswith("https://") else "mailto:switchboard@localhost")
+        PUSH_KEYS = push_module.VapidKeys(BASE_DIR / "data" / "push_vapid.json", subject)
+    PUSH_NOTIFIER = push_module.PushNotifier(PUSH_SUBS, PUSH_KEYS)
+    events.BUS.subscribe(PUSH_NOTIFIER)
+
+
 def _load_database(dsn):
     """Connects to Postgres, runs one-time legacy migrations, and (re)loads
     devices + status polling from it. Raises on a bad DSN/unreachable host
     so callers (setup wizard, Settings save) can report a clear error
     without disturbing whatever was working before the attempt."""
     global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES
-    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW, SFLOW_IFINDEX, NETFLOW
+    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW, SFLOW_IFINDEX, NETFLOW, API_TOKENS, WEBHOOKS, PUSH_SUBS
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
@@ -1021,6 +1179,16 @@ def _load_database(dsn):
     SFLOW = new_sflow
     NETFLOW = new_netflow
     SFLOW_IFINDEX = new_ifindex
+    API_TOKENS = api_tokens.ApiTokenStore(new_db)
+    WEBHOOKS = webhooks_module.WebhookStore(new_db)
+    PUSH_SUBS = push_module.PushSubscriptionStore(new_db)
+    try:
+        _wire_event_bus()
+    except Exception:
+        # Found live: OIDC_REDIRECT_URI is None on a dev instance, and one
+        # AttributeError here left the app with no devices and no push -
+        # everything after this line in the configuration never ran.
+        log.exception("event bus wiring failed - webhooks/push disabled, everything else continues")
 
     _migrate_legacy_json_devices()
     _migrate_legacy_sqlite()
@@ -1156,6 +1324,8 @@ class DeviceCreateRequest(BaseModel):
     # would, instead of a confusing "password is required" for a field the
     # user deliberately left blank to keep unchanged.
     edit_id: Optional[str] = None
+    notes: str = ""
+    runbook_url: str = ""
 
 
 def _validate_device_request(req, existing=None):
@@ -1725,10 +1895,13 @@ def api_create_device(req: DeviceCreateRequest, user: str = Depends(require_admi
             "passphrase": req.passphrase,
             "enable_password": req.enable_password,
             "ports": req.ports,
+            "notes": req.notes.strip(),
+            "runbook_url": req.runbook_url.strip(),
             "port_channels": req.port_channels,
         }
         STORE.add(record)
         device = StoredDevice(record)
+        events.BUS.emit("device.created", device_id=device.id, device=device.name, by=user)
         DEVICES.append(device)
         DEVICES_BY_ID[device.id] = device
         _session_locks[device.id] = threading.Lock()
@@ -1780,10 +1953,13 @@ def api_update_device(device_id: str, req: DeviceCreateRequest, user: str = Depe
             "passphrase": req.passphrase or (existing or {}).get("passphrase"),
             "enable_password": req.enable_password or (existing or {}).get("enable_password"),
             "ports": req.ports,
+            "notes": req.notes.strip(),
+            "runbook_url": req.runbook_url.strip(),
             "port_channels": req.port_channels,
         }
         STORE.update(device_id, record)
         new_device = StoredDevice(record)
+        events.BUS.emit("device.updated", device_id=device_id, device=new_device.name, by=user)
         idx = next(i for i, d in enumerate(DEVICES) if d.id == device_id)
         DEVICES[idx] = new_device
         DEVICES_BY_ID[device_id] = new_device
@@ -1807,6 +1983,7 @@ def api_delete_device(device_id: str, user: str = Depends(require_admin)):
         raise HTTPException(status_code=400, detail="only devices added through the UI can be deleted")
     with _registry_lock:
         STORE.delete(device_id)
+        events.BUS.emit("device.deleted", device_id=device_id, by=user)
         DEVICES[:] = [d for d in DEVICES if d.id != device_id]
         del DEVICES_BY_ID[device_id]
         _session_locks.pop(device_id, None)
@@ -2057,6 +2234,7 @@ def _run_and_save(device, category_id, command_id, params, user, auto_saved=True
         # The audit trail's own entry for the same event - see
         # command_history.py's module docstring for why both exist.
         AUDIT.record(user, "command.run", device.id, cmd)
+        events.BUS.emit("command.ran", device_id=device.id, device=device.name, command=cmd, by=user)
     return {"command": cmd, "output": output, "summary": summary, "saved_as": saved["filename"]}
 
 
@@ -2640,6 +2818,7 @@ def api_ack_occurrence(occurrence_id: int, req: NoteRequest, user: str = Depends
     that rather than implying the alarm as a whole is handled forever."""
     occurrence = _require_occurrence(occurrence_id)
     ack = OCCURRENCES.ack(occurrence_id, user, req.note)
+    events.BUS.emit("alarm.acknowledged", occurrence=_occ_payload(occurrence), by=user, note=req.note)
     AUDIT.record(user, "alert.ack", occurrence["alertname"], {"note": req.note},
                  occurrence["signature"], occurrence_id)
     log.info("user=%s acknowledged alarm %s (%s)", user, occurrence_id, occurrence["alertname"])
@@ -2651,6 +2830,7 @@ def api_unack_occurrence(occurrence_id: int, user: str = Depends(require_operato
     occurrence = _require_occurrence(occurrence_id)
     if not OCCURRENCES.unack(occurrence_id):
         raise HTTPException(status_code=404, detail="that alarm is not acknowledged")
+    events.BUS.emit("alarm.unacknowledged", occurrence=_occ_payload(occurrence), by=user)
     AUDIT.record(user, "alert.unack", occurrence["alertname"], None, occurrence["signature"], occurrence_id)
     log.info("user=%s un-acknowledged alarm %s", user, occurrence_id)
     return {"ok": True}
@@ -2936,6 +3116,7 @@ def api_add_comment(occurrence_id: int, req: CommentRequest, user: str = Depends
     if not body:
         raise HTTPException(status_code=400, detail="comment cannot be empty")
     result = OCCURRENCES.add_comment(occurrence_id, user, body)
+    events.BUS.emit("alarm.commented", occurrence=_occ_payload(occurrence), by=user, note=body)
     AUDIT.record(user, "alert.comment", occurrence["alertname"], {"note": body},
                  occurrence["signature"], occurrence_id)
     return result
@@ -3164,7 +3345,10 @@ async def api_alertmanager_webhook(request: Request):
             signature = alert_acks.fingerprint_for(labels)
             try:
                 if status == "firing":
+                    was_open = OCCURRENCES.open_for(signature)
                     occurrence = OCCURRENCES.open(signature, name, severity, summary, labels)
+                    if occurrence and was_open is None:
+                        events.BUS.emit("alarm.opened", occurrence=_occ_payload(occurrence))
                     held = PENDING_HOLDS.pop(signature, None)
                     if occurrence and held and occurrence.get("page_at") is None and occurrence.get("paged_at") is None:
                         OCCURRENCES.set_paging(occurrence["id"], held[1], held[0])
@@ -3184,6 +3368,8 @@ async def api_alertmanager_webhook(request: Request):
                     elif held:
                         PAGER.release(held[0])
                     OCCURRENCES.close(signature)
+                    if open_occurrence:
+                        events.BUS.emit("alarm.resolved", occurrence=_occ_payload(open_occurrence), by="alertmanager")
             except Exception:
                 log.exception("could not update alarm occurrence for %s", name)
     return {"ok": True}
@@ -3533,6 +3719,25 @@ def _name_flow_ends(rows):
         r["ip_src_host"] = names.get(r.get("ip_src"))
         r["ip_dst_host"] = names.get(r.get("ip_dst"))
     return rows
+
+
+
+
+def _occ_payload(occ):
+    """The outward-facing shape of an occurrence: what a webhook receiver
+    or a phone needs, and nothing internal."""
+    if not occ:
+        return None
+    labels = occ.get("labels") or {}
+    if isinstance(labels, str):
+        try:
+            labels = json.loads(labels)
+        except Exception:
+            labels = {}
+    return {"id": occ.get("id"), "alertname": occ.get("alertname"), "severity": occ.get("severity"),
+            "summary": occ.get("summary"), "device": labels.get("device") or labels.get("instance"),
+            "signature": occ.get("signature"), "started_at": str(occ.get("started_at") or ""),
+            "labels": labels}
 
 
 def _flow_store(source):
@@ -3888,6 +4093,57 @@ def _lag_health(edges):
     return health
 
 
+def _gather_device_topology(device):
+    """Every topology input for one device - LLDP, ARP, MAC table,
+    port-channel membership - in one pass under that device's own lock.
+    Returns (raw_lldp, lldp_error, arp_rows, mac_rows, pc_members); any of
+    the optional ones is None when the platform has no such command or the
+    fetch failed, and a failure of one does not cost the others."""
+    lldp_raw = lldp_err = arp_rows = mac_rows = pc_members = None
+    with _session_locks[device.id]:
+        switch = _get_session(device)
+        cmd = _LLDP_COMMAND.get(device.platform)
+        if cmd:
+            try:
+                lldp_raw = switch.run(cmd)
+            except SwitchSSHError as e:
+                lldp_err = str(e)
+            except Exception:
+                log.exception("unexpected error fetching LLDP for topology from %s", device.id)
+                lldp_err = "internal error"
+        for name, table, parser in (("ARP", _ARP_COMMAND, _ARP_PARSER),
+                                    ("MAC table", _MAC_TABLE_COMMAND, _MAC_TABLE_PARSER),
+                                    ("port-channel membership", _PORT_CHANNEL_COMMAND, _PORT_CHANNEL_PARSER)):
+            cmd = table.get(device.platform)
+            if not cmd:
+                continue
+            try:
+                parsed = parser[device.platform](switch.run(cmd))
+            except Exception:
+                log.warning("could not fetch %s from %s for topology", name, device.id, exc_info=True)
+                continue
+            if name == "ARP":
+                arp_rows = parsed
+            elif name == "MAC table":
+                mac_rows = parsed
+            else:
+                pc_members = parsed
+    return lldp_raw, lldp_err, arp_rows, mac_rows, pc_members
+
+
+# The topology page used to crawl every device on every load and again
+# every 30 seconds: four SSH commands per device, one device at a time,
+# so three devices was twelve sequential round trips before anything
+# rendered. Now one background thread crawls on its own cadence - devices
+# concurrently, each device's four commands serialised under its own
+# lock - and the page reads the cache. Topology changes on the scale of
+# minutes; a diagram sixty seconds old is not a stale diagram, and a
+# forced refresh is one click for the moment it is.
+_TOPOLOGY_CACHE = {"result": None, "fetched_at": None, "error": None, "refreshing": False}
+_TOPOLOGY_LOCK = threading.Lock()
+TOPOLOGY_REFRESH_SECONDS = int(os.environ.get("TOPOLOGY_REFRESH_SECONDS", "60"))
+
+
 def _fetch_live_topology():
     """Fetches live LLDP from every device, builds the graph, and overlays
     current link state + (where the platform has it) Mbps utilization from
@@ -3896,76 +4152,28 @@ def _fetch_live_topology():
     fail the whole call - that device just shows up with no edges and
     `lldp_error` set, same partial-failure tolerance as the rest of this
     app's multi-device endpoints."""
-    raw_by_device = {}
-    errors_by_device = {}
-    for device in DEVICES:
-        # Not every platform runs/exposes LLDP (e.g. OPNsense - a firewall
-        # appliance, not part of the LLDP-discovered switch fabric) -
-        # skipped entirely rather than surfaced as a per-device error.
-        lldp_command = _LLDP_COMMAND.get(device.platform)
-        if lldp_command is None:
-            continue
-        try:
-            with _session_locks[device.id]:
-                switch = _get_session(device)
-                raw_by_device[device.id] = switch.run(lldp_command)
-        except SwitchSSHError as e:
-            errors_by_device[device.id] = str(e)
-        except Exception:
-            log.exception("unexpected error fetching LLDP for topology from %s", device.id)
-            errors_by_device[device.id] = "internal error"
-
-    # ARP tables merge in from every device regardless of LLDP support -
-    # OPNsense (no LLDP integration) still sees the whole LAN and is often
-    # the most complete source, since it's the router. Best-effort: a
-    # device that fails here just doesn't contribute any MAC->IP entries,
-    # same partial-failure tolerance as everything else on this page.
-    arp_rows_by_device = {}
-    for device in DEVICES:
-        arp_command = _ARP_COMMAND.get(device.platform)
-        if arp_command is None:
-            continue
-        try:
-            with _session_locks[device.id]:
-                switch = _get_session(device)
-                raw_arp = switch.run(arp_command)
-            arp_rows_by_device[device.id] = _ARP_PARSER[device.platform](raw_arp)
-        except Exception:
-            log.warning("could not fetch ARP table from %s for topology", device.id, exc_info=True)
+    raw_by_device, errors_by_device = {}, {}
+    arp_rows_by_device, mac_table_by_device, port_channel_members_by_device = {}, {}, {}
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(DEVICES) or 1)), thread_name_prefix="topology") as pool:
+        for device, fut in [(d, pool.submit(_gather_device_topology, d)) for d in DEVICES]:
+            try:
+                lldp_raw, lldp_err, arp_rows, mac_rows, pc_members = fut.result()
+            except Exception:
+                log.exception("topology gather failed for %s", device.id)
+                errors_by_device[device.id] = "internal error"
+                continue
+            if lldp_raw is not None:
+                raw_by_device[device.id] = lldp_raw
+            if lldp_err is not None:
+                errors_by_device[device.id] = lldp_err
+            if arp_rows is not None:
+                arp_rows_by_device[device.id] = arp_rows
+            if mac_rows is not None:
+                mac_table_by_device[device.id] = mac_rows
+            if pc_members is not None:
+                port_channel_members_by_device[device.id] = pc_members
     mac_to_ip = topology.merge_mac_to_ip(arp_rows_by_device)
-
-    # MAC/switching table: a second, independent discovery source (see
-    # topology.py's module docstring) that finds hosts LLDP never will -
-    # anything that's sent/received a frame shows up here, LLDP-capable or
-    # not. Same best-effort tolerance as ARP above.
-    mac_table_by_device = {}
-    for device in DEVICES:
-        mac_table_command = _MAC_TABLE_COMMAND.get(device.platform)
-        if mac_table_command is None:
-            continue
-        try:
-            with _session_locks[device.id]:
-                switch = _get_session(device)
-                raw_mac_table = switch.run(mac_table_command)
-            mac_table_by_device[device.id] = _MAC_TABLE_PARSER[device.platform](raw_mac_table)
-        except Exception:
-            log.warning("could not fetch MAC table from %s for topology", device.id, exc_info=True)
-
-    # Port-channel membership (Dell OS9 only - see _PORT_CHANNEL_COMMAND).
-    # Same best-effort tolerance as ARP/MAC-table above.
-    port_channel_members_by_device = {}
-    for device in DEVICES:
-        pc_command = _PORT_CHANNEL_COMMAND.get(device.platform)
-        if pc_command is None:
-            continue
-        try:
-            with _session_locks[device.id]:
-                switch = _get_session(device)
-                raw_pc = switch.run(pc_command)
-            port_channel_members_by_device[device.id] = _PORT_CHANNEL_PARSER[device.platform](raw_pc)
-        except Exception:
-            log.warning("could not fetch port-channel membership from %s for topology", device.id, exc_info=True)
-
     result = topology.build_topology(
         DEVICES,
         raw_by_device,
@@ -4020,14 +4228,67 @@ def _fetch_live_topology():
     return result
 
 
-@app.get("/api/topology")
-def api_topology(user: str = Depends(require_auth_and_db)):
-    """Fleet-wide topology from live LLDP data - fetched fresh on every
-    call (no background poller for this) since topology changes rarely and
-    there are only ever as many devices as are configured, so the extra
-    per-device SSH round trip on page load/refresh is cheap."""
-    result = _fetch_live_topology()
-    result["lag_health"] = _lag_health(result["edges"])
+def _refresh_topology_cache():
+    """One crawl into the cache. Safe to call from the loop and from a
+    request; a crawl already in progress is not doubled up."""
+    with _TOPOLOGY_LOCK:
+        if _TOPOLOGY_CACHE["refreshing"]:
+            return False
+        if not DEVICES:
+            # Nothing to crawl is not a result. Caching an empty topology
+            # here (seen live: the first request landed before devices had
+            # loaded) would serve "no links" for a full refresh interval.
+            _TOPOLOGY_CACHE["error"] = "no devices loaded yet"
+            return False
+        _TOPOLOGY_CACHE["refreshing"] = True
+    try:
+        result = _fetch_live_topology()
+        result["lag_health"] = _lag_health(result["edges"])
+        with _TOPOLOGY_LOCK:
+            _TOPOLOGY_CACHE.update(result=result, fetched_at=datetime.now(timezone.utc), error=None)
+        return True
+    except Exception as e:
+        log.exception("topology refresh failed")
+        with _TOPOLOGY_LOCK:
+            _TOPOLOGY_CACHE["error"] = str(e)
+        return False
+    finally:
+        with _TOPOLOGY_LOCK:
+            _TOPOLOGY_CACHE["refreshing"] = False
+
+
+def _topology_refresh_loop():
+    while True:
+        if DB is not None and DEVICES:
+            _refresh_topology_cache()
+        time.sleep(TOPOLOGY_REFRESH_SECONDS)
+
+
+threading.Thread(target=_topology_refresh_loop, daemon=True, name="topology-refresh").start()
+
+
+@app.get("/api/topology", tags=["topology"], summary="Fleet topology (cached)")
+def api_topology(refresh: int = 0, user: str = Depends(require_auth_and_db)):
+    """Fleet-wide topology from LLDP, ARP and MAC-table data.
+
+    Served from a cache that a background thread refreshes every
+    TOPOLOGY_REFRESH_SECONDS (default 60). `?refresh=1` forces a live crawl
+    first - a few seconds of SSH round trips - for the moment a link was
+    just moved and sixty seconds is too long to wait. The response carries
+    `fetched_at` and `age_seconds` so the page can say how old it is."""
+    if refresh or _TOPOLOGY_CACHE["result"] is None:
+        _refresh_topology_cache()
+    with _TOPOLOGY_LOCK:
+        cached, fetched_at, error = _TOPOLOGY_CACHE["result"], _TOPOLOGY_CACHE["fetched_at"], _TOPOLOGY_CACHE["error"]
+        refreshing = _TOPOLOGY_CACHE["refreshing"]
+    if cached is None:
+        raise HTTPException(status_code=503, detail=f"topology not available yet: {error or 'first crawl still running'}")
+    result = dict(cached)
+    result["fetched_at"] = fetched_at.isoformat() if fetched_at else None
+    result["age_seconds"] = round((datetime.now(timezone.utc) - fetched_at).total_seconds()) if fetched_at else None
+    result["refreshing"] = refreshing
+    result["refresh_seconds"] = TOPOLOGY_REFRESH_SECONDS
+    result["last_error"] = error
 
     baseline = TOPOLOGY_STORE.get()
     result["baseline"] = (
@@ -4070,6 +4331,160 @@ def api_clear_topology_baseline(user: str = Depends(require_admin)):
     return {"ok": True}
 
 
+# ------------------------------------------------------------ API tokens
+
+class ApiTokenCreateRequest(BaseModel):
+    name: str
+    role: str = "viewer"
+    expires_in_days: Optional[int] = None
+
+
+@app.get("/api/tokens", tags=["auth"], summary="List API tokens")
+def api_list_tokens(user: str = Depends(require_admin)):
+    return API_TOKENS.list()
+
+
+@app.post("/api/tokens", tags=["auth"], summary="Create an API token", status_code=201)
+def api_create_token(req: ApiTokenCreateRequest, request: Request, user: str = Depends(require_admin)):
+    """The clear-text token is in this response and nowhere else. A token
+    never carries more than the role of the account creating it."""
+    expires_at = None
+    if req.expires_in_days:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=int(req.expires_in_days))
+    try:
+        row, token = API_TOKENS.create(req.name, req.role, user, _role_of(request), expires_at)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    AUDIT.record(user, "token.create", req.name, {"role": req.role})
+    return {**row, "token": token}
+
+
+@app.delete("/api/tokens/{token_id}", tags=["auth"], summary="Revoke an API token")
+def api_revoke_token(token_id: int, user: str = Depends(require_admin)):
+    if not API_TOKENS.revoke(token_id):
+        raise HTTPException(status_code=404, detail="no such active token")
+    AUDIT.record(user, "token.revoke", str(token_id), None)
+    return {"ok": True}
+
+
+# ------------------------------------------------------------ events + webhooks
+
+@app.get("/api/events", tags=["webhooks"], summary="Event catalogue")
+def api_list_events(user: str = Depends(require_auth)):
+    return [{"name": k, "description": v} for k, v in events.EVENTS.items()]
+
+
+class WebhookRequest(BaseModel):
+    name: str
+    url: str
+    events: list = ["*"]
+    enabled: bool = True
+
+
+@app.get("/api/webhooks", tags=["webhooks"], summary="List webhooks")
+def api_list_webhooks(user: str = Depends(require_admin)):
+    return WEBHOOKS.list()
+
+
+@app.post("/api/webhooks", tags=["webhooks"], summary="Create a webhook", status_code=201)
+def api_create_webhook(req: WebhookRequest, user: str = Depends(require_admin)):
+    """The signing secret is in this response and nowhere else."""
+    try:
+        row = WEBHOOKS.create(req.name, req.url, req.events, user)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not req.enabled:
+        WEBHOOKS.update(row["id"], enabled=False)
+        row["enabled"] = False
+    AUDIT.record(user, "webhook.create", req.name, {"url": req.url})
+    return row
+
+
+@app.put("/api/webhooks/{webhook_id}", tags=["webhooks"], summary="Update a webhook")
+def api_update_webhook(webhook_id: int, req: WebhookRequest, user: str = Depends(require_admin)):
+    unknown = [e for e in req.events if e != "*" and e not in events.EVENTS]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"unknown event(s): {', '.join(unknown)}")
+    row = WEBHOOKS.update(webhook_id, name=req.name, url=req.url, events=req.events, enabled=req.enabled)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such webhook")
+    AUDIT.record(user, "webhook.update", req.name, {"url": req.url, "enabled": req.enabled})
+    return row
+
+
+@app.delete("/api/webhooks/{webhook_id}", tags=["webhooks"], summary="Delete a webhook")
+def api_delete_webhook(webhook_id: int, user: str = Depends(require_admin)):
+    if not WEBHOOKS.delete(webhook_id):
+        raise HTTPException(status_code=404, detail="no such webhook")
+    AUDIT.record(user, "webhook.delete", str(webhook_id), None)
+    return {"ok": True}
+
+
+@app.post("/api/webhooks/{webhook_id}/test", tags=["webhooks"], summary="Send a test delivery")
+def api_test_webhook(webhook_id: int, user: str = Depends(require_admin)):
+    result = WEBHOOK_DISPATCHER.test(webhook_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="no such webhook")
+    return result
+
+
+# ------------------------------------------------------------ web push (the in-house pager)
+
+class PushSubscribeRequest(BaseModel):
+    subscription: dict
+    min_severity: str = "warning"
+    notify_resolved: bool = True
+    label: Optional[str] = None
+
+
+class PushEndpointRequest(BaseModel):
+    endpoint: str
+
+
+@app.get("/api/push/config", tags=["push"], summary="Push availability + this user's devices")
+def api_push_config(user: str = Depends(require_auth_and_db)):
+    enabled = bool(PUSH_KEYS and PUSH_KEYS.available)
+    return {"enabled": enabled, "public_key": PUSH_KEYS.public_key if enabled else None,
+            "subscriptions": PUSH_SUBS.list(username=user)}
+
+
+@app.post("/api/push/subscribe", tags=["push"], summary="Register this browser for paging")
+def api_push_subscribe(req: PushSubscribeRequest, user: str = Depends(require_auth_and_db)):
+    if not (PUSH_KEYS and PUSH_KEYS.available):
+        raise HTTPException(status_code=503, detail="push is not available on this server")
+    try:
+        row = PUSH_SUBS.upsert(req.subscription, user, req.label, req.min_severity, req.notify_resolved)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    AUDIT.record(user, "push.subscribe", (req.label or "")[:60], {"min_severity": req.min_severity})
+    return row
+
+
+@app.delete("/api/push/subscribe", tags=["push"], summary="Unregister a browser")
+def api_push_unsubscribe(req: PushEndpointRequest, request: Request, user: str = Depends(require_auth_and_db)):
+    mine = {r["endpoint"] for r in PUSH_SUBS.list(username=user)}
+    if req.endpoint not in mine and not auth.role_meets(_role_of(request), "admin"):
+        raise HTTPException(status_code=403, detail="not your subscription")
+    PUSH_SUBS.remove(req.endpoint)
+    return {"ok": True}
+
+
+@app.get("/api/push/subscriptions", tags=["push"], summary="Every subscribed browser (admin)")
+def api_push_subscriptions(user: str = Depends(require_admin)):
+    return PUSH_SUBS.list()
+
+
+@app.post("/api/push/test", tags=["push"], summary="Send a test page to one browser")
+def api_push_test(req: PushEndpointRequest, request: Request, user: str = Depends(require_auth_and_db)):
+    mine = {r["endpoint"] for r in PUSH_SUBS.list(username=user)}
+    if req.endpoint not in mine and not auth.role_meets(_role_of(request), "admin"):
+        raise HTTPException(status_code=403, detail="not your subscription")
+    result = PUSH_NOTIFIER.test(req.endpoint)
+    if result is None:
+        raise HTTPException(status_code=404, detail="no such subscription")
+    return result
+
+
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 
 
@@ -4098,7 +4513,36 @@ else:
     log.warning("frontend/dist/assets not found - run `npm run build` in webui/frontend/; static assets won't be served")
 
 
-@app.get("/")
+@app.get("/sw.js", include_in_schema=False)
+def service_worker():
+    path = FRONTEND_DIST / "sw.js"
+    if not path.exists():
+        raise HTTPException(status_code=404)
+    # Service-Worker-Allowed lets a worker served here claim "/" scope;
+    # no-cache so a new build takes effect on the next visit, not a day later.
+    return FileResponse(str(path), media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+
+@app.get("/manifest.webmanifest", include_in_schema=False)
+def web_manifest():
+    path = FRONTEND_DIST / "manifest.webmanifest"
+    if not path.exists():
+        raise HTTPException(status_code=404)
+    return FileResponse(str(path), media_type="application/manifest+json", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/icons/{name}", include_in_schema=False)
+def pwa_icon(name: str):
+    if "/" in name or ".." in name or not name.endswith(".png"):
+        raise HTTPException(status_code=404)
+    path = FRONTEND_DIST / "icons" / name
+    if not path.exists():
+        raise HTTPException(status_code=404)
+    return FileResponse(str(path), media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/", include_in_schema=False)
 def index():
     # Always unauthenticated - the SPA itself calls /api/auth/me on load
     # and redirects to /api/auth/login on a 401 (see api.js). Gating index.html

@@ -32,6 +32,8 @@ const PLATFORM_OPTIONS = [
 ];
 
 const EMPTY_FORM = {
+  notes: "",
+  runbookUrl: "",
   name: "",
   host: "",
   make: "",
@@ -65,6 +67,8 @@ function toRequestBody(form, editId) {
     host: form.host,
     make: form.make,
     model: form.model,
+    notes: form.notes,
+    runbook_url: form.runbookUrl,
     platform: form.platform,
     username: form.username,
     auth_method: form.authMethod,
@@ -144,6 +148,8 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash, prefil
         host: data.host,
         make: data.make,
         model: data.model,
+        notes: data.notes || "",
+        runbookUrl: data.runbook_url || "",
         platform: data.platform,
         username: data.username,
         authMethod: data.auth_method,
@@ -310,6 +316,28 @@ export default function DevicesPage({ devices, refreshDevices, pushFlash, prefil
                   <Input value={form.model} onChange={({ detail }) => setField("model", detail.value)} placeholder="S4048-ON, Catalyst 9300..." />
                 </FormField>
               </SpaceBetween>
+              <FormField
+                label="Runbook link"
+                description="Shown on the Console page for this device - where to look first when it pages."
+              >
+                <Input
+                  value={form.runbookUrl}
+                  onChange={({ detail }) => setField("runbookUrl", detail.value)}
+                  placeholder="https://wiki.example.com/runbooks/core-switch"
+                  inputMode="url"
+                />
+              </FormField>
+              <FormField
+                label="Notes"
+                description="Anything the next person should know: rack position, quirks, who to call."
+              >
+                <Textarea
+                  value={form.notes}
+                  onChange={({ detail }) => setField("notes", detail.value)}
+                  rows={3}
+                  placeholder="Rack 3 U12. Console cable on the left. Reboots take ~4 minutes."
+                />
+              </FormField>
               <FormField
                 label="Operating system"
                 description="Only Dell OS9's command set is wired up in the Console today - other platforms can be saved and reached over SSH, but the commands menu may not match its syntax."

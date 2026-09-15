@@ -311,7 +311,7 @@ export default function FrontPanelView({ device, status, profileId, onProfileCha
         <Box color="text-status-inactive">Loading live port status...</Box>
       ) : (
         <SpaceBetween size="xs">
-          <div className="switch-chassis">
+          <div className="switch-chassis switch-chassis-scroll">
             <div className="switch-rack-ear left">
               <span className="screw" />
               <span className="screw" />

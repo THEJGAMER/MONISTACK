@@ -13,6 +13,14 @@ import Toggle from "@cloudscape-design/components/toggle";
 import TextFilter from "@cloudscape-design/components/text-filter";
 import Pagination from "@cloudscape-design/components/pagination";
 
+import Tabs from "@cloudscape-design/components/tabs";
+import {
+  colorChartsStatusPositive, colorChartsStatusHigh, colorChartsStatusNeutral,
+  colorTextBodyDefault, colorTextBodySecondary, colorBorderDividerDefault,
+  colorBackgroundContainerContent, colorBackgroundLayoutMain, colorBorderItemFocused,
+  colorBackgroundStatusInfo, colorBackgroundStatusError, colorBorderStatusError,
+  fontFamilyMonospace,
+} from "@cloudscape-design/design-tokens";
 import { getTopology, saveTopologyBaseline, acceptTopologyDrift, clearTopologyBaseline } from "./api.js";
 
 const PORT_PAGE_SIZE = 15;
@@ -50,15 +58,22 @@ const PORT_ROW_H = 28;
 const PORT_PADDING = 6;
 const AUTO_REFRESH_MS = 30_000;
 
-const COLOR_UP = "#037f0c";
-const COLOR_DOWN = "#d13212";
-const COLOR_UNKNOWN = "#9aa5b1";
-const COLOR_DEVICE_STROKE = "#0972d3";
-const COLOR_DEVICE_FILL = "#f0f6ff";
-const COLOR_DEVICE_ERROR_STROKE = "#d13212";
-const COLOR_DEVICE_ERROR_FILL = "#fdf2f1";
-const COLOR_TEXT = "#16191f";
-const COLOR_TEXT_SECONDARY = "#68737d";
+// Cloudscape design tokens, not hex: these resolve to CSS variables, so
+// the diagram follows the app's light/dark mode instead of staying a
+// light-mode island, and the status colours are the same ones every
+// StatusIndicator on the page uses.
+const COLOR_UP = colorChartsStatusPositive;
+const COLOR_DOWN = colorChartsStatusHigh;
+const COLOR_UNKNOWN = colorChartsStatusNeutral;
+const COLOR_DEVICE_STROKE = colorBorderItemFocused;
+const COLOR_DEVICE_FILL = colorBackgroundStatusInfo;
+const COLOR_DEVICE_ERROR_STROKE = colorBorderStatusError;
+const COLOR_DEVICE_ERROR_FILL = colorBackgroundStatusError;
+const COLOR_TEXT = colorTextBodyDefault;
+const COLOR_TEXT_SECONDARY = colorTextBodySecondary;
+const COLOR_CARD_FILL = colorBackgroundContainerContent;
+const COLOR_CARD_HEADER = colorBackgroundLayoutMain;
+const COLOR_DIVIDER = colorBorderDividerDefault;
 
 // Right-angle "elbow" connector (drop - step - drop), same convention as
 // an org-chart/tree diagram: down from the parent, across at the
@@ -177,10 +192,10 @@ export default function TopologyPage({ pushFlash, onOpenConsole, onAddDevice }) 
   const prevStates = useRef(null); // edge key -> status, from the previous fetch (for flap detection)
   const firstLoad = useRef(true);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force) => {
     setLoading(true);
     try {
-      const next = await getTopology();
+      const next = await getTopology({ refresh: force === true });
       if (!firstLoad.current && prevStates.current) {
         const nextStates = {};
         const flap = (key, label, status) => {
@@ -222,7 +237,7 @@ export default function TopologyPage({ pushFlash, onOpenConsole, onAddDevice }) 
 
   useEffect(() => {
     if (!autoRefresh) return;
-    const id = setInterval(load, AUTO_REFRESH_MS);
+    const id = setInterval(() => load(false), AUTO_REFRESH_MS);
     return () => clearInterval(id);
   }, [autoRefresh, load]);
 
@@ -534,302 +549,330 @@ export default function TopologyPage({ pushFlash, onOpenConsole, onAddDevice }) 
         </SpaceBetween>
       </Container>
 
-      <Container
-        header={
-          <Header
-            variant="h2"
-            actions={
-              <SpaceBetween direction="horizontal" size="s">
-                <Toggle checked={showMacTableHosts} onChange={({ detail }) => setShowMacTableHosts(detail.checked)}>
-                  MAC-table hosts ({macTableHostCount})
-                </Toggle>
-                <Toggle checked={autoRefresh} onChange={({ detail }) => setAutoRefresh(detail.checked)}>
-                  Auto-refresh (30s)
-                </Toggle>
-                <Button iconName="refresh" onClick={load} loading={loading}>
-                  Refresh
-                </Button>
-              </SpaceBetween>
+      {data?.last_error ? (
+        <Alert type="warning" header="The last background crawl failed">
+          Showing the previous successful result. {data.last_error}
+        </Alert>
+      ) : null}
+      {data?.fetched_at ? (
+        <Box color="text-body-secondary" fontSize="body-s">
+          Crawled {data.age_seconds < 5 ? "just now" : `${data.age_seconds}s ago`}
+          {data.refreshing ? " - refreshing…" : ""}; re-crawled every {data.refresh_seconds || 60}s in the background.
+          {" "}Refresh on the Diagram tab forces a live crawl now.
+        </Box>
+      ) : null}
+      {/* Tables first: a Cloudscape table with filter and pagination is
+          the fastest way to answer "what is on port X" or "which links
+          are down", and it works on a phone. The diagram is the picture
+          for when the shape matters, one tab over. */}
+      <Tabs
+        tabs={[
+          { id: "tables", label: "Links & hosts", content: (
+          <Container
+            header={
+              <Header
+                variant="h2"
+                counter={`(${filteredPortItems.length})`}
+                description="Every local port across the fleet, and what's attached to it. Expand a port to see its individual hosts."
+              >
+                Ports
+              </Header>
             }
           >
-            Fleet topology
-          </Header>
-        }
-      >
-        <SpaceBetween size="s">
-          <SpaceBetween direction="horizontal" size="l">
-            <Box fontSize="body-s" color="text-body-secondary">
-              <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
-                <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UP} strokeWidth="3" />
-              </svg>
-              Link up
-            </Box>
-            <Box fontSize="body-s" color="text-body-secondary">
-              <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
-                <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_DOWN} strokeWidth="3" />
-              </svg>
-              Link down
-            </Box>
-            <Box fontSize="body-s" color="text-body-secondary">
-              <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
-                <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UNKNOWN} strokeWidth="3" />
-              </svg>
-              State unknown
-            </Box>
-            <Box fontSize="body-s" color="text-body-secondary">
-              <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
-                <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UNKNOWN} strokeWidth="2" strokeDasharray="4 3" />
-              </svg>
-              LLDP neighbor (click to add)
-            </Box>
-            <Box fontSize="body-s" color="text-body-secondary">
-              <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
-                <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UNKNOWN} strokeWidth="1" strokeDasharray="1 3" />
-              </svg>
-              MAC-table only (lower confidence, doesn't speak LLDP)
-            </Box>
-          </SpaceBetween>
+            <Table
+              columnDefinitions={[
+                { id: "port", header: "Port", cell: (i) => i.port || "", minWidth: 220 },
+                { id: "host", header: "Host / remote", cell: (i) => i.host, minWidth: 220 },
+                { id: "mac", header: "MAC address", cell: (i) => <Box variant="code">{i.mac}</Box> },
+                {
+                  id: "status",
+                  header: "State",
+                  cell: (i) => <StatusIndicator type={i.status.type}>{i.status.text}</StatusIndicator>,
+                },
+                { id: "discoveredVia", header: "Discovered via", cell: (i) => i.discoveredVia },
+                { id: "utilization", header: "Utilization", cell: (i) => i.utilization },
+              ]}
+              items={portPageItems}
+              trackBy="id"
+              expandableRows={{
+                getItemChildren: (item) => item.children,
+                isItemExpandable: (item) => item.children.length > 0,
+                expandedItems,
+                onExpandableItemToggle: ({ detail }) =>
+                  setExpandedPortIds((prev) =>
+                    detail.expanded ? [...prev, detail.item.id] : prev.filter((id) => id !== detail.item.id)
+                  ),
+              }}
+              filter={
+                <TextFilter
+                  filteringText={portFilterText}
+                  onChange={({ detail }) => {
+                    setPortFilterText(detail.filteringText);
+                    setPortPage(1);
+                  }}
+                  filteringPlaceholder="Find a port, host, IP, or MAC address..."
+                  countText={`${filteredPortItems.length} match${filteredPortItems.length === 1 ? "" : "es"}`}
+                />
+              }
+              pagination={<Pagination {...portPaginationProps} />}
+              empty={<Box textAlign="center">No ports found on any device.</Box>}
+              variant="embedded"
+              stripedRows
+              resizableColumns
+              wrapLines
+            />
+          </Container>
+          ) },
+          { id: "diagram", label: "Diagram", content: (
+          <Container
+            header={
+              <Header
+                variant="h2"
+                description={
+                  data?.fetched_at
+                    ? `Crawled ${data.age_seconds < 5 ? "just now" : `${data.age_seconds}s ago`}${data.refreshing ? " - refreshing…" : ""}; re-crawled every ${data.refresh_seconds || 60}s in the background. Refresh forces a live crawl now.`
+                    : "Waiting for the first crawl…"
+                }
+                actions={
+                  <SpaceBetween direction="horizontal" size="s">
+                    <Toggle checked={showMacTableHosts} onChange={({ detail }) => setShowMacTableHosts(detail.checked)}>
+                      MAC-table hosts ({macTableHostCount})
+                    </Toggle>
+                    <Toggle checked={autoRefresh} onChange={({ detail }) => setAutoRefresh(detail.checked)}>
+                      Auto-refresh (30s)
+                    </Toggle>
+                    <Button iconName="refresh" onClick={() => load(true)} loading={loading}>
+                      Refresh
+                    </Button>
+                  </SpaceBetween>
+                }
+              >
+                Fleet topology
+              </Header>
+            }
+          >
+            <SpaceBetween size="s">
+              <SpaceBetween direction="horizontal" size="l">
+                <Box fontSize="body-s" color="text-body-secondary">
+                  <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
+                    <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UP} strokeWidth="3" />
+                  </svg>
+                  Link up
+                </Box>
+                <Box fontSize="body-s" color="text-body-secondary">
+                  <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
+                    <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_DOWN} strokeWidth="3" />
+                  </svg>
+                  Link down
+                </Box>
+                <Box fontSize="body-s" color="text-body-secondary">
+                  <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
+                    <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UNKNOWN} strokeWidth="3" />
+                  </svg>
+                  State unknown
+                </Box>
+                <Box fontSize="body-s" color="text-body-secondary">
+                  <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
+                    <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UNKNOWN} strokeWidth="2" strokeDasharray="4 3" />
+                  </svg>
+                  LLDP neighbor (click to add)
+                </Box>
+                <Box fontSize="body-s" color="text-body-secondary">
+                  <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
+                    <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UNKNOWN} strokeWidth="1" strokeDasharray="1 3" />
+                  </svg>
+                  MAC-table only (lower confidence, doesn't speak LLDP)
+                </Box>
+              </SpaceBetween>
 
-          <svg viewBox={`0 0 ${layout.width} ${layout.height}`} style={{ width: "100%", height: "auto" }}>
-            {internalEdges.map((e) => {
-              const a = layout.positions[e.a.device_id];
-              const b = layout.positions[e.b.device_id];
-              if (!a || !b) return null;
-              const info = edgeStatusInfo([e.a.state, e.b.state]);
-              const key = `${e.a.device_id}:${e.a.port}-${e.b.device_id}:${e.b.port}`;
+              <svg viewBox={`0 0 ${layout.width} ${layout.height}`} style={{ width: "100%", height: "auto" }}>
+                {internalEdges.map((e) => {
+                  const a = layout.positions[e.a.device_id];
+                  const b = layout.positions[e.b.device_id];
+                  if (!a || !b) return null;
+                  const info = edgeStatusInfo([e.a.state, e.b.state]);
+                  const key = `${e.a.device_id}:${e.a.port}-${e.b.device_id}:${e.b.port}`;
 
-              const pairKey = [e.a.device_id, e.b.device_id].sort().join("|");
-              const group = pairGroups[pairKey];
-              const idxInGroup = group.indexOf(e);
-              const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-              const dx = b.x - a.x;
-              const dy = b.y - a.y;
-              const len = Math.hypot(dx, dy) || 1;
-              // Perpendicular unit vector, scaled by how far this edge sits
-              // from the middle of its group (e.g. 3 edges -> offsets of
-              // -28, 0, +28), so a single edge stays a straight line.
-              const spacing = 28;
-              const offset = (idxInGroup - (group.length - 1) / 2) * spacing;
-              const ctrl = { x: mid.x + (-dy / len) * offset, y: mid.y + (dx / len) * offset };
-              const path = group.length > 1
-                ? `M ${a.x} ${a.y} Q ${ctrl.x} ${ctrl.y} ${b.x} ${b.y}`
-                : `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
-              // Label placed at the curve's midpoint (same formula as the
-              // control point, halved) so each parallel link's ports are
-              // readable directly on the diagram, not just on hover.
-              const labelPos = { x: mid.x + (-dy / len) * offset * 0.5, y: mid.y + (dx / len) * offset * 0.5 };
+                  const pairKey = [e.a.device_id, e.b.device_id].sort().join("|");
+                  const group = pairGroups[pairKey];
+                  const idxInGroup = group.indexOf(e);
+                  const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+                  const dx = b.x - a.x;
+                  const dy = b.y - a.y;
+                  const len = Math.hypot(dx, dy) || 1;
+                  // Perpendicular unit vector, scaled by how far this edge sits
+                  // from the middle of its group (e.g. 3 edges -> offsets of
+                  // -28, 0, +28), so a single edge stays a straight line.
+                  const spacing = 28;
+                  const offset = (idxInGroup - (group.length - 1) / 2) * spacing;
+                  const ctrl = { x: mid.x + (-dy / len) * offset, y: mid.y + (dx / len) * offset };
+                  const path = group.length > 1
+                    ? `M ${a.x} ${a.y} Q ${ctrl.x} ${ctrl.y} ${b.x} ${b.y}`
+                    : `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
+                  // Label placed at the curve's midpoint (same formula as the
+                  // control point, halved) so each parallel link's ports are
+                  // readable directly on the diagram, not just on hover.
+                  const labelPos = { x: mid.x + (-dy / len) * offset * 0.5, y: mid.y + (dx / len) * offset * 0.5 };
 
-              return (
-                <g key={key}>
-                  <path
-                    d={path} fill="none"
-                    stroke={info.color} strokeWidth={hovered === key ? 5 : 3}
-                    style={{ cursor: "pointer", transition: "stroke-width 0.1s" }}
-                    onMouseEnter={() => setHovered(key)}
-                    onMouseLeave={() => setHovered(null)}
-                  >
-                    <title>
-                      {layout.nodeById[e.a.device_id]?.name} ({e.a.port}) ⟷ {layout.nodeById[e.b.device_id]?.name} ({e.b.port})
-                      {"\n"}state: {info.text}
-                      {formatMbps(e.a.state?.input_mbps) ? `\n${e.a.port} in: ${formatMbps(e.a.state.input_mbps)}` : ""}
-                      {formatMbps(e.a.state?.output_mbps) ? `\n${e.a.port} out: ${formatMbps(e.a.state.output_mbps)}` : ""}
-                    </title>
-                  </path>
-                  {hovered === key && (
-                    <g style={{ pointerEvents: "none" }}>
-                      <rect
-                        x={labelPos.x - 62} y={labelPos.y - 11} width="124" height="22" rx="4"
-                        fill="white" stroke={info.color} strokeWidth="1"
-                      />
-                      <text x={labelPos.x} y={labelPos.y + 4} textAnchor="middle" fontSize="11" fill={COLOR_TEXT}>
-                        {e.a.port} ⟷ {e.b.port}
+                  return (
+                    <g key={key}>
+                      <path
+                        d={path} fill="none"
+                        stroke={info.color} strokeWidth={hovered === key ? 5 : 3}
+                        style={{ cursor: "pointer", transition: "stroke-width 0.1s" }}
+                        onMouseEnter={() => setHovered(key)}
+                        onMouseLeave={() => setHovered(null)}
+                      >
+                        <title>
+                          {layout.nodeById[e.a.device_id]?.name} ({e.a.port}) ⟷ {layout.nodeById[e.b.device_id]?.name} ({e.b.port})
+                          {"\n"}state: {info.text}
+                          {formatMbps(e.a.state?.input_mbps) ? `\n${e.a.port} in: ${formatMbps(e.a.state.input_mbps)}` : ""}
+                          {formatMbps(e.a.state?.output_mbps) ? `\n${e.a.port} out: ${formatMbps(e.a.state.output_mbps)}` : ""}
+                        </title>
+                      </path>
+                      {hovered === key && (
+                        <g style={{ pointerEvents: "none" }}>
+                          <rect
+                            x={labelPos.x - 62} y={labelPos.y - 11} width="124" height="22" rx="4"
+                            fill="white" stroke={info.color} strokeWidth="1"
+                          />
+                          <text x={labelPos.x} y={labelPos.y + 4} textAnchor="middle" fontSize="11" fill={COLOR_TEXT}>
+                            {e.a.port} ⟷ {e.b.port}
+                          </text>
+                        </g>
+                      )}
+                    </g>
+                  );
+                })}
+
+                {nodes.flatMap((n) => {
+                  const a = layout.positions[n.id];
+                  const { groups, laneWidth } = layout.portGroupsByDevice[n.id] || { groups: [] };
+                  const cols = Math.max(1, Math.min(PORT_CARD_COLS, groups.length));
+                  const laneLeftX = a ? a.x - laneWidth / 2 : 0;
+                  const corridorX = cols > 1
+                    ? laneLeftX + PORT_CARD_W + PORT_CARD_GAP_X / 2
+                    : laneLeftX + PORT_CARD_W + 10;
+                  return groups.map((g) => {
+                    const card = layout.portPositions[`${n.id}:${g.port}`];
+                    if (!a || !card) return null;
+                    const rows = [
+                      ...g.lldp.map((e) => ({ e, kind: "lldp" })),
+                      ...g.mac.map((e) => ({ e, kind: "mac" })),
+                    ];
+                    return (
+                      <g key={`${n.id}:${g.port}`}>
+                        <path
+                          d={portConnectorPath(a.x, a.y + DEVICE_NODE_R, card.x + card.width / 2, card.y, corridorX)}
+                          fill="none" stroke={COLOR_UNKNOWN} strokeWidth="1.5"
+                          strokeDasharray={g.lldp.length > 0 ? "4 3" : "1 3"}
+                        />
+                        <foreignObject x={card.x} y={card.y} width={card.width} height={card.height}>
+                          <div
+                            xmlns="http://www.w3.org/1999/xhtml"
+                            style={{
+                              fontFamily: "inherit",
+                              background: COLOR_CARD_FILL,
+                              border: `1.5px solid ${COLOR_UNKNOWN}`,
+                              borderRadius: 8,
+                              height: card.height - 2,
+                              boxSizing: "border-box",
+                              overflow: "hidden",
+                            }}
+                          >
+                            <div
+                              style={{
+                                fontSize: 11, fontWeight: "bold", color: COLOR_TEXT, padding: "3px 8px",
+                                borderBottom: `1px solid ${COLOR_DIVIDER}`, background: COLOR_CARD_HEADER, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                              }}
+                              title={`${n.name} — ${g.port}${g.memberPorts?.length > 1 ? ` (${g.memberPorts.join(", ")})` : ""}`}
+                            >
+                              {g.port}
+                              {g.memberPorts?.length > 1 ? ` (${g.memberPorts.length} members)` : ""}
+                            </div>
+                            {rows.map(({ e, kind }) => {
+                              const ip = e.remote_ip;
+                              const mac = externalMac(e);
+                              const sub = externalSubline(e);
+                              const alsoKnownAs = e.also_known_as?.length ? ` — also seen as: ${e.also_known_as.join(", ")}` : "";
+                              const corroborated = kind === "lldp" && e.discovered_via.includes("mac-table") ? " (confirmed via MAC table)" : "";
+                              const notice = kind === "mac" ? " — MAC table only, no LLDP" : "";
+                              return (
+                                <div
+                                  key={externalKey(e)}
+                                  onClick={() => onAddDevice?.({ name: ip || e.remote_label, host: ip || "" })}
+                                  title={`${ip || "no IP"} / ${mac}${sub ? ` (${sub})` : ""}${alsoKnownAs}${corroborated}${notice}\nClick to add as a device`}
+                                  style={{
+                                    display: "flex", alignItems: "center", gap: 5, padding: "1px 8px",
+                                    height: PORT_ROW_H, cursor: onAddDevice ? "pointer" : "default",
+                                    fontFamily: fontFamilyMonospace,
+                                  }}
+                                >
+                                  <span
+                                    style={{
+                                      flex: "none", width: 6, height: 6, borderRadius: "50%",
+                                      background: kind === "lldp" ? COLOR_DEVICE_STROKE : COLOR_UNKNOWN,
+                                    }}
+                                  />
+                                  <span style={{ display: "flex", flexDirection: "column", overflow: "hidden", lineHeight: 1.25 }}>
+                                    <span
+                                      style={{
+                                        fontSize: 11, fontWeight: kind === "lldp" ? 600 : 400, color: COLOR_TEXT,
+                                        whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                                      }}
+                                    >
+                                      {ip || "no IP"}
+                                    </span>
+                                    <span
+                                      style={{
+                                        fontSize: 9, color: COLOR_TEXT_SECONDARY,
+                                        whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                                      }}
+                                    >
+                                      {mac}
+                                    </span>
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </foreignObject>
+                      </g>
+                    );
+                  });
+                })}
+
+                {nodes.map((n) => {
+                  const p = layout.positions[n.id];
+                  if (!p) return null;
+                  return (
+                    <g key={n.id} style={{ cursor: onOpenConsole ? "pointer" : "default" }} onClick={() => onOpenConsole?.(n.id)}>
+                      <circle
+                        cx={p.x} cy={p.y} r={DEVICE_NODE_R}
+                        fill={n.lldp_error ? COLOR_DEVICE_ERROR_FILL : COLOR_DEVICE_FILL}
+                        stroke={n.lldp_error ? COLOR_DEVICE_ERROR_STROKE : COLOR_DEVICE_STROKE}
+                        strokeWidth="2.5"
+                      >
+                        <title>Open {n.name} in the Console</title>
+                      </circle>
+                      <text x={p.x} y={p.y - 10} textAnchor="middle" fontSize="13" fontWeight="bold" fill={COLOR_TEXT}>
+                        {n.name.length > 20 ? `${n.name.slice(0, 18)}…` : n.name}
+                      </text>
+                      <text x={p.x} y={p.y + 6} textAnchor="middle" fontSize="11" fill={COLOR_TEXT_SECONDARY} fontFamily={fontFamilyMonospace}>
+                        {n.host}
+                      </text>
+                      <text x={p.x} y={p.y + 20} textAnchor="middle" fontSize="9" fill={COLOR_TEXT_SECONDARY}>
+                        {n.platform}
                       </text>
                     </g>
-                  )}
-                </g>
-              );
-            })}
-
-            {nodes.flatMap((n) => {
-              const a = layout.positions[n.id];
-              const { groups, laneWidth } = layout.portGroupsByDevice[n.id] || { groups: [] };
-              const cols = Math.max(1, Math.min(PORT_CARD_COLS, groups.length));
-              const laneLeftX = a ? a.x - laneWidth / 2 : 0;
-              const corridorX = cols > 1
-                ? laneLeftX + PORT_CARD_W + PORT_CARD_GAP_X / 2
-                : laneLeftX + PORT_CARD_W + 10;
-              return groups.map((g) => {
-                const card = layout.portPositions[`${n.id}:${g.port}`];
-                if (!a || !card) return null;
-                const rows = [
-                  ...g.lldp.map((e) => ({ e, kind: "lldp" })),
-                  ...g.mac.map((e) => ({ e, kind: "mac" })),
-                ];
-                return (
-                  <g key={`${n.id}:${g.port}`}>
-                    <path
-                      d={portConnectorPath(a.x, a.y + DEVICE_NODE_R, card.x + card.width / 2, card.y, corridorX)}
-                      fill="none" stroke={COLOR_UNKNOWN} strokeWidth="1.5"
-                      strokeDasharray={g.lldp.length > 0 ? "4 3" : "1 3"}
-                    />
-                    <foreignObject x={card.x} y={card.y} width={card.width} height={card.height}>
-                      <div
-                        xmlns="http://www.w3.org/1999/xhtml"
-                        style={{
-                          fontFamily: "inherit",
-                          background: "#f7f8fa",
-                          border: `1.5px solid ${COLOR_UNKNOWN}`,
-                          borderRadius: 8,
-                          height: card.height - 2,
-                          boxSizing: "border-box",
-                          overflow: "hidden",
-                        }}
-                      >
-                        <div
-                          style={{
-                            fontSize: 11, fontWeight: "bold", color: COLOR_TEXT, padding: "3px 8px",
-                            borderBottom: `1px solid #d8dde3`, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                          }}
-                          title={`${n.name} — ${g.port}${g.memberPorts?.length > 1 ? ` (${g.memberPorts.join(", ")})` : ""}`}
-                        >
-                          {g.port}
-                          {g.memberPorts?.length > 1 ? ` (${g.memberPorts.length} members)` : ""}
-                        </div>
-                        {rows.map(({ e, kind }) => {
-                          const ip = e.remote_ip;
-                          const mac = externalMac(e);
-                          const sub = externalSubline(e);
-                          const alsoKnownAs = e.also_known_as?.length ? ` — also seen as: ${e.also_known_as.join(", ")}` : "";
-                          const corroborated = kind === "lldp" && e.discovered_via.includes("mac-table") ? " (confirmed via MAC table)" : "";
-                          const notice = kind === "mac" ? " — MAC table only, no LLDP" : "";
-                          return (
-                            <div
-                              key={externalKey(e)}
-                              onClick={() => onAddDevice?.({ name: ip || e.remote_label, host: ip || "" })}
-                              title={`${ip || "no IP"} / ${mac}${sub ? ` (${sub})` : ""}${alsoKnownAs}${corroborated}${notice}\nClick to add as a device`}
-                              style={{
-                                display: "flex", alignItems: "center", gap: 5, padding: "1px 8px",
-                                height: PORT_ROW_H, cursor: onAddDevice ? "pointer" : "default",
-                                fontFamily: "monospace",
-                              }}
-                            >
-                              <span
-                                style={{
-                                  flex: "none", width: 6, height: 6, borderRadius: "50%",
-                                  background: kind === "lldp" ? COLOR_DEVICE_STROKE : "#9aa5b1",
-                                }}
-                              />
-                              <span style={{ display: "flex", flexDirection: "column", overflow: "hidden", lineHeight: 1.25 }}>
-                                <span
-                                  style={{
-                                    fontSize: 11, fontWeight: kind === "lldp" ? 600 : 400, color: COLOR_TEXT,
-                                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                                  }}
-                                >
-                                  {ip || "no IP"}
-                                </span>
-                                <span
-                                  style={{
-                                    fontSize: 9, color: COLOR_TEXT_SECONDARY,
-                                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                                  }}
-                                >
-                                  {mac}
-                                </span>
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </foreignObject>
-                  </g>
-                );
-              });
-            })}
-
-            {nodes.map((n) => {
-              const p = layout.positions[n.id];
-              if (!p) return null;
-              return (
-                <g key={n.id} style={{ cursor: onOpenConsole ? "pointer" : "default" }} onClick={() => onOpenConsole?.(n.id)}>
-                  <circle
-                    cx={p.x} cy={p.y} r={DEVICE_NODE_R}
-                    fill={n.lldp_error ? COLOR_DEVICE_ERROR_FILL : COLOR_DEVICE_FILL}
-                    stroke={n.lldp_error ? COLOR_DEVICE_ERROR_STROKE : COLOR_DEVICE_STROKE}
-                    strokeWidth="2.5"
-                  >
-                    <title>Open {n.name} in the Console</title>
-                  </circle>
-                  <text x={p.x} y={p.y - 10} textAnchor="middle" fontSize="13" fontWeight="bold" fill={COLOR_TEXT}>
-                    {n.name.length > 20 ? `${n.name.slice(0, 18)}…` : n.name}
-                  </text>
-                  <text x={p.x} y={p.y + 6} textAnchor="middle" fontSize="11" fill={COLOR_TEXT_SECONDARY} fontFamily="monospace">
-                    {n.host}
-                  </text>
-                  <text x={p.x} y={p.y + 20} textAnchor="middle" fontSize="9" fill={COLOR_TEXT_SECONDARY}>
-                    {n.platform}
-                  </text>
-                </g>
-              );
-            })}
-          </svg>
-        </SpaceBetween>
-      </Container>
-
-      <Container
-        header={
-          <Header
-            variant="h2"
-            counter={`(${filteredPortItems.length})`}
-            description="Every local port across the fleet, and what's attached to it. Expand a port to see its individual hosts."
-          >
-            Ports
-          </Header>
-        }
-      >
-        <Table
-          columnDefinitions={[
-            { id: "port", header: "Port", cell: (i) => i.port || "", minWidth: 220 },
-            { id: "host", header: "Host / remote", cell: (i) => i.host, minWidth: 220 },
-            { id: "mac", header: "MAC address", cell: (i) => <span style={{ fontFamily: "monospace" }}>{i.mac}</span> },
-            {
-              id: "status",
-              header: "State",
-              cell: (i) => <StatusIndicator type={i.status.type}>{i.status.text}</StatusIndicator>,
-            },
-            { id: "discoveredVia", header: "Discovered via", cell: (i) => i.discoveredVia },
-            { id: "utilization", header: "Utilization", cell: (i) => i.utilization },
-          ]}
-          items={portPageItems}
-          trackBy="id"
-          expandableRows={{
-            getItemChildren: (item) => item.children,
-            isItemExpandable: (item) => item.children.length > 0,
-            expandedItems,
-            onExpandableItemToggle: ({ detail }) =>
-              setExpandedPortIds((prev) =>
-                detail.expanded ? [...prev, detail.item.id] : prev.filter((id) => id !== detail.item.id)
-              ),
-          }}
-          filter={
-            <TextFilter
-              filteringText={portFilterText}
-              onChange={({ detail }) => {
-                setPortFilterText(detail.filteringText);
-                setPortPage(1);
-              }}
-              filteringPlaceholder="Find a port, host, IP, or MAC address..."
-              countText={`${filteredPortItems.length} match${filteredPortItems.length === 1 ? "" : "es"}`}
-            />
-          }
-          pagination={<Pagination {...portPaginationProps} />}
-          empty={<Box textAlign="center">No ports found on any device.</Box>}
-          variant="embedded"
-          stripedRows
-          resizableColumns
-          wrapLines
-        />
-      </Container>
+                  );
+                })}
+              </svg>
+            </SpaceBetween>
+          </Container>
+          ) },
+        ]}
+      />
 
       <Modal
         visible={confirmAction === "relearn"}

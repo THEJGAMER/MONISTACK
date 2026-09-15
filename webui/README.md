@@ -220,6 +220,76 @@ reach (a LAN hostname/IP, a reverse tunnel, or a public URL) - front-
 channel login/logout (the normal browser flow) has no such requirement
 and works fine at `localhost` regardless.
 
+## Public API, tokens and webhooks
+
+The API the UI uses is the public API. It is documented at `/api/docs`
+(Swagger UI) and `/api/redoc`, from `/api/openapi.json`, versioned `1.0`.
+Paths are stable; fields may be added, never silently removed.
+
+**Three ways to authenticate, one identity and role:**
+
+| Method | How | Role comes from |
+|---|---|---|
+| Session cookie | what the browser does | Keycloak client roles at login |
+| API token | `Authorization: Bearer sb_…` | the token's own role, never above its creator's |
+| Keycloak JWT | `Authorization: Bearer <access token>` | the same `resource_access` client roles |
+
+Tokens are created on **Settings → API tokens** (admin) or `POST
+/api/tokens`. Only a SHA-256 is stored; the clear text is returned once.
+They can expire and can be revoked; a revoked token 401s immediately.
+
+A Keycloak access token from the same realm works with no token minted
+here at all - useful for scripts that already hold one, e.g. via client
+credentials. It is validated against the realm's JWKS (cached, refreshed
+on an unknown key), with issuer and expiry checked.
+
+```bash
+# mint a token (as an admin, with a session cookie), then use it
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"name":"ci","role":"viewer","expires_in_days":90}' https://switchboard/api/tokens
+curl -s -H "Authorization: Bearer sb_…" https://switchboard/api/devices
+```
+
+**Webhooks** (Settings → Webhooks, or `/api/webhooks`) POST every matching
+event as JSON, with `X-Switchboard-Event`, a unique `X-Switchboard-Delivery`
+id, and `X-Switchboard-Signature: sha256=<hmac>` over the raw body using
+the secret shown once at creation. Transient failures retry three times
+with backoff; 4xx (other than 429) does not. The last status and the
+consecutive-failure count sit on the row and are never auto-disabled - an
+integration that quietly switches itself off is worse than a red row.
+`GET /api/events` lists the event names; every emit in app.py goes through
+`events.py`'s bus, which is also what drives push paging.
+
+Verify a delivery in Python:
+
+```python
+import hmac, hashlib
+expected = "sha256=" + hmac.new(secret.encode(), body_bytes, hashlib.sha256).hexdigest()
+hmac.compare_digest(expected, request.headers["X-Switchboard-Signature"])
+```
+
+## Paging without a pager: the PWA
+
+Switchboard installs as an app (manifest + service worker at root scope,
+`/sw.js`) and pages phones directly through Web Push - no Pushover or
+PagerDuty needed, though both still work via Alertmanager. On **My
+account → Paging on this device** a browser subscribes with its own
+severity floor and a "tell me on resolve" switch, and can send itself a
+test page. Notifications for critical alarms stay on screen until dealt
+with; a re-fire of the same alarm replaces its notification rather than
+stacking; and the notification carries an **Acknowledge** action that
+acks the occurrence using the browser's own session, straight from the
+lock screen.
+
+It needs HTTPS (push is a secure-context API) and, on iOS, a home-screen
+install. The VAPID key pair is generated once into `data/push_vapid.json`
+(0600); losing it invalidates every subscription, so back it up with the
+rest of `data/`. `PUSH_VAPID_SUBJECT` overrides the VAPID subject (it
+defaults to the https origin from `OIDC_REDIRECT_URI`).
+
+Adapted from the PROXMON project's push implementation, then extended for
+paging as above.
+
 ## Deployment config: the Settings page, not just `.env`
 
 `webui/settings.py` holds the handful of things that differ per

@@ -26,3 +26,8 @@ python-multipart>=0.0.9,<1
 # not bundled by default (confirmed live: ModuleNotFoundError without it),
 # despite being Starlette's own recommended session mechanism.
 itsdangerous>=2.1,<3
+# Web Push (VAPID) for the in-house pager: the PWA subscribes in the
+# browser, the app signs and sends through the browser vendor's push
+# service. Replaces nothing yet - Pushover/PagerDuty via Alertmanager
+# still work - but it is what lets a phone get paged without a third party.
+pywebpush>=2.0,<3

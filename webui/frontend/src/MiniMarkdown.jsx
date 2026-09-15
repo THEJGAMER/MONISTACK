@@ -1,6 +1,8 @@
 import React from "react";
 import Box from "@cloudscape-design/components/box";
 import SpaceBetween from "@cloudscape-design/components/space-between";
+import CodeView from "@cloudscape-design/code-view/code-view";
+import CopyToClipboard from "@cloudscape-design/components/copy-to-clipboard";
 
 // A tiny renderer for exactly the Markdown subset this app generates itself
 // (## headings, **bold**, `inline code`, ```text code fences``` ). Not a
@@ -80,9 +82,21 @@ export default function MiniMarkdown({ source, codeStyle = "terminal" }) {
         }
         if (block.type === "code") {
           return (
-            <Box key={idx} variant="code" display="block" className={codeClassName}>
-              {block.content}
-            </Box>
+            <CodeView
+              key={idx}
+              content={block.content}
+              lineNumbers={codeStyle !== "snippet"}
+              wrapLines
+              actions={
+                <CopyToClipboard
+                  copyButtonAriaLabel="Copy"
+                  copyErrorText="Could not copy"
+                  copySuccessText="Copied"
+                  textToCopy={block.content}
+                  variant="icon"
+                />
+              }
+            />
           );
         }
         return <Box key={idx}>{parseInline(block.content, idx)}</Box>;

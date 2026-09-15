@@ -1,3 +1,4 @@
+import Select from "@cloudscape-design/components/select";
 import React, { useCallback, useEffect, useState } from "react";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
@@ -12,7 +13,14 @@ import Table from "@cloudscape-design/components/table";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Box from "@cloudscape-design/components/box";
 
-import { getSettings, updateSettings, getSettingsHealth } from "./api.js";
+import Multiselect from "@cloudscape-design/components/multiselect";
+import Toggle from "@cloudscape-design/components/toggle";
+import CopyToClipboard from "@cloudscape-design/components/copy-to-clipboard";
+import {
+  getSettings, updateSettings, getSettingsHealth,
+  listApiTokens, createApiToken, revokeApiToken,
+  listEvents, listWebhooks, createWebhook, updateWebhook, deleteWebhook, testWebhook,
+} from "./api.js";
 import { useHasRole } from "./AuthContext.jsx";
 
 const SERVICE_FIELDS = [
@@ -58,7 +66,291 @@ const SERVICE_FIELDS = [
   },
 ];
 
+
+// --- API tokens -------------------------------------------------------
+// The token is shown exactly once, in the Alert below the form. It is not
+// stored anywhere in clear text, so closing the alert really is the last
+// time anyone sees it - the copy button is there for that reason.
+const TOKEN_ROLES = [
+  { label: "viewer - read only", value: "viewer" },
+  { label: "operator - run commands, work alarms", value: "operator" },
+  { label: "admin - change configuration", value: "admin" },
+];
+
+function ApiTokensSection({ pushFlash }) {
+  const [tokens, setTokens] = useState([]);
+  const [name, setName] = useState("");
+  const [role, setRole] = useState(TOKEN_ROLES[0]);
+  const [expiresDays, setExpiresDays] = useState("");
+  const [minted, setMinted] = useState(null); // {name, token}
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setTokens(await listApiTokens());
+    } catch (e) {
+      pushFlash("error", `Could not load API tokens: ${e.message}`);
+    }
+  }, [pushFlash]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function create() {
+    setBusy(true);
+    try {
+      const row = await createApiToken({ name: name.trim(), role: role.value, expires_in_days: expiresDays ? Number(expiresDays) : null });
+      setMinted({ name: row.name, token: row.token });
+      setName("");
+      await load();
+    } catch (e) {
+      pushFlash("error", `Could not create token: ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function revoke(id) {
+    try {
+      await revokeApiToken(id);
+      await load();
+    } catch (e) {
+      pushFlash("error", `Could not revoke: ${e.message}`);
+    }
+  }
+
+  return (
+    <Container
+      header={
+        <Header
+          variant="h2"
+          description={
+            <>
+              Bearer credentials for scripts and integrations. Send <Box variant="code" display="inline">Authorization: Bearer sb_…</Box> to any
+              endpoint; the API is documented at <a href="/api/docs" target="_blank" rel="noreferrer">/api/docs</a>. A Keycloak access token
+              works the same way with no token needed here.
+            </>
+          }
+        >
+          API tokens
+        </Header>
+      }
+    >
+      <SpaceBetween size="l">
+        {minted ? (
+          <Alert
+            type="success"
+            dismissible
+            onDismiss={() => setMinted(null)}
+            header={`Token "${minted.name}" created - copy it now, it will not be shown again`}
+            action={<CopyToClipboard copyButtonText="Copy token" copyErrorText="Could not copy" copySuccessText="Copied" textToCopy={minted.token} />}
+          >
+            <Box variant="code">{minted.token}</Box>
+          </Alert>
+        ) : null}
+        <SpaceBetween size="s" direction="horizontal" alignItems="end">
+          <FormField label="Name" description="What uses it, e.g. 'grafana' or 'backup script'.">
+            <Input value={name} onChange={({ detail }) => setName(detail.value)} placeholder="ci-pipeline" />
+          </FormField>
+          <FormField label="Role" description="Never more than your own.">
+            <Select selectedOption={role} onChange={({ detail }) => setRole(detail.selectedOption)} options={TOKEN_ROLES} />
+          </FormField>
+          <FormField label="Expires in (days)" description="Blank = never.">
+            <Input value={expiresDays} onChange={({ detail }) => setExpiresDays(detail.value.replace(/[^0-9]/g, ""))} placeholder="90" inputMode="numeric" />
+          </FormField>
+          <Button variant="primary" onClick={create} loading={busy} disabled={!name.trim()}>
+            Create token
+          </Button>
+        </SpaceBetween>
+        <Table
+          variant="embedded"
+          items={tokens}
+          empty={<Box color="text-status-inactive">No API tokens yet.</Box>}
+          columnDefinitions={[
+            { id: "name", header: "Name", cell: (t) => t.name },
+            { id: "prefix", header: "Starts with", cell: (t) => <Box variant="code">{t.prefix}…</Box> },
+            { id: "role", header: "Role", cell: (t) => t.role },
+            { id: "by", header: "Created by", cell: (t) => t.created_by },
+            { id: "used", header: "Last used", cell: (t) => (t.last_used_at ? new Date(t.last_used_at).toLocaleString() : "never") },
+            {
+              id: "state",
+              header: "State",
+              cell: (t) =>
+                t.revoked_at ? (
+                  <StatusIndicator type="stopped">revoked</StatusIndicator>
+                ) : t.expires_at && new Date(t.expires_at) < new Date() ? (
+                  <StatusIndicator type="warning">expired</StatusIndicator>
+                ) : (
+                  <StatusIndicator type="success">active{t.expires_at ? ` until ${new Date(t.expires_at).toLocaleDateString()}` : ""}</StatusIndicator>
+                ),
+            },
+            {
+              id: "actions",
+              header: "",
+              cell: (t) => (!t.revoked_at ? <Button variant="inline-link" onClick={() => revoke(t.id)}>Revoke</Button> : null),
+            },
+          ]}
+        />
+      </SpaceBetween>
+    </Container>
+  );
+}
+
+// --- Webhooks ---------------------------------------------------------
+function WebhooksSection({ pushFlash }) {
+  const [hooks, setHooks] = useState([]);
+  const [eventOptions, setEventOptions] = useState([]);
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
+  const [selectedEvents, setSelectedEvents] = useState([]);
+  const [minted, setMinted] = useState(null); // {name, secret}
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const [h, ev] = await Promise.all([listWebhooks(), listEvents()]);
+      setHooks(h);
+      setEventOptions(ev.map((e) => ({ label: e.name, value: e.name, description: e.description })));
+    } catch (e) {
+      pushFlash("error", `Could not load webhooks: ${e.message}`);
+    }
+  }, [pushFlash]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function create() {
+    setBusy(true);
+    try {
+      const row = await createWebhook({ name: name.trim(), url: url.trim(), events: selectedEvents.length ? selectedEvents.map((o) => o.value) : ["*"] });
+      setMinted({ name: row.name, secret: row.secret });
+      setName(""); setUrl(""); setSelectedEvents([]);
+      await load();
+    } catch (e) {
+      pushFlash("error", `Could not create webhook: ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function toggle(h) {
+    try {
+      await updateWebhook(h.id, { name: h.name, url: h.url, events: h.events, enabled: !h.enabled });
+      await load();
+    } catch (e) {
+      pushFlash("error", e.message);
+    }
+  }
+  async function test(h) {
+    try {
+      const r = await testWebhook(h.id);
+      pushFlash(r.error ? "error" : "success", r.error ? `Test delivery failed: ${r.error}` : `Test delivered (HTTP ${r.status}).`);
+      await load();
+    } catch (e) {
+      pushFlash("error", e.message);
+    }
+  }
+  async function remove(h) {
+    try {
+      await deleteWebhook(h.id);
+      await load();
+    } catch (e) {
+      pushFlash("error", e.message);
+    }
+  }
+
+  return (
+    <Container
+      header={
+        <Header
+          variant="h2"
+          description={
+            <>
+              Switchboard POSTs each event as JSON to the URL, signed with <Box variant="code" display="inline">X-Switchboard-Signature: sha256=&lt;hmac&gt;</Box> over
+              the raw body using the secret shown once at creation. Three tries with backoff; failures are counted here, never silently disabled.
+            </>
+          }
+        >
+          Webhooks
+        </Header>
+      }
+    >
+      <SpaceBetween size="l">
+        {minted ? (
+          <Alert
+            type="success"
+            dismissible
+            onDismiss={() => setMinted(null)}
+            header={`Webhook "${minted.name}" created - copy the signing secret now, it will not be shown again`}
+            action={<CopyToClipboard copyButtonText="Copy secret" copyErrorText="Could not copy" copySuccessText="Copied" textToCopy={minted.secret} />}
+          >
+            <Box variant="code">{minted.secret}</Box>
+          </Alert>
+        ) : null}
+        <SpaceBetween size="s">
+          <SpaceBetween size="s" direction="horizontal" alignItems="end">
+            <FormField label="Name">
+              <Input value={name} onChange={({ detail }) => setName(detail.value)} placeholder="ticketing" />
+            </FormField>
+            <FormField label="URL" description="http:// or https://">
+              <Input value={url} onChange={({ detail }) => setUrl(detail.value)} placeholder="https://hooks.example.com/switchboard" inputMode="url" />
+            </FormField>
+          </SpaceBetween>
+          <FormField label="Events" description="Leave empty for every event.">
+            <Multiselect
+              selectedOptions={selectedEvents}
+              onChange={({ detail }) => setSelectedEvents(detail.selectedOptions)}
+              options={eventOptions}
+              placeholder="All events"
+              filteringType="auto"
+            />
+          </FormField>
+          <Button variant="primary" onClick={create} loading={busy} disabled={!name.trim() || !/^https?:\/\//.test(url.trim())}>
+            Add webhook
+          </Button>
+        </SpaceBetween>
+        <Table
+          variant="embedded"
+          items={hooks}
+          empty={<Box color="text-status-inactive">No webhooks yet.</Box>}
+          columnDefinitions={[
+            { id: "name", header: "Name", cell: (h) => h.name },
+            { id: "url", header: "URL", cell: (h) => <Box variant="code">{h.url}</Box> },
+            { id: "events", header: "Events", cell: (h) => (h.events.includes("*") ? "all" : h.events.join(", ")) },
+            {
+              id: "enabled",
+              header: "Enabled",
+              cell: (h) => <Toggle checked={h.enabled} onChange={() => toggle(h)} ariaLabel={`Enable ${h.name}`} />,
+            },
+            {
+              id: "last",
+              header: "Last delivery",
+              cell: (h) =>
+                !h.last_delivery_at ? (
+                  <Box color="text-status-inactive">never</Box>
+                ) : h.last_error ? (
+                  <StatusIndicator type="error">{h.consecutive_failures} failed - {h.last_error.slice(0, 50)}</StatusIndicator>
+                ) : (
+                  <StatusIndicator type="success">HTTP {h.last_status} at {new Date(h.last_delivery_at).toLocaleTimeString()}</StatusIndicator>
+                ),
+            },
+            {
+              id: "actions",
+              header: "",
+              cell: (h) => (
+                <SpaceBetween size="xs" direction="horizontal">
+                  <Button variant="inline-link" onClick={() => test(h)}>Test</Button>
+                  <Button variant="inline-link" onClick={() => remove(h)}>Delete</Button>
+                </SpaceBetween>
+              ),
+            },
+          ]}
+        />
+      </SpaceBetween>
+    </Container>
+  );
+}
+
 export default function SettingsPage({ pushFlash }) {
+  const isAdmin = useHasRole("admin");
   // Saving is admin-tier server-side (require_admin_no_db on the PUT route
   // in app.py) - viewers/operators can still see the page and the health
   // panel (GET is any-authenticated-user) but the form is read-only.
@@ -284,6 +576,8 @@ export default function SettingsPage({ pushFlash }) {
           </SpaceBetween>
         </Form>
       </form>
+      {isAdmin ? <ApiTokensSection pushFlash={pushFlash} /> : null}
+      {isAdmin ? <WebhooksSection pushFlash={pushFlash} /> : null}
     </SpaceBetween>
   );
 }

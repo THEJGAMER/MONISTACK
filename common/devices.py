@@ -77,6 +77,8 @@ class Device:
             "make": self.make,
             "model": self.model,
             "auth_method": self.auth_method,
+            "notes": getattr(self, "notes", ""),
+            "runbook_url": getattr(self, "runbook_url", ""),
             "source": self.source,
         }
 
@@ -157,6 +159,12 @@ class StoredDevice(Device):
         # Kept as originally entered (not the expanded valid_ports list) so
         # the Edit form can repopulate the same prefix/range/template spec
         # instead of an unreadable flat list of hundreds of port names.
+        # Free-text operator notes and a runbook link, both optional. Kept on
+        # the device record (not a separate table) because they are part of
+        # what the device *is* to the people running it, and they travel
+        # with it through export/import.
+        self.notes = (raw.get("notes") or "").strip()
+        self.runbook_url = (raw.get("runbook_url") or "").strip()
         self._ports_spec = raw.get("ports")
         self._port_channels_spec = raw.get("port_channels")
 

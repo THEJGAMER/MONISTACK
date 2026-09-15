@@ -34,6 +34,9 @@ import {
   deleteFavorite,
 } from "./api.js";
 import { resultToMarkdown } from "./markdown.js";
+import CodeView from "@cloudscape-design/code-view/code-view";
+import CopyToClipboard from "@cloudscape-design/components/copy-to-clipboard";
+import Link from "@cloudscape-design/components/link";
 import MiniMarkdown from "./MiniMarkdown.jsx";
 import { useClientPagination } from "./useClientPagination.js";
 import { CATEGORY_OPTIONS, severityType, formatTime } from "./syslogUtils.js";
@@ -526,6 +529,20 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
     { type: "pair", label: "Platform", value: selected.platform },
     {
       type: "pair",
+      label: "Runbook",
+      value: selected.runbook_url ? (
+        <Link href={selected.runbook_url} external>{selected.runbook_url.replace(/^https?:\/\//, "").slice(0, 60)}</Link>
+      ) : (
+        <Box color="text-status-inactive">none - add one on the Devices page</Box>
+      ),
+    },
+    {
+      type: "pair",
+      label: "Notes",
+      value: selected.notes ? <Box>{selected.notes}</Box> : <Box color="text-status-inactive">none</Box>,
+    },
+    {
+      type: "pair",
       label: "Interfaces up",
       value: status?.interfaces_total != null ? `${status.interfaces_up} / ${status.interfaces_total}` : "-",
     },
@@ -820,9 +837,20 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
                           }
                         >
                           {viewMode === "raw" ? (
-                            <Box variant="code" display="block" className="terminal-output">
-                              {result.output || "(no output)"}
-                            </Box>
+                            <CodeView
+                              content={result.output || "(no output)"}
+                              lineNumbers
+                              wrapLines
+                              actions={
+                                <CopyToClipboard
+                                  copyButtonAriaLabel="Copy output"
+                                  copyErrorText="Could not copy"
+                                  copySuccessText="Copied"
+                                  textToCopy={result.output || ""}
+                                  variant="icon"
+                                />
+                              }
+                            />
                           ) : (
                             <MiniMarkdown
                               source={resultToMarkdown({

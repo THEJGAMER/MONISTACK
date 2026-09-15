@@ -344,7 +344,7 @@ export default function App() {
               ) : page === "settings" ? (
                 <SettingsPage pushFlash={pushFlash} />
               ) : page === "account" ? (
-                <AccountPage user={user} />
+                <AccountPage user={user} pushFlash={pushFlash} />
               ) : page === "topology" ? (
                 <TopologyPage pushFlash={pushFlash} onOpenConsole={openConsoleFor} onAddDevice={openAddDevice} />
               ) : page === "trends" ? (
