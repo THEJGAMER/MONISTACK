@@ -281,6 +281,19 @@ stacking; and the notification carries an **Acknowledge** action that
 acks the occurrence using the browser's own session, straight from the
 lock screen.
 
+It is a pager, not a notifier: a page **repeats** on each device at its
+own interval (default every 5 min, up to 12 times) until someone
+acknowledges - the repeat reuses the alarm's notification tag with
+`renotify`, so it re-alerts without piling up and says "[page 3] …
+unacknowledged for 15 min". One acknowledgement, from anywhere, sends a
+`close` push to every device that was paged, so the whole team's phones
+stop together. Enrolled devices are listed on My account (and, for every
+user, on Settings) and can be removed. Open tabs play a synthesised
+two-tone pager cadence per severity (toggle on My account); a closed app
+gets the OS sound and a vibration pattern. The page ledger (`push_pages`)
+is cleared on ack and resolve, and pruned every repeater pass against
+what is still open.
+
 It needs HTTPS (push is a secure-context API) and, on iOS, a home-screen
 install. The VAPID key pair is generated once into `data/push_vapid.json`
 (0600); losing it invalidates every subscription, so back it up with the
@@ -360,6 +373,80 @@ on every single command execution, no click required: the "Kind" column
 in Saved Results / Recent results shows "Auto" vs "Manual" (the manual
 `POST /api/results` endpoint still exists, e.g. for scripted use, and rows
 it creates are flagged "Manual").
+
+## Alerting in under a second: the syslog fast path
+
+PROXMON pages within about a second of a fault because its agent watches
+cheap signals and the server evaluates each report on arrival. A switch
+gives us the same signal for free: it logs a link change, a PSU fault or a
+protocol event to syslog the instant it happens. Until this shipped that
+line took the long way round - Vector, Loki, a 3-second poll, an
+Alertmanager POST, its dispatch, our own webhook, an occurrence, a page:
+several seconds on a good day and minutes when Loki was slow.
+
+Now Vector's `switchboard_fast` sink (`syslog/vector.yaml`) POSTs every
+interpreted event to **`/api/ingest/syslog`** as it arrives (50 ms batch
+timeout, bearer token `SYSLOG_INGEST_TOKEN`), and Switchboard evaluates
+it on arrival with the same checkers the Loki poll feeds - interface
+down/up (`interface_alerting.process_events`), fan/PSU
+(`hardware_alerting.process_events`) and the **syslog rules** below. Each
+checker keeps a timestamp cursor, so the poll behind the fast path sees
+what it already handled as done; if the fast path goes quiet the poll is
+still there, a few seconds slower.
+
+The second half is `fastpath.LocalFirstAlertmanager`: every alert this
+app raises goes through one `post_alerts`, and the wrapper opens the
+occurrence, marks it paged and (via the event bus) pushes to phones
+*before* forwarding to Alertmanager. Alertmanager still gets everything
+for its other receivers; it just no longer sits between a fault and a
+phone, and a page still goes out when it is down. An `endsAt` in the past
+closes the occurrence at once, so a link that came back up stops paging
+the moment the switch says so. Occurrences record `detected_via`
+(`syslog`, `loki`, `poll`, a person, or NULL for Alertmanager-learned)
+and `signal_at` (the device's own timestamp), and the alarm's detail
+panel shows "detected via syslog fast path, 0.4 s after the device logged
+it".
+
+**Syslog rules** (Alerts → Syslog rules) are PROXMON's kmsg fault regex
+for switches: match on the parsed facility and/or mnemonic and/or a
+pattern over the message, pick a severity, and say how the alarm ends - a
+clearing pattern, an auto-resolve timer, or both; one alarm per device or
+per device+interface. Five ship, all off except the self-test:
+spanning-tree topology change, routing neighbour lost, duplicate IP,
+configuration changed. The editor can paste a real line and see which
+rules fire or clear. Rule alarms carry `source=syslog-rule` and are
+heartbeated/reseeded like the other direct alerts.
+
+**Send a test** on that tab is the honest number: it sends one syslog line
+to the receiver in Settings (`syslog_receiver`, Vector's listener), times
+it back through Vector into the ingest endpoint, into an alarm, and to
+the enrolled phones, then the test alarm resolves itself a minute later.
+The Settings health panel has a "Syslog fast path" row: not configured,
+configured-but-silent (the case that hides - the token is set but
+Vector's sink is not pointed here), or receiving with the Vector →
+Switchboard latency.
+
+Set-up: `install-stack.sh --install webui` generates
+`SYSLOG_INGEST_TOKEN`; `--install syslog` asks for the Switchboard URL and
+that token and POSTs a test event before deploying anything (the same
+"test the connection before it goes live" discipline as the Loki
+endpoint). No token = no sink, and everything still works through Loki.
+
+## Alarm lifecycle events come from the occurrence store
+
+`alarm.opened` (an occurrence exists - the alarm is pending or firing,
+possibly inside its paging hold), `alarm.paged` (it went to the pager:
+the hold lapsed or there was none - **this** is what pages phones) and
+`alarm.resolved` are emitted by `OccurrenceStore`'s own transitions, not
+by whichever code path happened to drive them. Confirmed live before the
+change: `alarm.opened` was emitted only by the Alertmanager webhook, but
+the 3-second sync tick opens nearly every real occurrence first, so real
+alarms produced no event, no page and no webhook call; and the stale
+sweep closed occurrences without ever emitting `alarm.resolved`, leaving
+the pager ledger behind. Each hook fires exactly once per transition -
+decided in SQL (`INSERT … RETURNING` under the partial unique index, an
+`UPDATE … FOR UPDATE` returning the previous `paged_at`, `UPDATE … WHERE
+resolved_at IS NULL`) - even when the webhook and the tick race.
 
 ## Syslog: read live from Loki, not re-derived
 

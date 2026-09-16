@@ -53,7 +53,9 @@ import retention
 import api_tokens
 import dns_cache
 import events
+import fastpath
 import push as push_module
+import syslog_alerting
 import sflow_store
 import webhooks as webhooks_module
 from ssh_client import SwitchSSH, SwitchSSHError
@@ -78,7 +80,12 @@ LEGACY_SQLITE_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "data" / "switchbo
 # is enough, no need for the Settings-page-editable DSN treatment Loki
 # gets.
 ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "http://alertmanager:9093")
-ALERTMANAGER = AlertmanagerClient(ALERTMANAGER_URL)
+# Local-first (see fastpath.py): an alert this app raises opens its
+# occurrence and pages here, then goes to Alertmanager for its receivers.
+# OCCURRENCES is looked up at call time - it does not exist yet here, and
+# _load_database replaces it on every reconfiguration.
+ALERTMANAGER = fastpath.LocalFirstAlertmanager(
+    AlertmanagerClient(ALERTMANAGER_URL), lambda: globals().get("OCCURRENCES"), alert_acks.fingerprint_for)
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
 # How long an alarm is held back from paging so it can be looked at first
 # (see paging.py). 0 disables the hold entirely and restores "page the
@@ -503,6 +510,15 @@ INTERFACE_ALERT_CHECKER.reseed_from_alertmanager(ALERTMANAGER)
 # hardware_alerting.py's HardwareAlertChecker docstring.
 HARDWARE_ALERT_CHECKER = hardware_alerting.HardwareAlertChecker()
 HARDWARE_ALERT_CHECKER.reseed_from_alertmanager(ALERTMANAGER)
+
+# The syslog fast path (fastpath.py): Vector POSTs events here as they
+# arrive; the token is what lets it. Blank = endpoint answers 503 and
+# detection stays on the Loki poll and SSH fallbacks.
+SYSLOG_INGEST_TOKEN = (os.environ.get("SYSLOG_INGEST_TOKEN") or "").strip()
+SYSLOG_RECEIVER = (os.environ.get("SYSLOG_RECEIVER") or "").strip()
+FAST_PATH = fastpath.FastPathStats()
+SYSLOG_RULES = None   # syslog_alerting.SyslogRuleStore, once the database is up
+SYSLOG_RULE_ENGINE = syslog_alerting.SyslogRuleEngine()
 DEVICES = []
 DEVICES_BY_ID = {}
 LOKI = None
@@ -797,7 +813,8 @@ def _interface_alert_syslog_loop():
             log.exception("interface alert config lookup failed (syslog path)")
             continue
         try:
-            ok = INTERFACE_ALERT_CHECKER.check_via_syslog(configs, LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
+            with fastpath.attributed("loki"):
+                ok = INTERFACE_ALERT_CHECKER.check_via_syslog(configs, LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
             backoff.ok() if ok else backoff.failed()
         except Exception:
             backoff.failed()
@@ -861,7 +878,8 @@ def _hardware_alert_syslog_loop():
         if LOKI is None:
             continue
         try:
-            ok = HARDWARE_ALERT_CHECKER.check_via_syslog(LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
+            with fastpath.attributed("loki"):
+                ok = HARDWARE_ALERT_CHECKER.check_via_syslog(LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
             backoff.ok() if ok else backoff.failed()
         except Exception:
             backoff.failed()
@@ -883,6 +901,126 @@ def _hardware_alert_reconcile_loop():
 
 
 threading.Thread(target=_hardware_alert_reconcile_loop, daemon=True, name="hardware-alert-reconciler").start()
+
+
+# --- the syslog fast path: evaluate on arrival ---------------------------
+# Everything below runs on Vector's POST (see api_ingest_syslog): the same
+# checkers the Loki polls above feed, given the event the moment it lands
+# instead of up to three seconds later, plus the syslog rules. Each checker
+# keeps a timestamp cursor, so the poll behind this sees what the fast
+# path already handled as done.
+
+_LIST_CACHE = {}
+
+
+def _cached_list(key, ttl, fn):
+    """A per-batch DB read for interface configs / rules would be one
+    query per syslog event under load; a few seconds of staleness for a
+    rule edit is nothing."""
+    now = time.monotonic()
+    hit = _LIST_CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    value = fn()
+    _LIST_CACHE[key] = (now, value)
+    return value
+
+
+def _device_for_event(event):
+    """(device_id or "", display name) for a syslog event - by source
+    address first (that is what the devices table records), then by the
+    hostname the device wrote into the line, else the hostname itself so
+    a sender we do not manage still alarms under its own name."""
+    host = event.get("source_ip") or event.get("device_host") or event.get("host") or ""
+    for d in DEVICES_BY_ID.values():
+        if d.host == host:
+            return d.id, d.name
+    name = str(event.get("device_host") or event.get("host") or host or "unknown")
+    for d in DEVICES_BY_ID.values():
+        if d.name.lower() == name.lower():
+            return d.id, d.name
+    return "", name
+
+
+def _handle_syslog_events(events):
+    """Run every checker over freshly arrived events. Returns how many
+    alarms fired or cleared. Each event runs inside fastpath.signal so
+    the occurrence it opens records when the device logged it."""
+    if not events:
+        return 0
+    configs = _cached_list("interface_configs", 5, lambda: INTERFACE_ALERT_RULES.list() if INTERFACE_ALERT_RULES is not None else [])
+    rules = _cached_list("syslog_rules", 5, lambda: SYSLOG_RULES.list(enabled_only=True) if SYSLOG_RULES is not None else [])
+    acted = 0
+    for event in sorted(events, key=lambda e: int(e.get("_timestamp_ns") or 0)):
+        with fastpath.signal(event):
+            try:
+                acted += INTERFACE_ALERT_CHECKER.process_events([event], configs, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
+            except Exception:
+                log.exception("fast path: interface check failed")
+            try:
+                acted += HARDWARE_ALERT_CHECKER.process_events([event], DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
+            except Exception:
+                log.exception("fast path: hardware check failed")
+            if rules:
+                try:
+                    acted += SYSLOG_RULE_ENGINE.evaluate_new([event], rules, _device_for_event, ALERTMANAGER)
+                except Exception:
+                    log.exception("fast path: syslog rules failed")
+    return acted
+
+
+def _syslog_rules_tick_loop():
+    """Auto-resolve expired rule alarms and heartbeat the rest."""
+    while True:
+        time.sleep(3)
+        if SYSLOG_RULES is None:
+            continue
+        try:
+            SYSLOG_RULE_ENGINE.tick(ALERTMANAGER)
+        except Exception:
+            log.exception("syslog rule tick failed")
+
+
+threading.Thread(target=_syslog_rules_tick_loop, daemon=True, name="syslog-rules-tick").start()
+
+
+def _syslog_rules_fallback_loop():
+    """The Loki poll behind the fast path, for rules - engaged only while
+    the fast path has been silent for 30s (Vector's sink down, token
+    wrong, Switchboard just restarted mid-burst). While events are
+    flowing this does nothing, so it costs Loki nothing in the normal
+    case; when they are not, rules still fire, a few seconds late."""
+    backoff = PollBackoff(base=5.0)
+    while True:
+        time.sleep(backoff.delay)
+        if LOKI is None or SYSLOG_RULES is None:
+            continue
+        last = FAST_PATH.last_received_at
+        if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < 30:
+            backoff.ok()
+            continue
+        try:
+            rules = SYSLOG_RULES.list(enabled_only=True)
+        except Exception:
+            log.exception("syslog rule lookup failed (fallback path)")
+            continue
+        if not rules:
+            continue
+        try:
+            events = LOKI.query_range(filters=None, limit=200, since_seconds=20)
+        except Exception:
+            backoff.failed()
+            continue
+        backoff.ok()
+        try:
+            with fastpath.attributed("loki"):
+                SYSLOG_RULE_ENGINE.evaluate_new(sorted(events, key=lambda e: int(e.get("_timestamp_ns") or 0)),
+                                                rules, _device_for_event, ALERTMANAGER)
+        except Exception:
+            log.exception("syslog rules fallback evaluation failed")
+
+
+threading.Thread(target=_syslog_rules_fallback_loop, daemon=True, name="syslog-rules-fallback").start()
 
 
 def _place_hold(labels, signature=None):
@@ -1046,7 +1184,7 @@ def _sync_occurrences():
         held = PENDING_HOLDS.pop(occurrence["signature"], None)
         if held:
             PAGER.release(held[0])
-        OCCURRENCES.close(occurrence["signature"])
+        OCCURRENCES.close(occurrence["signature"], by="sync")
         if occurrence["paged_at"] is None:
             log.info("alarm %s cleared without ever paging", occurrence["id"])
 
@@ -1127,6 +1265,19 @@ def _backfill_alert_history_fingerprints():
     log.info("backfilled fingerprints for %d alert history row(s)", filled)
 
 
+def _wire_occurrence_events(store):
+    """Every alarm lifecycle event comes from the occurrence store's own
+    transitions, not from whichever code path happened to drive them.
+    Confirmed live: emitting alarm.opened only from the Alertmanager
+    webhook meant a real alarm the 3s sync tick opened first (nearly all
+    of them - the tick beats the webhook) never paged anyone and never
+    reached a webhook; and an occurrence the stale sweep closed never
+    produced alarm.resolved, so its pager ledger was never cleared."""
+    store.on_opened = lambda occ: events.BUS.emit("alarm.opened", occurrence=_occ_payload(occ))
+    store.on_paged = lambda occ: events.BUS.emit("alarm.paged", occurrence=_occ_payload(occ))
+    store.on_closed = lambda occ, by: events.BUS.emit("alarm.resolved", occurrence=_occ_payload(occ), by=by or "switchboard")
+
+
 def _wire_event_bus():
     """Subscribe the webhook dispatcher and push notifier to the event bus.
     Runs on every (re)configuration; the bus is process-global, so the
@@ -1159,6 +1310,7 @@ def _load_database(dsn):
     without disturbing whatever was working before the attempt."""
     global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES
     global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW, SFLOW_IFINDEX, NETFLOW, API_TOKENS, WEBHOOKS, PUSH_SUBS
+    global SYSLOG_RULES
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
@@ -1184,6 +1336,14 @@ def _load_database(dsn):
     API_TOKENS = api_tokens.ApiTokenStore(new_db)
     WEBHOOKS = webhooks_module.WebhookStore(new_db)
     PUSH_SUBS = push_module.PushSubscriptionStore(new_db)
+    SYSLOG_RULES = syslog_alerting.SyslogRuleStore(new_db)
+    _LIST_CACHE.clear()
+    try:
+        SYSLOG_RULES.seed_defaults()
+        SYSLOG_RULE_ENGINE.reseed_from_alertmanager(ALERTMANAGER, {str(r["id"]): r for r in SYSLOG_RULES.list()})
+    except Exception:
+        log.exception("syslog rules: seeding/reseeding failed - rules still evaluate, state starts empty")
+    _wire_occurrence_events(OCCURRENCES)
     try:
         _wire_event_bus()
     except Exception:
@@ -1247,7 +1407,7 @@ def _apply_service_settings(settings_dict):
     precisely when it's needed. An admin whose Postgres is down must still
     be able to correct the Alertmanager or Loki address."""
     global LOKI_URL, LOKI, ALERTMANAGER_URL, PROMETHEUS_URL, PROMETHEUS_RELOAD_URL
-    global EXPORTER_URL, ALERTMANAGER, PAGER, SFLOW_COLLECTOR
+    global EXPORTER_URL, ALERTMANAGER, PAGER, SFLOW_COLLECTOR, SYSLOG_RECEIVER
     LOKI_URL = settings_dict.get("loki_url") or settings_store.DEFAULT_LOKI_URL
     LOKI = LokiClient(LOKI_URL)
     ALERTMANAGER_URL = settings_dict.get("alertmanager_url") or ALERTMANAGER_URL
@@ -1261,8 +1421,10 @@ def _apply_service_settings(settings_dict):
     # instead of at the next restart. PAGER holds its own reference to the
     # client, so it has to be rebuilt too or it keeps talking to the old
     # address - a silent failure where holds would be placed nowhere.
-    ALERTMANAGER = AlertmanagerClient(ALERTMANAGER_URL)
+    ALERTMANAGER = fastpath.LocalFirstAlertmanager(
+        AlertmanagerClient(ALERTMANAGER_URL), lambda: globals().get("OCCURRENCES"), alert_acks.fingerprint_for)
     PAGER = paging.PagingController(ALERTMANAGER, PAGE_DELAY_SECONDS)
+    SYSLOG_RECEIVER = settings_dict.get("syslog_receiver", SYSLOG_RECEIVER) or ""
 
 
 _initial_settings = settings_store.load()
@@ -1374,6 +1536,9 @@ class SettingsUpdateRequest(BaseModel):
     exporter_url: Optional[str] = None
     # Blank is meaningful: "collector address not recorded".
     sflow_collector: Optional[str] = None
+    # Blank is meaningful: "no receiver recorded" (the fast-path self-test
+    # then says so instead of sending into the void).
+    syslog_receiver: Optional[str] = None
 
 
 @app.get("/api/setup/status")
@@ -1462,6 +1627,7 @@ def api_get_settings(user: str = Depends(require_auth)):
         "prometheus_reload_url": PROMETHEUS_RELOAD_URL,
         "exporter_url": EXPORTER_URL,
         "sflow_collector": SFLOW_COLLECTOR,
+        "syslog_receiver": SYSLOG_RECEIVER,
         "db_error": DB_ERROR,
     }
 
@@ -1567,6 +1733,27 @@ def api_settings_health(user: str = Depends(require_auth)):
             checks.append({"name": label, "target": target, "ok": False,
                            "detail": f"could not query flows: {e}"})
 
+    # The fast path is "are events arriving straight from Vector", the
+    # difference between paging in under a second and paging when the
+    # Loki poll gets round to it. Configured-but-silent is the case to
+    # name: the token is set here but Vector's sink is not pointed here,
+    # or carries a different token, and everything still *works* - slowly.
+    snap = FAST_PATH.snapshot()
+    if not SYSLOG_INGEST_TOKEN:
+        checks.append({"name": "Syslog fast path", "target": "/api/ingest/syslog", "ok": False,
+                       "detail": "not configured - set SYSLOG_INGEST_TOKEN and point Vector's switchboard_fast "
+                                 "sink here (install-stack.sh --install syslog); detection is on the Loki poll"})
+    elif snap["last_received_at"] is None:
+        checks.append({"name": "Syslog fast path", "target": "/api/ingest/syslog", "ok": False,
+                       "detail": "configured, but no event has arrived since start - is Vector's switchboard_fast "
+                                 "sink pointed here with the same token? Use 'Send a test' on the Alerts page"})
+    else:
+        age = (datetime.now(timezone.utc) - FAST_PATH.last_received_at).total_seconds()
+        lat = f"; Vector to Switchboard median {snap['transport_ms_median']:.0f} ms" if snap["transport_ms_median"] is not None else ""
+        checks.append({"name": "Syslog fast path", "target": "/api/ingest/syslog", "ok": age <= SYSLOG_STALE_AFTER_SECONDS,
+                       "detail": (f"last event {age/60:.0f} min ago" if age > 90 else f"last event {age:.0f}s ago")
+                                 + f" from {snap['last_host'] or '?'}; {snap['events_last_minute']}/min{lat}"})
+
     for name, url, path in (
         ("Loki", LOKI_URL, "/ready"),
         ("Alertmanager", ALERTMANAGER_URL, "/-/healthy"),
@@ -1601,7 +1788,7 @@ def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_
         submitted = submitted.strip()
         # prometheus_reload_url is legitimately blank (it derives from
         # prometheus_url); the rest fall back rather than being blanked.
-        blank_ok = key in ("prometheus_reload_url", "sflow_collector")
+        blank_ok = key in ("prometheus_reload_url", "sflow_collector", "syslog_receiver")
         new_settings[key] = submitted or ("" if blank_ok else fallback)
 
     # The service URLs are applied and saved first, and never gated behind
@@ -3232,12 +3419,13 @@ def api_resolve_alarm(occurrence_id: int, user: str = Depends(require_operator))
     labels = occurrence["labels"]
     now = datetime.now(timezone.utc)
     try:
-        ALERTMANAGER.post_alerts([{
-            "labels": labels,
-            "annotations": {"summary": f"Manually resolved by {user}"},
-            "startsAt": (now - timedelta(minutes=1)).isoformat(),
-            "endsAt": now.isoformat(),
-        }])
+        with fastpath.attributed(user):
+            ALERTMANAGER.post_alerts([{
+                "labels": labels,
+                "annotations": {"summary": f"Manually resolved by {user}"},
+                "startsAt": (now - timedelta(minutes=1)).isoformat(),
+                "endsAt": now.isoformat(),
+            }])
     except AlertmanagerError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -3347,10 +3535,7 @@ async def api_alertmanager_webhook(request: Request):
             signature = alert_acks.fingerprint_for(labels)
             try:
                 if status == "firing":
-                    was_open = OCCURRENCES.open_for(signature)
                     occurrence = OCCURRENCES.open(signature, name, severity, summary, labels)
-                    if occurrence and was_open is None:
-                        events.BUS.emit("alarm.opened", occurrence=_occ_payload(occurrence))
                     held = PENDING_HOLDS.pop(signature, None)
                     if occurrence and held and occurrence.get("page_at") is None and occurrence.get("paged_at") is None:
                         OCCURRENCES.set_paging(occurrence["id"], held[1], held[0])
@@ -3369,9 +3554,7 @@ async def api_alertmanager_webhook(request: Request):
                         PAGER.release(open_occurrence["silence_id"])
                     elif held:
                         PAGER.release(held[0])
-                    OCCURRENCES.close(signature)
-                    if open_occurrence:
-                        events.BUS.emit("alarm.resolved", occurrence=_occ_payload(open_occurrence), by="alertmanager")
+                    OCCURRENCES.close(signature, by="alertmanager")
             except Exception:
                 log.exception("could not update alarm occurrence for %s", name)
     return {"ok": True}
@@ -3739,6 +3922,9 @@ def _occ_payload(occ):
     return {"id": occ.get("id"), "alertname": occ.get("alertname"), "severity": occ.get("severity"),
             "summary": occ.get("summary"), "device": labels.get("device") or labels.get("instance"),
             "signature": occ.get("signature"), "started_at": str(occ.get("started_at") or ""),
+            "paged_at": str(occ.get("paged_at")) if occ.get("paged_at") else None,
+            "resolved_at": str(occ.get("resolved_at")) if occ.get("resolved_at") else None,
+            "detected_via": occ.get("detected_via"), "signal_at": occ.get("signal_at"),
             "labels": labels}
 
 
@@ -4269,6 +4455,276 @@ def _topology_refresh_loop():
 threading.Thread(target=_topology_refresh_loop, daemon=True, name="topology-refresh").start()
 
 
+def _open_unacked_occurrences():
+    """Open occurrences that went to the pager and nobody has acknowledged,
+    in the shape push wants. `paged_at` is the gate: an occurrence that is
+    only pending, or still inside its paging hold, or NARG'd, has not
+    paged anyone and must not have phones repeating for it."""
+    rows = OCCURRENCES.list(limit=500, open_only=True)
+    ids = [r["id"] for r in rows]
+    acked = OCCURRENCES.acks_by_occurrence(ids) if ids else {}
+    out = []
+    for r in rows:
+        if acked.get(r["id"]) or not r.get("paged_at"):
+            continue
+        p = _occ_payload(r) or {}
+        p["started_at"] = str(r.get("started_at") or "")
+        out.append(p)
+    return out
+
+
+def _push_repeat_loop():
+    """A pager repeats. Every 30s, re-page devices whose interval has
+    elapsed for any alarm still open and unacknowledged - and page any
+    device that has not been paged for it yet. The event bus handles the
+    first page and the ack broadcast; this handles everything between."""
+    while True:
+        time.sleep(30)
+        if PUSH_NOTIFIER is None or OCCURRENCES is None or PUSH_SUBS is None:
+            continue
+        try:
+            # Belt and braces for the ledger: alarm.resolved clears it, but
+            # a resolve that happened while the process was down (or any
+            # future close path that forgets) must not leave rows behind.
+            PUSH_SUBS.prune_pages(OCCURRENCES.open_ids())
+            PUSH_NOTIFIER.repeat_due(_open_unacked_occurrences())
+        except Exception:
+            log.exception("push repeat pass failed")
+
+
+threading.Thread(target=_push_repeat_loop, daemon=True, name="push-repeater").start()
+
+
+# --- the syslog fast path -----------------------------------------------
+# Vector's switchboard_fast sink (syslog/vector.yaml) POSTs each parsed
+# event here the moment it arrives. Not a session route: the sink
+# authenticates with SYSLOG_INGEST_TOKEN. The work runs on a worker
+# thread so a slow Alertmanager forward never stalls the event loop.
+
+def _ingest_syslog_sync(body, content_type):
+    try:
+        events = fastpath.parse_events(body, content_type)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"unreadable events: {e}")
+    FAST_PATH.record(events, datetime.now(timezone.utc))
+    acted = _handle_syslog_events(events)
+    return {"accepted": len(events), "acted": acted}
+
+
+@app.post("/api/ingest/syslog", tags=["ingest"], summary="Syslog fast path: events straight from Vector")
+async def api_ingest_syslog(request: Request):
+    """Receives interpreted syslog events from Vector's `http` sink (a JSON
+    array per batch; a single object or NDJSON also work) and evaluates
+    them immediately: interface down/up, fan/PSU alarms, syslog rules.
+    Authenticate with `Authorization: Bearer <SYSLOG_INGEST_TOKEN>`."""
+    if not SYSLOG_INGEST_TOKEN:
+        raise HTTPException(status_code=503, detail="fast path not configured: set SYSLOG_INGEST_TOKEN")
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else request.headers.get("x-switchboard-token", "")
+    if not token or not secrets.compare_digest(token, SYSLOG_INGEST_TOKEN):
+        raise HTTPException(status_code=401, detail="bad ingest token")
+    body = await request.body()
+    if len(body) > 4_000_000:
+        raise HTTPException(status_code=413, detail="batch too large")
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(_ingest_syslog_sync, body, request.headers.get("content-type", ""))
+
+
+@app.get("/api/alerting/fast-path", tags=["alerting"], summary="Syslog fast-path status")
+def api_fast_path_status(user: str = Depends(require_auth_and_db)):
+    snap = FAST_PATH.snapshot()
+    snap.update({
+        "configured": bool(SYSLOG_INGEST_TOKEN),
+        "receiver": SYSLOG_RECEIVER,
+        "local_opens": getattr(ALERTMANAGER, "local_opens", 0),
+        "local_closes": getattr(ALERTMANAGER, "local_closes", 0),
+        "rule_alarms_active": SYSLOG_RULE_ENGINE.active(),
+        "stale_after_seconds": SYSLOG_STALE_AFTER_SECONDS,
+    })
+    return snap
+
+
+class FastPathTestRequest(BaseModel):
+    severity: str = "warning"
+
+
+@app.post("/api/alerting/fast-path/test", tags=["alerting"], summary="Send a syslog self-test and time it")
+def api_fast_path_test(req: FastPathTestRequest, user: str = Depends(require_operator)):
+    """Sends one syslog line to the configured receiver (Vector) and times
+    it back: received by the ingest endpoint, opened as an alarm, paged to
+    phones. The alarm is the built-in self-test rule and resolves itself
+    after a minute. The numbers are the whole path a real switch message
+    takes, minus the switch."""
+    if not SYSLOG_INGEST_TOKEN:
+        raise HTTPException(status_code=400, detail="fast path not configured: set SYSLOG_INGEST_TOKEN in webui.env")
+    if not SYSLOG_RECEIVER:
+        raise HTTPException(status_code=400, detail="set the syslog receiver address (host:port) in Settings first")
+    if req.severity not in syslog_alerting.SEVERITIES:
+        raise HTTPException(status_code=400, detail=f"severity must be one of {', '.join(syslog_alerting.SEVERITIES)}")
+    host, _, port = SYSLOG_RECEIVER.rpartition(":")
+    if not host:
+        host, port = SYSLOG_RECEIVER, "514"
+    try:
+        port = int(port)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="syslog receiver must be host:port")
+    rule = SYSLOG_RULES.ensure_selftest(req.severity)
+    _LIST_CACHE.pop("syslog_rules", None)
+    # A previous test still firing would make this one look instant.
+    SYSLOG_RULE_ENGINE.forget_rule(rule["id"], ALERTMANAGER)
+    labels = SYSLOG_RULE_ENGINE._labels(rule, "", "switchboard", "")
+    signature = alert_acks.fingerprint_for(labels)
+
+    import socket
+    nonce = secrets.token_hex(4)
+    line = fastpath.selftest_line(nonce, sender="switchboard")
+    sent_at = datetime.now(timezone.utc)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(2)
+            sock.sendto(line.encode(), (host, port))
+    except OSError as e:
+        raise HTTPException(status_code=502, detail=f"could not send to {host}:{port}: {e}")
+
+    def ms_since(dt):
+        return round((dt - sent_at).total_seconds() * 1000) if dt else None
+
+    received_at = occ = None
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        received_at = received_at or FAST_PATH.selftest_received_at(nonce)
+        if received_at:
+            cand = OCCURRENCES.open_for(signature)
+            if cand and cand.get("paged_at") and fastpath._iso_to_dt(cand["started_at"]) >= sent_at - timedelta(seconds=1):
+                occ = cand
+                break
+        time.sleep(0.02)
+    paged_devices, first_push_at = 0, None
+    if occ and PUSH_SUBS is not None:
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            pages = PUSH_SUBS.pages_for(occ["id"])
+            if pages:
+                paged_devices = len(pages)
+                first = min(p["first_paged_at"] for p in pages.values())
+                first_push_at = first if first.tzinfo else first.replace(tzinfo=timezone.utc)
+                break
+            time.sleep(0.05)
+    result = {
+        "ok": occ is not None,
+        "sent_at": sent_at.isoformat(),
+        "receiver": f"{host}:{port}",
+        "received_ms": ms_since(received_at),
+        "alarm_ms": ms_since(fastpath._iso_to_dt(occ["paged_at"])) if occ else None,
+        "push_ms": ms_since(first_push_at),
+        "paged_devices": paged_devices,
+        "occurrence_id": occ["id"] if occ else None,
+        "severity": req.severity,
+        "by": user,
+    }
+    if not occ:
+        result["detail"] = ("the line never arrived on /api/ingest/syslog - check Vector's switchboard_fast sink and token"
+                            if received_at is None else "received, but no alarm opened - is the self-test rule enabled?")
+    FAST_PATH.last_test = result
+    AUDIT.record(user, "alerting.fast_path_test", "Switchboard fast-path self-test", result)
+    log.info("user=%s fast-path self-test: %s", user, result)
+    return result
+
+
+# --- syslog rules ----------------------------------------------------------
+
+class SyslogRuleRequest(BaseModel):
+    name: Optional[str] = None
+    enabled: Optional[bool] = None
+    severity: Optional[str] = None
+    facility: Optional[str] = None
+    mnemonic: Optional[str] = None
+    pattern: Optional[str] = None
+    clear_pattern: Optional[str] = None
+    per_interface: Optional[bool] = None
+    auto_resolve_seconds: Optional[int] = None
+
+
+class SyslogRuleMatchRequest(BaseModel):
+    message: str
+    facility: Optional[str] = None
+    mnemonic: Optional[str] = None
+
+
+def _require_syslog_rules():
+    if SYSLOG_RULES is None:
+        raise HTTPException(status_code=503, detail="database not configured")
+    return SYSLOG_RULES
+
+
+@app.get("/api/syslog-rules", tags=["alerting"], summary="List syslog rules")
+def api_list_syslog_rules(user: str = Depends(require_auth_and_db)):
+    return {"rules": _require_syslog_rules().list(), "active": SYSLOG_RULE_ENGINE.active()}
+
+
+@app.post("/api/syslog-rules", tags=["alerting"], summary="Create a syslog rule")
+def api_create_syslog_rule(req: SyslogRuleRequest, user: str = Depends(require_operator)):
+    try:
+        rule = _require_syslog_rules().create(req.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _LIST_CACHE.pop("syslog_rules", None)
+    AUDIT.record(user, "syslog_rule.created", rule["name"], {k: rule[k] for k in ("severity", "facility", "mnemonic", "pattern")})
+    return rule
+
+
+@app.put("/api/syslog-rules/{rule_id}", tags=["alerting"], summary="Update a syslog rule")
+def api_update_syslog_rule(rule_id: int, req: SyslogRuleRequest, user: str = Depends(require_operator)):
+    try:
+        rule = _require_syslog_rules().update(rule_id, req.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if rule is None:
+        raise HTTPException(status_code=404, detail="no such rule")
+    _LIST_CACHE.pop("syslog_rules", None)
+    if not rule["enabled"]:
+        SYSLOG_RULE_ENGINE.forget_rule(rule_id, ALERTMANAGER)
+    AUDIT.record(user, "syslog_rule.updated", rule["name"], {k: v for k, v in req.model_dump().items() if v is not None})
+    return rule
+
+
+@app.delete("/api/syslog-rules/{rule_id}", tags=["alerting"], summary="Delete a syslog rule")
+def api_delete_syslog_rule(rule_id: int, user: str = Depends(require_operator)):
+    store = _require_syslog_rules()
+    rule = store.get(rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail="no such rule")
+    if rule["builtin"]:
+        raise HTTPException(status_code=400, detail="the self-test rule is built in; disable it instead")
+    store.delete(rule_id)
+    _LIST_CACHE.pop("syslog_rules", None)
+    SYSLOG_RULE_ENGINE.forget_rule(rule_id, ALERTMANAGER)
+    AUDIT.record(user, "syslog_rule.deleted", rule["name"], None)
+    return {"ok": True}
+
+
+_DELL_SHAPE = re.compile(r"%(?P<facility>[A-Z0-9]+)-(?P<severity_num>\d)-(?P<mnemonic>[A-Z0-9_-]+):")
+
+
+@app.post("/api/syslog-rules/match", tags=["alerting"], summary="Which rules would a line fire or clear?")
+def api_match_syslog_rules(req: SyslogRuleMatchRequest, user: str = Depends(require_auth_and_db)):
+    """Dry run for the rule editor: paste a real log line and see what it
+    would do. A Dell-shaped line has its facility/mnemonic parsed the way
+    Vector's interpreter would; otherwise pass them explicitly."""
+    event = {"message": req.message, "detail": req.message,
+             "facility": (req.facility or "").upper(), "mnemonic": (req.mnemonic or "").upper()}
+    m = _DELL_SHAPE.search(req.message)
+    if m and not req.facility:
+        event["facility"], event["mnemonic"] = m.group("facility"), m.group("mnemonic")
+    out = []
+    for rule in _require_syslog_rules().list():
+        verdict = syslog_alerting.matches(rule, event)
+        if verdict is not None:
+            out.append({"id": rule["id"], "name": rule["name"], "enabled": rule["enabled"],
+                        "verdict": "fires" if verdict else "clears"})
+    return {"parsed": {"facility": event["facility"], "mnemonic": event["mnemonic"]}, "matches": out}
+
+
 @app.get("/api/topology", tags=["topology"], summary="Fleet topology (cached)")
 def api_topology(refresh: int = 0, user: str = Depends(require_auth_and_db)):
     """Fleet-wide topology from LLDP, ARP and MAC-table data.
@@ -4437,6 +4893,16 @@ class PushSubscribeRequest(BaseModel):
     min_severity: str = "warning"
     notify_resolved: bool = True
     label: Optional[str] = None
+    repeat_minutes: int = 5
+    max_repeats: int = 12
+
+
+class PushPrefsRequest(BaseModel):
+    endpoint: str
+    min_severity: str = "warning"
+    notify_resolved: bool = True
+    repeat_minutes: int = 5
+    max_repeats: int = 12
 
 
 class PushEndpointRequest(BaseModel):
@@ -4455,7 +4921,8 @@ def api_push_subscribe(req: PushSubscribeRequest, user: str = Depends(require_au
     if not (PUSH_KEYS and PUSH_KEYS.available):
         raise HTTPException(status_code=503, detail="push is not available on this server")
     try:
-        row = PUSH_SUBS.upsert(req.subscription, user, req.label, req.min_severity, req.notify_resolved)
+        row = PUSH_SUBS.upsert(req.subscription, user, req.label, req.min_severity, req.notify_resolved,
+                               req.repeat_minutes, req.max_repeats)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     AUDIT.record(user, "push.subscribe", (req.label or "")[:60], {"min_severity": req.min_severity})
@@ -4469,6 +4936,20 @@ def api_push_unsubscribe(req: PushEndpointRequest, request: Request, user: str =
         raise HTTPException(status_code=403, detail="not your subscription")
     PUSH_SUBS.remove(req.endpoint)
     return {"ok": True}
+
+
+@app.post("/api/push/prefs", tags=["push"], summary="Change how a device is paged")
+def api_push_prefs(req: PushPrefsRequest, request: Request, user: str = Depends(require_auth_and_db)):
+    mine = {r["endpoint"] for r in PUSH_SUBS.list(username=user)}
+    if req.endpoint not in mine and not auth.role_meets(_role_of(request), "admin"):
+        raise HTTPException(status_code=403, detail="not your subscription")
+    try:
+        row = PUSH_SUBS.update_prefs(req.endpoint, req.min_severity, req.notify_resolved, req.repeat_minutes, req.max_repeats)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such subscription")
+    return row
 
 
 @app.get("/api/push/subscriptions", tags=["push"], summary="Every subscribed browser (admin)")

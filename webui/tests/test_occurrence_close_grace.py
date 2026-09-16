@@ -51,7 +51,9 @@ CREATE TABLE alert_occurrences (
     paged_at TEXT,
     paging_disabled INTEGER NOT NULL DEFAULT 0,
     silence_id TEXT,
-    last_seen_at TEXT
+    last_seen_at TEXT,
+    detected_via TEXT,
+    signal_at TEXT
 );
 CREATE UNIQUE INDEX idx_occurrences_one_open
     ON alert_occurrences(signature) WHERE resolved_at IS NULL;
@@ -135,11 +137,24 @@ def test_an_untouched_occurrence_becomes_stale_after_the_grace_period(store):
 
 
 def test_never_touched_occurrence_counts_as_stale(store):
-    """Rows predating last_seen_at, or opened by an instance that then
-    died, must remain closable rather than becoming immortal."""
-    _open(store)
+    """Rows predating last_seen_at must remain closable rather than
+    becoming immortal. (A row open() creates today is stamped seen at
+    birth - see test_a_fresh_occurrence_is_not_stale_at_birth - so the
+    legacy shape is written directly.)"""
+    store.db.execute(
+        "INSERT INTO alert_occurrences (signature, alertname, labels, started_at) VALUES ('sig1', 'TestAlarm', '{}', '2026-08-01T10:00:00+00:00')"
+    )
 
     assert [s["signature"] for s in store.stale_open(grace_seconds=90)] == ["sig1"]
+
+
+def test_a_fresh_occurrence_is_not_stale_at_birth(store):
+    """Confirmed live (52623): an occurrence opened by the webhook was
+    closed by the sweep 0.3s later, before Alertmanager listed it, because
+    a NULL last_seen_at counts as stale. Opening now stamps it seen."""
+    _open(store)
+
+    assert store.stale_open(grace_seconds=90) == []
 
 
 def test_touch_does_not_resurrect_a_closed_occurrence(store):

@@ -345,5 +345,23 @@ export const subscribePush = (body) =>
   api("/api/push/subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 export const unsubscribePush = (endpoint) =>
   api("/api/push/subscribe", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ endpoint }) });
+export const listPushSubscriptions = () => api("/api/push/subscriptions");
+export const updatePushPrefs = (body) =>
+  api("/api/push/prefs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 export const testPush = (endpoint) =>
   api("/api/push/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ endpoint }) });
+
+// --- the syslog fast path + syslog rules ---------------------------------
+const JSON_HEADERS = { "Content-Type": "application/json" };
+export const getFastPath = () => api("/api/alerting/fast-path");
+// The self-test waits for the line to come back through Vector (up to ~12s).
+export const testFastPath = (severity) =>
+  api("/api/alerting/fast-path/test", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ severity }) }, 30_000);
+export const listSyslogRules = () => api("/api/syslog-rules");
+export const createSyslogRule = (body) =>
+  api("/api/syslog-rules", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body) });
+export const updateSyslogRule = (id, body) =>
+  api(`/api/syslog-rules/${id}`, { method: "PUT", headers: JSON_HEADERS, body: JSON.stringify(body) });
+export const deleteSyslogRule = (id) => api(`/api/syslog-rules/${id}`, { method: "DELETE" });
+export const matchSyslogRules = (body) =>
+  api("/api/syslog-rules/match", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body) });

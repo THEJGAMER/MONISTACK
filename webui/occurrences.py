@@ -30,10 +30,32 @@ log = logging.getLogger("webui.occurrences")
 class OccurrenceStore:
     def __init__(self, db):
         self.db = db
+        # Lifecycle hooks, set by app.py to emit onto the event bus. They
+        # live here, at the store, because there is no single caller: an
+        # occurrence is opened by the Alertmanager webhook *or* the 3s sync
+        # tick (whichever sees it first - usually the tick), paged by
+        # either of those, the hold scheduler, or "Page now", and closed
+        # by the webhook, the stale sweep, or a person. Confirmed live: with
+        # emission at one call site (the webhook), a real alarm the tick
+        # opened first never produced alarm.opened at all - no page, no
+        # webhook - and one the sweep closed never produced alarm.resolved,
+        # leaving its pager ledger behind. Each hook fires exactly once per
+        # transition, decided by the row, not the caller.
+        self.on_opened = None    # fn(occurrence)
+        self.on_paged = None     # fn(occurrence)
+        self.on_closed = None    # fn(occurrence, by)
+
+    def _hook(self, fn, *args):
+        if fn is None:
+            return
+        try:
+            fn(*args)
+        except Exception:
+            log.exception("occurrence hook %s failed", getattr(fn, "__name__", fn))
 
     # --- lifecycle -------------------------------------------------
 
-    def open(self, signature, alertname, severity, summary, labels, started_at=None):
+    def open(self, signature, alertname, severity, summary, labels, started_at=None, detected_via=None, signal_at=None):
         """Opens a new occurrence, or returns the existing open one.
 
         A repeated "firing" for an alarm that is already open is the same
@@ -43,15 +65,26 @@ class OccurrenceStore:
         if two webhook deliveries race; ON CONFLICT makes that a no-op
         rather than a 500."""
         started_at = started_at or datetime.now(timezone.utc).isoformat()
-        self.db.execute(
-            """INSERT INTO alert_occurrences (signature, alertname, severity, summary, labels, started_at)
-               VALUES (%s, %s, %s, %s, %s, %s)
-               ON CONFLICT (signature) WHERE resolved_at IS NULL DO NOTHING""",
-            (signature, alertname, severity, summary, json.dumps(labels), started_at),
+        # last_seen_at is set at birth: a row opened moments ago *was* just
+        # seen. Without this the stale sweep - for which NULL means "never
+        # seen, closable" - could close a fresh occurrence in the seconds
+        # before Alertmanager lists it (confirmed live: 52623, closed 0.3s
+        # after opening).
+        inserted = self.db.query_one(
+            """INSERT INTO alert_occurrences (signature, alertname, severity, summary, labels, started_at,
+                                              last_seen_at, detected_via, signal_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (signature) WHERE resolved_at IS NULL DO NOTHING
+               RETURNING id""",
+            (signature, alertname, severity, summary, json.dumps(labels), started_at,
+             datetime.now(timezone.utc).isoformat(), detected_via, signal_at),
         )
-        return self.open_for(signature)
+        row = self.open_for(signature)
+        if inserted and row:
+            self._hook(self.on_opened, row)
+        return row
 
-    def close(self, signature, resolved_at=None):
+    def close(self, signature, resolved_at=None, by=None):
         """Closes the open occurrence for a signature, if there is one. A
         resolve for something with nothing open is ignored rather than
         creating a phantom zero-length occurrence - it usually means a
@@ -79,11 +112,18 @@ class OccurrenceStore:
         if paged_at is None and row["page_at"] and not row["paging_disabled"]:
             if row["page_at"] <= resolved_at:  # ISO 8601 strings sort chronologically
                 paged_at = row["page_at"]
-        self.db.execute(
-            "UPDATE alert_occurrences SET resolved_at = %s, page_at = NULL, paged_at = %s WHERE id = %s",
+        # `AND resolved_at IS NULL`: the webhook and the sweep can both try
+        # to close the same occurrence in the same instant; only the one
+        # whose UPDATE actually lands reports it closed and fires the hook.
+        landed = self.db.query_one(
+            "UPDATE alert_occurrences SET resolved_at = %s, page_at = NULL, paged_at = %s "
+            "WHERE id = %s AND resolved_at IS NULL RETURNING id",
             (resolved_at, paged_at, row["id"]),
         )
-        return self.get(row["id"])
+        closed = self.get(row["id"])
+        if landed:
+            self._hook(self.on_closed, closed, by)
+        return closed
 
     def touch(self, signature, seen_at=None):
         """Records that this alarm was just observed genuinely active.
@@ -129,6 +169,12 @@ class OccurrenceStore:
         row = self.db.query_one("SELECT * FROM alert_occurrences WHERE id = %s", (occurrence_id,))
         return self._to_dict(row) if row else None
 
+    def open_ids(self):
+        """Every open occurrence id, uncapped - for reconciling things
+        keyed by occurrence (the pager ledger) against what is still open."""
+        rows = self.db.query("SELECT id FROM alert_occurrences WHERE resolved_at IS NULL")
+        return {r["id"] for r in rows}
+
     def list(self, limit=200, signature=None, open_only=False):
         limit = max(1, min(limit, 1000))
         clauses, params = [], []
@@ -170,11 +216,21 @@ class OccurrenceStore:
         return self.get(occurrence_id)
 
     def mark_paged(self, occurrence_id, when=None):
-        self.db.execute(
-            "UPDATE alert_occurrences SET paged_at = %s, page_at = NULL, silence_id = NULL WHERE id = %s",
+        """Records that the alarm went to the pager. The self-join returns
+        the *previous* paged_at under the row lock, so of two callers
+        marking the same fresh occurrence at once (the sync tick and the
+        webhook do exactly this) only the first sees None and fires
+        on_paged - one page per alarm, not one per path."""
+        prev = self.db.query_one(
+            """UPDATE alert_occurrences AS o SET paged_at = %s, page_at = NULL, silence_id = NULL
+               FROM (SELECT id, paged_at AS was FROM alert_occurrences WHERE id = %s FOR UPDATE) AS before
+               WHERE o.id = before.id RETURNING before.was""",
             (when or datetime.now(timezone.utc).isoformat(), occurrence_id),
         )
-        return self.get(occurrence_id)
+        row = self.get(occurrence_id)
+        if prev is not None and prev["was"] is None and row:
+            self._hook(self.on_paged, row)
+        return row
 
     def set_paging_disabled(self, occurrence_id, disabled, silence_id=None):
         self.db.execute(
@@ -347,6 +403,8 @@ class OccurrenceStore:
             "started_at": row["started_at"],
             "resolved_at": row["resolved_at"],
             "page_at": row["page_at"],
+            "detected_via": row.get("detected_via") if hasattr(row, "get") else None,
+            "signal_at": row.get("signal_at") if hasattr(row, "get") else None,
             "paged_at": row["paged_at"],
             "paging_disabled": bool(row["paging_disabled"]),
             "silence_id": row["silence_id"],

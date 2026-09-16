@@ -11,6 +11,7 @@ import { applyMode, applyDensity, Mode, Density } from "@cloudscape-design/globa
 import SetupWizard from "./SetupWizard.jsx";
 import AccessDeniedPage from "./AccessDeniedPage.jsx";
 import LoginFailedPage from "./LoginFailedPage.jsx";
+import { listenForPages } from "./pagerSound.js";
 import { getDevices, getCommands, getSetupStatus, getCurrentUser, logout } from "./api.js";
 import { AuthProvider, useHasRole } from "./AuthContext.jsx";
 
@@ -102,6 +103,16 @@ export default function App() {
   useEffect(() => {
     applyMode(mode);
   }, [mode]);
+
+  // Every push the service worker receives is posted to open tabs: play
+  // the pager tone (unless turned off on My account) and say what paged.
+  useEffect(() => {
+    return listenForPages((payload) => {
+      if (payload.close) return;
+      pushFlash(payload.severity === "critical" ? "error" : "warning", `Paged: ${payload.title || "alarm"}`);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     applyDensity(density);

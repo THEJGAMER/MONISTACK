@@ -22,6 +22,7 @@ import Badge from "@cloudscape-design/components/badge";
 import Popover from "@cloudscape-design/components/popover";
 
 import { useClientPagination } from "./useClientPagination.js";
+import SyslogRulesTab from "./SyslogRulesTab.jsx";
 
 import {
   createSilence,
@@ -1028,6 +1029,7 @@ export default function AlertsPage({ devices, pushFlash }) {
             label: "Interfaces",
             content: <InterfacesTab devices={devices || []} pushFlash={pushFlash} />,
           },
+          { id: "syslog", label: "Syslog rules", content: <SyslogRulesTab pushFlash={pushFlash} /> },
           { id: "history", label: "History", content: <HistoryTab pushFlash={pushFlash} /> },
           { id: "audit", label: "Audit log", content: <AuditLogTab pushFlash={pushFlash} /> },
         ]}

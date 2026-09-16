@@ -239,6 +239,46 @@ transforms:
       }
 
 sinks:
+  # --- The fast path: every interpreted event straight to Switchboard ----
+  # Loki below is the archive; this is the pager. Switchboard evaluates
+  # each event the moment it lands (interface down, fan/PSU, syslog rules)
+  # and pages before Alertmanager's round trip - PROXMON-style "evaluate
+  # on arrival". A 50 ms batch timeout keeps latency negligible while
+  # still coalescing a burst into one request.
+  #
+  # Deliberately isolated from the archive: healthcheck off (a Switchboard
+  # restart must not stop Vector starting), a small memory buffer that
+  # drops the newest events when full rather than blocking - the syslog
+  # source, and with it the Loki sink, must never be back-pressured by
+  # Switchboard being down. Nothing is lost by that: the Loki poll behind
+  # the fast path re-reads what it missed.
+  #
+  # The uri and the token are substituted by install-stack.sh --install
+  # syslog; the token must equal SYSLOG_INGEST_TOKEN in Switchboard's
+  # webui.env.
+  switchboard_fast:
+    type: http
+    inputs:
+      - interpret_switch_event
+    uri: http://127.0.0.1:8080/api/ingest/syslog
+    method: post
+    encoding:
+      codec: json
+    batch:
+      max_events: 100
+      timeout_secs: 0.05
+    request:
+      timeout_secs: 5
+      retry_attempts: 3
+      headers:
+        Authorization: "Bearer CHANGE-ME-SYSLOG-INGEST-TOKEN"
+    buffer:
+      type: memory
+      max_events: 2000
+      when_full: drop_newest
+    healthcheck:
+      enabled: false
+
   loki_sink:
     type: loki
     inputs:

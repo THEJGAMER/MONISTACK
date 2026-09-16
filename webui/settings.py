@@ -42,6 +42,11 @@ SERVICE_SETTINGS = (
     # "and here is the host to go and look at". host:port, e.g.
     # "192.168.0.155:6343".
     ("sflow_collector", "SFLOW_COLLECTOR", ""),
+    # The syslog receiver the devices send to (Vector, see syslog/). Only
+    # the fast-path self-test talks to it - it sends one syslog line there
+    # and times its way back through Vector into /api/ingest/syslog.
+    # host:port, e.g. "192.168.0.144:514".
+    ("syslog_receiver", "SYSLOG_RECEIVER", ""),
 )
 
 

@@ -3,80 +3,70 @@ the fix for a real bug reported live: a resolved alarm kept showing "paging
 now..." in the UI because closing an occurrence never cleared its stale,
 already-past page_at.
 
-Uses a minimal in-memory fake of the Database interface, same approach as
-test_alert_rules.py - OccurrenceStore's SQL is simple enough that faking
-the three-method Database contract is more honest than mocking the store.
+Against a real Postgres in a throwaway schema (as test_occurrence_events.py
+and test_occurrence_close_grace.py are): the store's transitions are now
+exactly-once *in SQL* - INSERT ... RETURNING under the partial unique
+index, UPDATE ... FROM ... FOR UPDATE, UPDATE ... WHERE resolved_at IS NULL -
+and a string-matching fake of the Database would only pin the fake.
 """
+import os
 import sys
+import uuid
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 
-from occurrences import OccurrenceStore
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+psycopg2 = pytest.importorskip("psycopg2")
+import psycopg2.extras  # noqa: E402
+
+from occurrences import OccurrenceStore  # noqa: E402
+
+DSN = os.environ.get("TEST_DATABASE_URL", "postgresql://claude:claude@192.168.0.146:5432/switchboard")
+DDL = """
+CREATE TABLE alert_occurrences (
+    id BIGSERIAL PRIMARY KEY, signature TEXT NOT NULL, alertname TEXT NOT NULL, severity TEXT, summary TEXT,
+    labels TEXT NOT NULL, started_at TEXT NOT NULL, resolved_at TEXT, page_at TEXT, paged_at TEXT,
+    paging_disabled INTEGER NOT NULL DEFAULT 0, silence_id TEXT, last_seen_at TEXT,
+    detected_via TEXT, signal_at TEXT);
+CREATE UNIQUE INDEX idx_occurrences_one_open ON alert_occurrences(signature) WHERE resolved_at IS NULL;
+"""
 
 
-class _FakeDB:
-    def __init__(self):
-        self.rows = {}
-        self._next_id = 1
+class _DB:
+    def __init__(self, conn):
+        self.conn = conn
 
-    def query_one(self, sql, params=()):
-        if "SELECT * FROM alert_occurrences WHERE signature = %s AND resolved_at IS NULL" in sql:
-            for r in self.rows.values():
-                if r["signature"] == params[0] and r["resolved_at"] is None:
-                    return dict(r)
-            return None
-        if "SELECT * FROM alert_occurrences WHERE id = %s" in sql:
-            r = self.rows.get(params[0])
-            return dict(r) if r else None
-        raise AssertionError(f"unexpected query_one: {sql}")
-
-    def query(self, sql, params=()):
-        if "WHERE resolved_at IS NOT NULL AND page_at IS NOT NULL" in sql:
-            return [dict(r) for r in self.rows.values() if r["resolved_at"] and r["page_at"]]
-        raise AssertionError(f"unexpected query: {sql}")
+    def _cur(self):
+        return self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     def execute(self, sql, params=()):
-        if sql.startswith("INSERT INTO alert_occurrences"):
-            signature, alertname, severity, summary, labels, started_at = params
-            row_id = self._next_id
-            self._next_id += 1
-            self.rows[row_id] = {
-                "id": row_id, "signature": signature, "alertname": alertname,
-                "severity": severity, "summary": summary, "labels": labels,
-                "started_at": started_at, "resolved_at": None,
-                "page_at": None, "paged_at": None, "paging_disabled": 0, "silence_id": None,
-            }
-            return _Result(1)
-        if sql.startswith("UPDATE alert_occurrences SET resolved_at = %s, page_at = NULL, paged_at = %s"):
-            resolved_at, paged_at, row_id = params
-            self.rows[row_id].update(resolved_at=resolved_at, page_at=None, paged_at=paged_at)
-            return _Result(1)
-        if sql.startswith("UPDATE alert_occurrences SET page_at = %s, silence_id = %s"):
-            page_at, silence_id, row_id = params
-            self.rows[row_id].update(page_at=page_at, silence_id=silence_id)
-            return _Result(1)
-        if sql.startswith("UPDATE alert_occurrences SET paged_at = %s, page_at = NULL, silence_id = NULL"):
-            paged_at, row_id = params
-            self.rows[row_id].update(paged_at=paged_at, page_at=None, silence_id=None)
-            return _Result(1)
-        if sql.startswith("UPDATE alert_occurrences SET page_at = NULL, paged_at = %s WHERE id"):
-            paged_at, row_id = params
-            self.rows[row_id].update(page_at=None, paged_at=paged_at)
-            return _Result(1)
-        raise AssertionError(f"unexpected execute: {sql}")
+        cur = self._cur(); cur.execute(sql, params); return cur
 
+    def query(self, sql, params=()):
+        cur = self._cur(); cur.execute(sql, params); return cur.fetchall()
 
-class _Result:
-    def __init__(self, rowcount):
-        self.rowcount = rowcount
+    def query_one(self, sql, params=()):
+        cur = self._cur(); cur.execute(sql, params); return cur.fetchone()
 
 
 @pytest.fixture
 def store():
-    return OccurrenceStore(_FakeDB())
+    try:
+        conn = psycopg2.connect(DSN, connect_timeout=4)
+    except Exception:
+        pytest.skip("test Postgres not reachable")
+    conn.autocommit = True
+    schema = f"test_occ_{uuid.uuid4().hex[:12]}"
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA "{schema}"'); cur.execute(f'SET search_path TO "{schema}"'); cur.execute(DDL)
+    try:
+        yield OccurrenceStore(_DB(conn))
+    finally:
+        with conn.cursor() as cur:
+            cur.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        conn.close()
 
 
 def _open(store, signature="sig1", started_at="2026-08-01T10:00:00+00:00"):
@@ -141,8 +131,8 @@ def _make_broken_row(store, page_at, resolved_at, paging_disabled=0):
     rather than going through close(), since close() no longer produces
     this broken shape - that's the whole point of the fix."""
     occurrence = _open(store, signature=f"broken-{page_at}")
-    row = store.db.rows[occurrence["id"]]
-    row.update(page_at=page_at, resolved_at=resolved_at, paging_disabled=paging_disabled)
+    store.db.execute("UPDATE alert_occurrences SET page_at = %s, resolved_at = %s, paging_disabled = %s WHERE id = %s",
+                     (page_at, resolved_at, paging_disabled, occurrence["id"]))
     return occurrence["id"]
 
 

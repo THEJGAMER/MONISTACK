@@ -125,7 +125,6 @@ class HardwareAlertChecker:
         single cheap Loki query on a tight loop (see app.py's wiring)
         rather than waiting on the SSH poll cycle. reconcile_via_poll is
         the fallback for whatever this misses."""
-        host_to_device_id = {d.host: d.id for d in devices_by_id.values()}
         try:
             events = loki_client.query_range(
                 filters=['facility=~"CHMGR|ENVMON|RPM|OSTATE"'], limit=100, since_seconds=lookback_seconds
@@ -136,7 +135,16 @@ class HardwareAlertChecker:
             # Distinct from "queried fine, nothing new" - that is a
             # healthy poll and must not slow the cadence.
             return False
+        self.process_events(events, devices_by_id, alertmanager, device_name_for)
+        return True
 
+    def process_events(self, events, devices_by_id, alertmanager, device_name_for):
+        """The evaluation behind check_via_syslog, shared with the fast
+        path (see interface_alerting.process_events for the shape and the
+        cursor-based dedup). Events from any facility are accepted; the
+        alarm text decides. Returns the number acted on."""
+        host_to_device_id = {d.host: d.id for d in devices_by_id.values()}
+        acted = 0
         newest_seen = self._last_syslog_ts_ns
         for event in events:
             ts_ns = int(event.get("_timestamp_ns", 0))
@@ -161,11 +169,13 @@ class HardwareAlertChecker:
             if classified["alarm_active"]:
                 self._fire(key, classified["alarm_severity"], alertmanager, device_name_for)
                 self._last_posted[key] = now
+                acted += 1
             elif key in self._alerting:
                 self._resolve(key, alertmanager, device_name_for)
                 self._last_posted.pop(key, None)
+                acted += 1
         self._last_syslog_ts_ns = newest_seen
-        return True
+        return acted
 
     def reconcile_via_poll(self, device_ids, get_env_and_polled_at, device_name_for, alertmanager):
         """Poll-fallback safety net, run on a tight loop (see app.py) -

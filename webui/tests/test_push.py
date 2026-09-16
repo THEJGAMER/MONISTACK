@@ -37,11 +37,12 @@ def test_vapid_keys_are_generated_once_and_reloaded(tmp_path):
 
 def _env(event, **occ):
     return {"event": event, "occurrence": {"id": 7, "alertname": "FanFailure", "severity": "critical",
-                                            "summary": "Fan tray 2 down", "device": "s4048", **occ}}
+                                            "summary": "Fan tray 2 down", "device": "s4048",
+                                            "paged_at": "2026-09-15T10:00:00+00:00", **occ}}
 
 
-def test_an_opened_alarm_pages_with_an_acknowledge_action():
-    p = push.payload_for("alarm.opened", _env("alarm.opened"))
+def test_a_paged_alarm_pages_with_an_acknowledge_action():
+    p = push.payload_for("alarm.paged", _env("alarm.paged"))
 
     assert p["title"].startswith("CRITICAL: FanFailure")
     assert "s4048" in p["title"]
@@ -63,6 +64,13 @@ def test_other_events_are_not_pages():
     assert push.payload_for("alarm.commented", _env("alarm.commented")) is None
 
 
+def test_an_opened_occurrence_is_not_yet_a_page():
+    """Opened means pending, or firing but held. The phone goes off on
+    alarm.paged - when the hold lapses - not before, or the paging hold
+    would delay Alertmanager's receivers only."""
+    assert push.payload_for("alarm.opened", _env("alarm.opened")) is None
+
+
 # --- store + notifier against a real Postgres --------------------------
 
 psycopg2 = pytest.importorskip("psycopg2")
@@ -74,7 +82,12 @@ CREATE TABLE push_subscriptions (
     endpoint TEXT PRIMARY KEY, subscription TEXT NOT NULL, username TEXT NOT NULL, label TEXT,
     min_severity TEXT NOT NULL DEFAULT 'warning', notify_resolved INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_used_at TIMESTAMPTZ,
-    failures INTEGER NOT NULL DEFAULT 0, last_error TEXT);
+    failures INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+    repeat_minutes INTEGER NOT NULL DEFAULT 5, max_repeats INTEGER NOT NULL DEFAULT 12);
+CREATE TABLE push_pages (
+    occurrence_id BIGINT NOT NULL, endpoint TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 1,
+    first_paged_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_paged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (occurrence_id, endpoint));
 """
 
 
@@ -153,8 +166,8 @@ def test_severity_floor_and_resolve_flag_decide_who_is_paged(store):
     sent = []
     n = push.PushNotifier(store, _Keys(), send_fn=lambda sub, payload: (sent.append((sub["endpoint"], payload["title"])), (True, None, False))[1])
 
-    n("alarm.opened", _env("alarm.opened", severity="warning"))
-    n("alarm.opened", _env("alarm.opened", severity="critical"))
+    n("alarm.paged", _env("alarm.paged", severity="warning"))
+    n("alarm.paged", _env("alarm.paged", severity="critical"))
     n("alarm.resolved", _env("alarm.resolved"))
 
     endpoints = [e for e, _ in sent]
@@ -166,7 +179,7 @@ def test_a_subscription_the_service_says_is_gone_is_pruned(store):
     store.upsert(_sub("https://push/dead"), "a", min_severity="info")
     n = push.PushNotifier(store, _Keys(), send_fn=lambda sub, payload: (False, "410 Gone", True))
 
-    n("alarm.opened", _env("alarm.opened"))
+    n("alarm.paged", _env("alarm.paged"))
 
     assert store.list() == []
 
@@ -175,8 +188,8 @@ def test_other_failures_are_counted_not_pruned(store):
     store.upsert(_sub("https://push/flaky"), "a", min_severity="info")
     n = push.PushNotifier(store, _Keys(), send_fn=lambda sub, payload: (False, "timeout", False))
 
-    n("alarm.opened", _env("alarm.opened"))
-    n("alarm.opened", _env("alarm.opened"))
+    n("alarm.paged", _env("alarm.paged"))
+    n("alarm.paged", _env("alarm.paged"))
 
     row = store.list()[0]
     assert row["failures"] == 2 and row["last_error"] == "timeout"
@@ -188,7 +201,20 @@ def test_nothing_is_sent_when_keys_are_unavailable(store):
     sent = []
     n = push.PushNotifier(store, keys, send_fn=lambda *a: (sent.append(1), (True, None, False))[1])
 
-    n("alarm.opened", _env("alarm.opened"))
+    n("alarm.paged", _env("alarm.paged"))
+
+    assert sent == []
+
+
+def test_a_resolve_for_an_alarm_that_never_paged_is_silent(store):
+    """A pending-only occurrence that cleared, or one that recovered inside
+    its hold, paged nobody - so "Resolved" would be the first anyone heard
+    of it. Confirmed live: 51969 resolved without ever paging."""
+    store.upsert(_sub("https://push/all"), "b", min_severity="info", notify_resolved=True)
+    sent = []
+    n = push.PushNotifier(store, _Keys(), send_fn=lambda sub, payload: (sent.append(payload["title"]), (True, None, False))[1])
+
+    n("alarm.resolved", _env("alarm.resolved", paged_at=None))
 
     assert sent == []
 

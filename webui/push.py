@@ -135,22 +135,74 @@ class PushSubscriptionStore:
     def __init__(self, db):
         self.db = db
 
-    def upsert(self, subscription, username, label=None, min_severity="warning", notify_resolved=True):
+    @staticmethod
+    def _check_prefs(min_severity, repeat_minutes, max_repeats):
+        if min_severity not in SEVERITY_RANK:
+            raise ValueError(f"unknown severity {min_severity!r}")
+        repeat_minutes, max_repeats = int(repeat_minutes), int(max_repeats)
+        if not 0 <= repeat_minutes <= 120:
+            raise ValueError("repeat_minutes must be 0 (off) to 120")
+        if not 1 <= max_repeats <= 100:
+            raise ValueError("max_repeats must be 1 to 100")
+        return repeat_minutes, max_repeats
+
+    def upsert(self, subscription, username, label=None, min_severity="warning", notify_resolved=True,
+               repeat_minutes=5, max_repeats=12):
         endpoint = (subscription or {}).get("endpoint")
         if not endpoint or not (subscription.get("keys") or {}).get("p256dh"):
             raise ValueError("not a push subscription")
-        if min_severity not in SEVERITY_RANK:
-            raise ValueError(f"unknown severity {min_severity!r}")
+        repeat_minutes, max_repeats = self._check_prefs(min_severity, repeat_minutes, max_repeats)
         row = self.db.query_one(
-            """INSERT INTO push_subscriptions (endpoint, subscription, username, label, min_severity, notify_resolved)
-               VALUES (%s, %s, %s, %s, %s, %s)
+            """INSERT INTO push_subscriptions
+                 (endpoint, subscription, username, label, min_severity, notify_resolved, repeat_minutes, max_repeats)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (endpoint) DO UPDATE SET subscription = EXCLUDED.subscription,
                  username = EXCLUDED.username, label = EXCLUDED.label, min_severity = EXCLUDED.min_severity,
-                 notify_resolved = EXCLUDED.notify_resolved, failures = 0, last_error = NULL
+                 notify_resolved = EXCLUDED.notify_resolved, repeat_minutes = EXCLUDED.repeat_minutes,
+                 max_repeats = EXCLUDED.max_repeats, failures = 0, last_error = NULL
                RETURNING *""",
-            (endpoint, json.dumps(subscription), username, (label or "")[:120], min_severity, 1 if notify_resolved else 0),
+            (endpoint, json.dumps(subscription), username, (label or "")[:120], min_severity,
+             1 if notify_resolved else 0, repeat_minutes, max_repeats),
         )
         return self._public(row)
+
+    def update_prefs(self, endpoint, min_severity, notify_resolved, repeat_minutes, max_repeats):
+        """Change how a device is paged without re-subscribing it."""
+        repeat_minutes, max_repeats = self._check_prefs(min_severity, repeat_minutes, max_repeats)
+        row = self.db.query_one(
+            """UPDATE push_subscriptions SET min_severity = %s, notify_resolved = %s, repeat_minutes = %s,
+                      max_repeats = %s WHERE endpoint = %s RETURNING *""",
+            (min_severity, 1 if notify_resolved else 0, repeat_minutes, max_repeats, endpoint),
+        )
+        return self._public(row) if row else None
+
+    # --- pages: who has been paged for what, and how often ----------------
+
+    def pages_for(self, occurrence_id):
+        rows = self.db.query("SELECT * FROM push_pages WHERE occurrence_id = %s", (int(occurrence_id),))
+        return {r["endpoint"]: dict(r) for r in rows}
+
+    def record_page(self, occurrence_id, endpoint):
+        self.db.execute(
+            """INSERT INTO push_pages (occurrence_id, endpoint) VALUES (%s, %s)
+               ON CONFLICT (occurrence_id, endpoint) DO UPDATE SET count = push_pages.count + 1, last_paged_at = now()""",
+            (int(occurrence_id), endpoint),
+        )
+
+    def clear_pages(self, occurrence_id):
+        self.db.execute("DELETE FROM push_pages WHERE occurrence_id = %s", (int(occurrence_id),))
+
+    def prune_pages(self, open_ids):
+        """Drop ledger rows for occurrences that are no longer open. The
+        resolve event clears them as it happens; this catches whatever a
+        restart, a lost event or a new close path left behind, so nothing
+        is ever paged again for an alarm that is over."""
+        ids = [int(i) for i in open_ids]
+        if ids:
+            cur = self.db.execute("DELETE FROM push_pages WHERE NOT (occurrence_id = ANY(%s))", (ids,))
+        else:
+            cur = self.db.execute("DELETE FROM push_pages")
+        return getattr(cur, "rowcount", 0)
 
     def remove(self, endpoint):
         cur = self.db.execute("DELETE FROM push_subscriptions WHERE endpoint = %s", (endpoint,))
@@ -178,6 +230,8 @@ class PushSubscriptionStore:
         d = dict(row)
         d.pop("subscription", None)      # the keys never leave the server
         d["notify_resolved"] = bool(d.get("notify_resolved", 1))
+        d.setdefault("repeat_minutes", 5)
+        d.setdefault("max_repeats", 12)
         return d
 
 
@@ -190,16 +244,44 @@ def payload_for(event, envelope):
     occ_id = occ.get("id") or envelope.get("occurrence_id")
     url = f"/#/alarms/{occ_id}" if occ_id else "/#/alarms"
     tag = f"switchboard-alarm-{occ_id or name}"
-    if event == "alarm.opened":
+    if event == "alarm.paged":
+        # alarm.opened is deliberately *not* a page: an occurrence opens
+        # while the alarm is still pending or inside its paging hold, and
+        # phones must not go off for something that may clear before it
+        # ever fires. alarm.paged is the moment the hold lapses (or there
+        # was none) - the same moment Alertmanager's own receivers hear.
         return {"title": f"{sev.upper()}: {name}" + (f" on {device}" if device else ""),
                 "body": occ.get("summary") or envelope.get("summary") or "",
                 "severity": sev, "tag": tag, "url": url, "occurrence_id": occ_id,
                 "actions": [{"action": "ack", "title": "Acknowledge"}, {"action": "open", "title": "Open"}]}
+    if event == "alarm.acknowledged":
+        # Not a page: this closes the outstanding page on every other
+        # device, the way one person picking up stops the whole team's
+        # pagers. `close: true` makes the service worker dismiss the
+        # notification with this tag; the short replacement is not sticky.
+        by = envelope.get("by") or "someone"
+        return {"title": f"Acknowledged by {by}: {name}", "body": envelope.get("note") or "",
+                "severity": "ok", "tag": tag, "url": url, "occurrence_id": occ_id, "close": True,
+                "actions": [{"action": "open", "title": "Open"}]}
     if event == "alarm.resolved":
         return {"title": f"Resolved: {name}" + (f" on {device}" if device else ""),
                 "body": occ.get("summary") or "", "severity": "ok", "tag": tag, "url": url,
                 "occurrence_id": occ_id, "actions": [{"action": "open", "title": "Open"}]}
     return None
+
+
+def repeat_payload(occ, count, unacked_seconds):
+    """The n-th page for a still-unacknowledged alarm. Same tag, so it
+    replaces the previous notification and re-alerts (renotify) rather
+    than piling up; the body says how long it has gone unanswered."""
+    base = payload_for("alarm.paged", {"occurrence": occ})
+    if base is None:
+        return None
+    mins = max(1, int(unacked_seconds // 60))
+    base["title"] = f"[page {count}] " + base["title"]
+    base["body"] = f"Unacknowledged for {mins} min. " + (base["body"] or "")
+    base["repeat"] = count
+    return base
 
 
 class PushNotifier:
@@ -225,11 +307,40 @@ class PushNotifier:
         except Exception as e:
             return False, str(e), False
 
+    def _deliver(self, row, payload):
+        ok, error, gone = self._send(json.loads(row["subscription"]), payload)
+        if ok:
+            self.store._ok(row["endpoint"])
+            self.sent += 1
+        elif gone:
+            self.store.remove(row["endpoint"])
+            log.info("pruned push subscription that the service reports gone: %s", row["endpoint"][:60])
+        else:
+            self.store._failed(row["endpoint"], error)
+            log.warning("push send failed for %s: %s", row["endpoint"][:60], error)
+        return ok
+
     def __call__(self, event, envelope):
         if not self.keys.available:
             return
         payload = payload_for(event, envelope)
         if payload is None:
+            return
+        occ_id = payload.get("occurrence_id")
+        if event == "alarm.acknowledged":
+            # Only devices that were actually paged for it need the close.
+            paged = self.store.pages_for(occ_id) if occ_id else {}
+            for row in self.store._all_raw():
+                if row["endpoint"] in paged:
+                    self._deliver(row, payload)
+            if occ_id:
+                self.store.clear_pages(occ_id)
+            return
+        if event == "alarm.resolved" and occ_id:
+            self.store.clear_pages(occ_id)
+        if event == "alarm.resolved" and not (envelope.get("occurrence") or {}).get("paged_at"):
+            # It never went to the pager (cleared while pending, or inside
+            # its hold), so nobody was paged and "Resolved" would be noise.
             return
         for row in self.store._all_raw():
             if event == "alarm.resolved":
@@ -237,16 +348,56 @@ class PushNotifier:
                     continue
             elif _rank(payload.get("severity")) < _rank(row.get("min_severity")):
                 continue
-            ok, error, gone = self._send(json.loads(row["subscription"]), payload)
-            if ok:
-                self.store._ok(row["endpoint"])
-                self.sent += 1
-            elif gone:
-                self.store.remove(row["endpoint"])
-                log.info("pruned push subscription that the service reports gone: %s", row["endpoint"][:60])
-            else:
-                self.store._failed(row["endpoint"], error)
-                log.warning("push send failed for %s: %s", row["endpoint"][:60], error)
+            if self._deliver(row, payload) and event == "alarm.paged" and occ_id:
+                self.store.record_page(occ_id, row["endpoint"])
+
+    def repeat_due(self, open_unacked, now=None):
+        """Re-page every device whose repeat interval has elapsed for an
+        alarm that is still open and unacknowledged, and page any device
+        that has not been paged for it at all (subscribed after it opened).
+
+        `open_unacked` is a list of occurrence dicts (id, alertname,
+        severity, summary, device, started_at). Returns the number sent.
+        The cap is per device per alarm; a forgotten alarm stops paging
+        after max_repeats rather than forever, and shows as such in the
+        device list."""
+        if not self.keys.available or not open_unacked:
+            return 0
+        now = now or datetime.now(timezone.utc)
+        subs = self.store._all_raw()
+        sent = 0
+        for occ in open_unacked:
+            occ_id = occ.get("id")
+            if not occ_id:
+                continue
+            pages = self.store.pages_for(occ_id)
+            started = occ.get("started_at")
+            try:
+                started_dt = datetime.fromisoformat(str(started).replace("Z", "+00:00")) if started else now
+                if started_dt.tzinfo is None:
+                    started_dt = started_dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                started_dt = now
+            for row in subs:
+                if _rank(occ.get("severity")) < _rank(row.get("min_severity")):
+                    continue
+                page = pages.get(row["endpoint"])
+                repeat_minutes = int(row.get("repeat_minutes") or 0)
+                if page is None:
+                    payload = payload_for("alarm.paged", {"occurrence": occ})
+                elif repeat_minutes <= 0 or page["count"] >= int(row.get("max_repeats") or 0):
+                    continue
+                else:
+                    last = page["last_paged_at"]
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    if (now - last).total_seconds() < repeat_minutes * 60:
+                        continue
+                    payload = repeat_payload(occ, page["count"] + 1, (now - started_dt).total_seconds())
+                if payload and self._deliver(row, payload):
+                    self.store.record_page(occ_id, row["endpoint"])
+                    sent += 1
+        return sent
 
     def test(self, endpoint):
         row = self.store.db.query_one("SELECT * FROM push_subscriptions WHERE endpoint = %s", (endpoint,))

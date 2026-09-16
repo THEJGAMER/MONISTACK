@@ -123,6 +123,32 @@ function PageCountdown({ pageAt }) {
   );
 }
 
+const DETECTED_VIA = {
+  syslog: "syslog fast path",
+  loki: "syslog (Loki poll)",
+  poll: "SSH poll",
+};
+
+function DetectionCell({ alarm }) {
+  // How the alarm was noticed, and - for the fast path - how long after
+  // the device logged it. The device clock is second-granular and may be
+  // skewed, so the delta is only shown when it is plausible.
+  const via = alarm.detected_via;
+  if (!via) return <Box color="text-body-secondary">Alertmanager</Box>;
+  const label = DETECTED_VIA[via] || `resolved by ${via}`;
+  let delta = null;
+  if (via === "syslog" && alarm.signal_at && alarm.started_at) {
+    const ms = new Date(alarm.started_at) - new Date(alarm.signal_at);
+    if (ms >= 0 && ms < 60000) delta = ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
+  }
+  return (
+    <SpaceBetween direction="horizontal" size="xs">
+      <StatusIndicator type={via === "syslog" ? "success" : "info"}>{label}</StatusIndicator>
+      {delta && <Box color="text-body-secondary">{delta} after the device logged it</Box>}
+    </SpaceBetween>
+  );
+}
+
 function PagingStatus({ alarm }) {
   if (alarm.paging_disabled) return <StatusIndicator type="stopped">paging off (NARG)</StatusIndicator>;
   if (alarm.paged_at) {
@@ -505,6 +531,7 @@ function AlarmDetail({ alarmId, pushFlash, onNavigate }) {
               { label: "Owner", value: <AckCell ack={alarm.ack} /> },
               { label: "Paging", value: <PagingStatus alarm={alarm} /> },
               { label: "Lasted", value: duration(alarm.started_at, alarm.resolved_at) },
+              { label: "Detected", value: <DetectionCell alarm={alarm} /> },
               { label: "Started", value: alarm.started_at ? new Date(alarm.started_at).toLocaleString() : "-" },
               {
                 label: "Resolved",

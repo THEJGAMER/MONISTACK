@@ -20,6 +20,7 @@ import {
   getSettings, updateSettings, getSettingsHealth,
   listApiTokens, createApiToken, revokeApiToken,
   listEvents, listWebhooks, createWebhook, updateWebhook, deleteWebhook, testWebhook,
+  listPushSubscriptions, unsubscribePush,
 } from "./api.js";
 import { useHasRole } from "./AuthContext.jsx";
 
@@ -56,6 +57,13 @@ const SERVICE_FIELDS = [
     description:
       "Where sfacctd runs, as host:port. The webui never connects to it - flows arrive via Postgres - so this is not a connection string. It is the address the health check names when sFlow goes quiet, so \"no flows\" comes with somewhere to look.",
     placeholder: "192.168.0.155:6343",
+  },
+  {
+    key: "syslog_receiver",
+    label: "Syslog receiver",
+    description:
+      "Where the devices send syslog (Vector), as host:port. Only the fast-path self-test on the Alerts page uses it: it sends one line there and times it back through Vector into Switchboard.",
+    placeholder: "192.168.0.144:514",
   },
   {
     key: "exporter_url",
@@ -349,6 +357,55 @@ function WebhooksSection({ pushFlash }) {
   );
 }
 
+// --- Enrolled pager devices (every user) --------------------------------
+// Admins see and can remove any device: a phone that changed hands, or a
+// laptop that keeps failing, should not keep being paged for the team.
+function PagingDevicesSection({ pushFlash }) {
+  const [rows, setRows] = useState([]);
+  const load = useCallback(async () => {
+    try {
+      const r = await listPushSubscriptions();
+      setRows(r);
+    } catch (e) {
+      pushFlash("error", `Could not load enrolled devices: ${e.message}`);
+    }
+  }, [pushFlash]);
+  useEffect(() => {
+    load();
+  }, [load]);
+  async function remove(r) {
+    try {
+      await unsubscribePush(r.endpoint);
+      await load();
+      pushFlash("info", `Removed ${r.username}'s device.`);
+    } catch (e) {
+      pushFlash("error", e.message);
+    }
+  }
+  return (
+    <Container header={<Header variant="h2" counter={`(${rows.length})`} description="Every browser enrolled for paging, across all accounts.">Pager devices</Header>}>
+      <Table
+        variant="embedded"
+        items={rows}
+        empty={<Box color="text-status-inactive">No devices enrolled.</Box>}
+        columnDefinitions={[
+          { id: "user", header: "Account", cell: (r) => r.username },
+          { id: "label", header: "Device", cell: (r) => (r.label || "unknown browser").slice(0, 50) },
+          { id: "sev", header: "Pages on", cell: (r) => r.min_severity },
+          { id: "rep", header: "Repeats", cell: (r) => (r.repeat_minutes ? `every ${r.repeat_minutes} min, up to ${r.max_repeats}` : "once") },
+          { id: "used", header: "Last paged", cell: (r) => (r.last_used_at ? new Date(r.last_used_at).toLocaleString() : "never") },
+          {
+            id: "health",
+            header: "Health",
+            cell: (r) => (r.failures ? <StatusIndicator type="warning">{r.failures} failed</StatusIndicator> : <StatusIndicator type="success">ok</StatusIndicator>),
+          },
+          { id: "rm", header: "", cell: (r) => <Button variant="inline-link" onClick={() => remove(r)}>Remove</Button> },
+        ]}
+      />
+    </Container>
+  );
+}
+
 export default function SettingsPage({ pushFlash }) {
   const isAdmin = useHasRole("admin");
   // Saving is admin-tier server-side (require_admin_no_db on the PUT route
@@ -578,6 +635,7 @@ export default function SettingsPage({ pushFlash }) {
       </form>
       {isAdmin ? <ApiTokensSection pushFlash={pushFlash} /> : null}
       {isAdmin ? <WebhooksSection pushFlash={pushFlash} /> : null}
+  {isAdmin ? <PagingDevicesSection pushFlash={pushFlash} /> : null}
     </SpaceBetween>
   );
 }

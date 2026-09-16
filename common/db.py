@@ -218,6 +218,31 @@ ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS page_at TEXT;
 ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS paged_at TEXT;
 ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS paging_disabled INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS silence_id TEXT;
+-- How the alarm was detected (syslog fast path, loki poll, ssh poll, a
+-- person; NULL = learned from Alertmanager) and when the device logged
+-- the signal that raised it - the numbers behind "paged 0.4s after".
+ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS detected_via TEXT;
+ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS signal_at TEXT;
+
+-- Syslog rules: alarms raised straight from what a device logs (see
+-- webui/syslog_alerting.py). `key` marks the shipped defaults so the
+-- self-test rule can be put back if deleted; `builtin` rows cannot be.
+CREATE TABLE IF NOT EXISTS syslog_alert_rules (
+    id BIGSERIAL PRIMARY KEY,
+    key TEXT UNIQUE,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    severity TEXT NOT NULL DEFAULT 'warning',
+    facility TEXT NOT NULL DEFAULT '',
+    mnemonic TEXT NOT NULL DEFAULT '',
+    pattern TEXT NOT NULL DEFAULT '',
+    clear_pattern TEXT NOT NULL DEFAULT '',
+    per_interface INTEGER NOT NULL DEFAULT 0,
+    auto_resolve_seconds INTEGER NOT NULL DEFAULT 0,
+    builtin INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- Acknowledgement of a single occurrence (not of the alarm in general):
 -- acknowledging today's flap says nothing about tomorrow's, which is the
@@ -507,6 +532,22 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     last_used_at TIMESTAMPTZ,
     failures INTEGER NOT NULL DEFAULT 0,
     last_error TEXT
+);
+-- Pager behaviour per device: re-page every `repeat_minutes` while the
+-- alarm is open and unacknowledged (0 = once only), up to `max_repeats`.
+ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS repeat_minutes INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS max_repeats INTEGER NOT NULL DEFAULT 12;
+
+-- Which device has been paged how many times for which alarm. This is what
+-- lets a repeat know it is a repeat, an ack close the page on every other
+-- device, and a cap stop a forgotten alarm paging forever.
+CREATE TABLE IF NOT EXISTS push_pages (
+    occurrence_id BIGINT NOT NULL,
+    endpoint TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 1,
+    first_paged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_paged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (occurrence_id, endpoint)
 );
 
 -- sFlow reports interfaces as SNMP ifIndex integers, which mean nothing to

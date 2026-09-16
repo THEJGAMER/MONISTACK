@@ -4,13 +4,19 @@
  * covers the whole app - a worker served under /static/ could only
  * control /static/, and then no push would ever reach it.
  *
- * Adapted from PROXMON's sw.js, then extended for paging: an Acknowledge
- * action on the notification itself, which POSTs the ack using the
- * browser's own session cookie - so a page can be acknowledged from the
- * lock screen without opening the app - and a per-alarm tag so a re-fire
- * replaces its notification rather than stacking a new one.
+ * Pager semantics, not notification semantics:
+ * - a critical page stays on screen until dealt with, and re-alerts
+ *   (sound/vibration) on every repeat because repeats reuse the alarm's
+ *   tag with renotify - one notification per alarm, updated, never a pile;
+ * - the Acknowledge action acks from the lock screen using the browser's
+ *   own session cookie, without opening the app;
+ * - an "Acknowledged by X" push carries close:true: it dismisses the page
+ *   on this device the moment anyone else picks it up, the way one person
+ *   answering stops the whole team's pagers;
+ * - every push is also posted to any open tab so the page can play the
+ *   in-app pager tone (a worker cannot play audio itself).
  */
-const CACHE = "switchboard-shell-v1";
+const CACHE = "switchboard-shell-v2";
 
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (e) =>
@@ -42,6 +48,18 @@ self.addEventListener("fetch", (e) => {
   }
 });
 
+const VIBRATE = {
+  critical: [300, 100, 300, 100, 300, 100, 300],
+  warning: [200, 100, 200],
+  info: [120],
+  ok: [60],
+};
+
+async function tellOpenTabs(payload) {
+  const list = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  for (const c of list) c.postMessage({ type: "switchboard-page", payload });
+}
+
 self.addEventListener("push", (e) => {
   let data = {};
   try {
@@ -49,22 +67,48 @@ self.addEventListener("push", (e) => {
   } catch {
     data = { title: "Switchboard", body: e.data && e.data.text() };
   }
-  const critical = data.severity === "critical";
+  const severity = data.severity || "warning";
+  const critical = severity === "critical";
+  const tag = data.tag || "switchboard";
+
   e.waitUntil(
-    self.registration.showNotification(data.title || "Switchboard", {
-      body: data.body || "",
-      tag: data.tag || "switchboard",
-      renotify: true,
-      icon: "/icons/icon-192.png",
-      badge: "/icons/badge-96.png",
-      timestamp: data.ts || Date.now(),
-      // A critical page stays on screen until someone deals with it; a
-      // resolve or an info-level note can go away on its own.
-      requireInteraction: critical,
-      vibrate: critical ? [200, 100, 200, 100, 200] : [100],
-      actions: data.actions || [],
-      data: { url: data.url || "/", occurrence_id: data.occurrence_id || null },
-    })
+    (async () => {
+      if (data.close) {
+        // Someone acknowledged it: take the page down here, then a short
+        // non-sticky note saying who, so the phone stops but the person
+        // holding it still knows what happened.
+        const open = await self.registration.getNotifications({ tag });
+        for (const n of open) n.close();
+        await self.registration.showNotification(data.title || "Acknowledged", {
+          body: data.body || "",
+          tag,
+          renotify: false,
+          silent: true,
+          icon: "/icons/icon-192.png",
+          badge: "/icons/badge-96.png",
+          requireInteraction: false,
+          data: { url: data.url || "/", occurrence_id: data.occurrence_id || null, close: true },
+        });
+        await tellOpenTabs(data);
+        return;
+      }
+      await self.registration.showNotification(data.title || "Switchboard", {
+        body: data.body || "",
+        tag,
+        // renotify: a repeat with the same tag replaces the old
+        // notification *and* alerts again. Without it a repeat is silent.
+        renotify: true,
+        silent: false,
+        icon: "/icons/icon-192.png",
+        badge: "/icons/badge-96.png",
+        timestamp: data.ts || Date.now(),
+        requireInteraction: critical,
+        vibrate: VIBRATE[severity] || VIBRATE.warning,
+        actions: data.actions || [],
+        data: { url: data.url || "/", occurrence_id: data.occurrence_id || null, severity, repeat: data.repeat || 0 },
+      });
+      await tellOpenTabs(data);
+    })()
   );
 });
 
@@ -75,7 +119,7 @@ async function focusOrOpen(url) {
       try {
         await c.navigate(url);
       } catch {
-        /* cross-origin or navigation refused: fall through to focus */
+        /* navigation refused: fall through to focus */
       }
       return c.focus();
     }
@@ -102,6 +146,7 @@ self.addEventListener("notificationclick", (e) => {
             return self.registration.showNotification("Acknowledged", {
               body: e.notification.title,
               tag: e.notification.tag,
+              silent: true,
               icon: "/icons/icon-192.png",
               badge: "/icons/badge-96.png",
             });

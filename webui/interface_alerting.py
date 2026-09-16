@@ -266,18 +266,30 @@ class InterfaceAlertChecker:
         `_last_syslog_ts_ns` is a monotonically-advancing cursor so the
         same already-processed event (log lines don't disappear from the
         query window between ticks) never fires twice."""
-        immediate_by_key = {
-            (c["device_id"], c["port"]): c for c in configs if c["enabled"] and c["mode"] == "immediate"
-        }
-        if not immediate_by_key:
+        if not any(c["enabled"] and c["mode"] == "immediate" for c in configs):
             return True   # nothing to ask, so nothing failed
-        host_to_device_id = {d.host: d.id for d in devices_by_id.values()}
         try:
             events = loki_client.query_range(filters=['link_event="true"'], limit=100, since_seconds=lookback_seconds)
         except Exception:
             log.warning("syslog-based interface check skipped: Loki unreachable", exc_info=True)
             return False  # lets the poll loop back off; see app.PollBackoff
+        self.process_events(events, configs, devices_by_id, alertmanager, device_name_for)
+        return True
 
+    def process_events(self, events, configs, devices_by_id, alertmanager, device_name_for):
+        """The evaluation behind check_via_syslog, separated so the fast
+        path (events POSTed by Vector the instant they arrive - see
+        fastpath.py) and the Loki poll behind it run the same code. The
+        `_last_syslog_ts_ns` cursor dedups the two: whichever delivers an
+        event first wins, the other sees it as already processed. Returns
+        the number of events acted on."""
+        immediate_by_key = {
+            (c["device_id"], c["port"]): c for c in configs if c["enabled"] and c["mode"] == "immediate"
+        }
+        if not immediate_by_key:
+            return 0
+        host_to_device_id = {d.host: d.id for d in devices_by_id.values()}
+        acted = 0
         newest_seen = self._last_syslog_ts_ns
         for event in events:
             ts_ns = int(event.get("_timestamp_ns", 0))
@@ -309,6 +321,7 @@ class InterfaceAlertChecker:
             # its own events; posting again is a safe, idempotent refresh
             # to Alertmanager either way (same reasoning as the heartbeat).
             now = time.monotonic()
+            acted += 1
             if link_state == "down":
                 self._down_since[key] = now
                 self._fire(cfg, alertmanager, device_name_for, 0)
@@ -324,7 +337,7 @@ class InterfaceAlertChecker:
                 self._last_seen_poll_at.pop(key, None)
                 self._alert_started_at.pop(key, None)
         self._last_syslog_ts_ns = newest_seen
-        return True
+        return acted
 
     def reconcile_via_poll(self, configs, get_state_and_polled_at, device_name_for, alertmanager):
         """Safety net for immediate-mode ports, run on a tight ~5s loop

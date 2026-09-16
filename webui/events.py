@@ -30,12 +30,12 @@ log = logging.getLogger("webui.events")
 # The catalogue. Kept here so the webhook settings page and the docs list
 # the same names the emitters actually use.
 EVENTS = {
-    "alarm.opened": "An alarm started firing and an occurrence was opened",
+    "alarm.opened": "An occurrence was opened: the alarm is pending or firing (it may still be inside its paging hold)",
     "alarm.acknowledged": "Someone acknowledged an alarm",
     "alarm.unacknowledged": "An acknowledgement was withdrawn",
     "alarm.commented": "A comment was added to an alarm",
     "alarm.resolved": "An alarm stopped firing, or was resolved by hand",
-    "alarm.paged": "An alarm was sent to the pager",
+    "alarm.paged": "The alarm went to the pager: it fired and any paging hold lapsed - this is what pages phones",
     "command.ran": "A command was run against a device and its result saved",
     "device.created": "A device was added",
     "device.updated": "A device was edited",

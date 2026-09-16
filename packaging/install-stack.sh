@@ -479,6 +479,8 @@ write_webui_env() {
     am="$(ask '  ALERTMANAGER_URL' 'http://127.0.0.1:9093')"
   fi
   secret="$(openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  local ingest_token
+  ingest_token="$(openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
   if [[ $DRY_RUN -eq 1 ]]; then
     printf '  %s[dry-run]%s write %s/webui.env\n' "$C_DIM" "$C_RESET" "$SB_CONF"; return
@@ -503,6 +505,14 @@ SESSION_TTL_HOURS=12
 # OIDC_REDIRECT_URI (https origin, else mailto: on its hostname); set this
 # only to override. Push needs HTTPS in the browser regardless.
 PUSH_VAPID_SUBJECT=
+
+# Syslog fast path: Vector's switchboard_fast sink POSTs each syslog event
+# here as it arrives (sub-second paging). Give this token to
+# `install-stack.sh --install syslog` on the syslog host. SYSLOG_RECEIVER is
+# where the devices send syslog (host:port) - used by the Alerts page's
+# fast-path self-test only; also editable in Settings.
+SYSLOG_INGEST_TOKEN=$ingest_token
+SYSLOG_RECEIVER=
 
 # OIDC - login will not work until these are real.
 # See webui/README.md "Login: OIDC against Keycloak".
@@ -1230,6 +1240,31 @@ syslog_loki_test() {
   return 0
 }
 
+syslog_ingest_test() {
+  # syslog_ingest_test <url> <token>
+  #
+  # POSTs one event to Switchboard's /api/ingest/syslog exactly as Vector's
+  # http sink will (a JSON array, the bearer token) and reads the answer.
+  # A wrong URL or token here means a healthy-looking sink that Switchboard
+  # rejects on every request - the fast path silently not existing.
+  local url="$1" token="$2" code body
+  step "Testing the Switchboard fast-path endpoint ($url)"
+  body="$(mktemp)"
+  code="$(curl -s -o "$body" -w '%{http_code}' --max-time 10 \
+          -H 'Content-Type: application/json' -H "Authorization: Bearer $token" -X POST \
+          --data '[{"message":"install-stack connection test","host":"install-test","timestamp":"1970-01-01T00:00:00Z"}]' \
+          "$url" 2>/dev/null || echo 000)"
+  case "$code" in
+    2*)  ok "Switchboard accepted a test event (HTTP $code)"; rm -f "$body"; return 0;;
+    000) warn "could not reach $url"; rm -f "$body"; return 1;;
+    401) warn "Switchboard rejected the token (HTTP 401) - it must equal SYSLOG_INGEST_TOKEN in webui.env there";;
+    503) warn "Switchboard says the fast path is not configured (HTTP 503) - set SYSLOG_INGEST_TOKEN in its webui.env and restart";;
+    *)   warn "endpoint answered HTTP $code:"; head -c 300 "$body" | sed 's/^/      /'; echo;;
+  esac
+  rm -f "$body"
+  return 1
+}
+
 syslog_endtoend_test() {
   # syslog_endtoend_test <endpoint>
   #
@@ -1302,6 +1337,13 @@ install_syslog() {
   # a pty or installing with a Loki address that points nowhere.
   d_loki="${SB_LOKI_ENDPOINT:-$d_loki}"
   d_tz="${SB_DEVICE_TZ:-$d_tz}"
+  local d_ingest d_token ingest token
+  d_ingest="$(sysl_conf_value '^[[:space:]]*uri:[[:space:]]*(http.*[^[:space:]])[[:space:]]*$')"
+  d_ingest="${d_ingest:-http://127.0.0.1:8080/api/ingest/syslog}"
+  d_token="$(sysl_conf_value '^[[:space:]]*Authorization:[[:space:]]*"Bearer ([^"]+)".*$')"
+  [[ "$d_token" == CHANGE-ME* ]] && d_token=""
+  d_ingest="${SB_INGEST_URL:-$d_ingest}"
+  d_token="${SB_INGEST_TOKEN:-$d_token}"
 
   say ""
   say "  ${C_BOLD}Loki.${C_RESET} Where parsed events are shipped. Vector's healthcheck for"
@@ -1322,6 +1364,31 @@ install_syslog() {
   done
 
   say ""
+  say "  ${C_BOLD}Switchboard fast path.${C_RESET} Besides the archive in Loki, Vector POSTs"
+  say "  every parsed event straight to Switchboard as it arrives, so an"
+  say "  interface down or a fan fault pages within a second instead of"
+  say "  waiting on polling and Alertmanager. The token is SYSLOG_INGEST_TOKEN"
+  say "  from Switchboard's /etc/switchboard/webui.env. Leave the token blank"
+  say "  to skip the fast path (Loki polling still works, just slower)."
+  while :; do
+    ingest="$(ask '  Switchboard ingest URL' "$d_ingest")"
+    token="$(ask '  SYSLOG_INGEST_TOKEN (blank = no fast path)' "$d_token")"
+    if [[ -z "$token" ]]; then
+      warn "no token - the switchboard_fast sink will be left disabled"
+      break
+    fi
+    syslog_ingest_test "$ingest" "$token" && break
+    if [[ $ASSUME_YES -eq 1 ]]; then
+      warn "continuing anyway (-y) - the fast path may not work"
+      break
+    fi
+    say ""
+    confirm "  Try a different URL or token?" && { d_ingest="$ingest"; d_token="$token"; continue; }
+    confirm "  Install anyway with a fast path that failed the test?" || die "aborted"
+    break
+  done
+
+  say ""
   say "  ${C_BOLD}Device timezone.${C_RESET} Switches send BSD-syslog timestamps with no UTC"
   say "  offset, and Vector's syslog source has no setting for the sender's"
   say "  zone, so it assumes they are already UTC. Getting this wrong shifts"
@@ -1335,7 +1402,7 @@ install_syslog() {
   step "Deploying $SYSLOG_CONF from syslog/vector.yaml"
   run mkdir -p /etc/vector
   if [[ $DRY_RUN -eq 0 ]]; then
-    SB_LOKI="$loki" SB_TZ="$tz" python3 - "$REPO_DIR/syslog/vector.yaml" "$SYSLOG_CANDIDATE" <<'PY'
+    SB_LOKI="$loki" SB_TZ="$tz" SB_INGEST="$ingest" SB_TOKEN="$token" python3 - "$REPO_DIR/syslog/vector.yaml" "$SYSLOG_CANDIDATE" <<'PY'
 import os, re, sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
@@ -1350,6 +1417,21 @@ subs += n
 # still baked in, and nothing would say so.
 if n == 0 or subs < 2:
     raise SystemExit("syslog/vector.yaml has no endpoint:/timezone: line to substitute")
+# The fast path: point the switchboard_fast sink at Switchboard with the
+# token, or - no token - remove the sink block so Vector does not retry
+# an endpoint forever.
+token = os.environ.get("SB_TOKEN", "")
+if token:
+    text, n1 = re.subn(r'(^\s*uri:\s*)http\S+', lambda m: m.group(1) + os.environ["SB_INGEST"], text, count=1, flags=re.M)
+    text, n2 = re.subn(r'(Authorization:\s*"Bearer )[^"]+(")', lambda m: m.group(1) + token + m.group(2), text, count=1)
+    if n1 == 0 or n2 == 0:
+        raise SystemExit("syslog/vector.yaml has no switchboard_fast uri:/Authorization: line to substitute")
+else:
+    start = text.find("  switchboard_fast:")
+    end = text.find("  loki_sink:")
+    if start == -1 or end == -1 or end < start:
+        raise SystemExit("syslog/vector.yaml: could not find the switchboard_fast sink block to remove")
+    text = text[:start] + text[end:]
 open(dst, "w").write(text)
 PY
     ok "wrote $SYSLOG_CANDIDATE"
