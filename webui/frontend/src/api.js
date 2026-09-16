@@ -338,3 +338,5 @@ export const getFastPath = () => api("/api/events/fast-path");
 export const testFastPath = (severity) =>
   api("/api/events/fast-path/test", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ severity }) }, 30_000);
 export const listWebhookEvents = () => api("/api/webhooks/events");
+
+export const getInsights = (refresh = false) => api(`/api/insights${refresh ? "?refresh=1" : ""}`, undefined, 60_000);

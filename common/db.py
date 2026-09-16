@@ -62,6 +62,10 @@ CREATE TABLE IF NOT EXISTS metric_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_metric_samples_lookup
     ON metric_samples(device_id, metric, port, recorded_at);
+-- Insights ask fleet-wide questions of one metric at a time ("every
+-- optic's Rx power over 45 days"), which the lookup index above cannot
+-- serve because device_id leads it.
+CREATE INDEX IF NOT EXISTS idx_metric_samples_metric_time ON metric_samples(metric, recorded_at DESC);
 
 -- Scheduled/recurring command runs (ROADMAP 3.6). Output feeds the same
 -- `results` table above (auto_saved=1) rather than a separate log, so

@@ -362,6 +362,51 @@ in Saved Results / Recent results shows "Auto" vs "Manual" (the manual
 `POST /api/results` endpoint still exists, e.g. for scripted use, and rows
 it creates are flagged "Manual").
 
+## Insights: what is worth knowing, as opposed to what broke
+
+Events answer "what is wrong right now". The **Insights** page answers the
+question nobody gets round to asking: what is worth a look? It is derived
+entirely from what is already collected - the trend samples
+(`metric_samples`, currently ~6 weeks of optical power and a month of
+interface counters), the SSH poller's live state, and the event history.
+No producer talks to a device.
+
+Twelve checks, each returning a finding or nothing, sorted by how much
+they want doing something about: **act**, **watch**, **note**. A healthy
+network still has plenty to show, which is the point - a page that only
+speaks up when something is broken is a page nobody opens.
+
+- **Optics losing light** - the average receive power over the last two
+  days against the window three weeks back, per port. Fibre does not
+  recover on its own, so a link that has quietly lost a decibel is the one
+  to clean before it starts erroring. Dark ports are excluded: comparing
+  two readings of the module's floor is not a measurement.
+- **Optical margin** - every live link ranked by how far its receive power
+  sits above the level that would raise an event. The top of that list is
+  the link that fails first.
+- **Transceivers in ports with nothing on them** - nine here. Modules
+  doing nothing: decommissioned cross-connects, ports shut and forgotten,
+  spares. Worth reclaiming, and worth knowing before someone reports a
+  link that was never connected.
+- **Ports with errors climbing**, **where the traffic is** (95th
+  percentile against link speed, so one burst does not read as
+  saturation), **live ports nobody labelled**, **ports shut with a module
+  still in them**, **optics running warm**.
+- **Things that keep coming back** - an intermittent fault is worse than a
+  hard one, because it clears before anyone looks.
+- **Open for more than an hour**, **what has been happening this week**,
+  and **devices not sending syslog** - which found the real thing it was
+  written for: the OPNsense firewall is registered but has never sent a
+  line, so everything about it is detected by the SSH poll or not at all.
+
+Checks that found nothing are listed too, so the page shows it looked. A
+producer that throws is named and the rest of the page still renders.
+
+The aggregates run over more than a million rows, so they are computed on
+a timer into memory (`INSIGHTS_REFRESH_SECONDS`, default 300) and warmed
+45 seconds after startup - a cached load is ~30 ms against ~9 s to
+compute. `?refresh=1` recomputes on demand.
+
 ## Events: syslog first, SSH as the fallback
 
 Switchboard does event-driven monitoring, the way PROXMON does it for

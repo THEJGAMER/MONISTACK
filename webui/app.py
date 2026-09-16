@@ -51,6 +51,7 @@ import event_reconcile
 import events
 import eventstore
 import fastpath
+import insights as insights_module
 import push as push_module
 import syslog_alerting
 import sflow_store
@@ -3085,6 +3086,67 @@ def api_list_events(open_only: int = 0, severity: Optional[str] = None, device_i
 @app.get("/api/events/summary", tags=["events"], summary="Open and recent counts by severity")
 def api_events_summary(user: str = Depends(require_auth_and_db)):
     return _require_events().summary()
+
+
+# Insights are several aggregate passes over metric_samples (1.3M rows and
+# growing), so they are computed on a timer and served from memory - the
+# same shape as the topology cache, and for the same reason.
+_INSIGHTS_CACHE = {"result": None, "at": None, "error": None}
+_INSIGHTS_LOCK = threading.Lock()
+INSIGHTS_REFRESH_SECONDS = int(os.environ.get("INSIGHTS_REFRESH_SECONDS", "300"))
+
+
+def _compute_insights():
+    if EVENTS is None or DB is None:
+        return None
+    return insights_module.Insights(
+        DB, EVENTS, EVENT_SETTINGS, list(DEVICES),
+        lambda device_id: STATUS.get(device_id, include_interfaces=True),
+        syslog_seen=dict(FAST_PATH.last_by_host),
+    ).run()
+
+
+def _refresh_insights():
+    with _INSIGHTS_LOCK:
+        try:
+            result = _compute_insights()
+        except Exception as e:
+            _INSIGHTS_CACHE["error"] = str(e)
+            log.exception("insights refresh failed")
+            return _INSIGHTS_CACHE["result"]
+        if result is not None:
+            _INSIGHTS_CACHE.update({"result": result, "at": datetime.now(timezone.utc), "error": None})
+        return _INSIGHTS_CACHE["result"]
+
+
+def _insights_loop():
+    # Warm the cache once the database and the first SSH poll have had a
+    # chance to land, rather than leaving the first visitor after a
+    # restart to compute six weeks of samples themselves (measured: ~9s).
+    time.sleep(45)
+    while True:
+        try:
+            _refresh_insights()
+        except Exception:
+            log.exception("insights loop failed")
+        time.sleep(INSIGHTS_REFRESH_SECONDS)
+
+
+threading.Thread(target=_insights_loop, daemon=True, name="insights-refresh").start()
+
+
+@app.get("/api/insights", tags=["events"], summary="What is worth knowing about the network right now")
+def api_insights(refresh: int = 0, user: str = Depends(require_auth_and_db)):
+    """Derived from the trend samples, the SSH poller's live state and the
+    event history - nothing here talks to a device. Served from a cache
+    refreshed every few minutes; `?refresh=1` recomputes."""
+    cached = _INSIGHTS_CACHE["result"]
+    if refresh or cached is None:
+        cached = _refresh_insights()
+    if cached is None:
+        raise HTTPException(status_code=503, detail=_INSIGHTS_CACHE["error"] or "insights are not available yet")
+    return {**cached, "cached_at": _INSIGHTS_CACHE["at"].isoformat() if _INSIGHTS_CACHE["at"] else None,
+            "refresh_seconds": INSIGHTS_REFRESH_SECONDS, "error": _INSIGHTS_CACHE["error"]}
 
 
 @app.get("/api/events/catalog", tags=["events"], summary="Every event kind and the site's severity for it")

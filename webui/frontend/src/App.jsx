@@ -29,6 +29,7 @@ const BulkRunPage = lazy(() => import("./BulkRunPage.jsx"));
 const SchedulesPage = lazy(() => import("./SchedulesPage.jsx"));
 const CompliancePage = lazy(() => import("./CompliancePage.jsx"));
 const EventsPage = lazy(() => import("./EventsPage.jsx"));
+const InsightsPage = lazy(() => import("./InsightsPage.jsx"));
 const AccountPage = lazy(() => import("./AccountPage.jsx"));
 
 function PageFallback() {
@@ -208,6 +209,7 @@ export default function App() {
     "schedules",
     "compliance",
     "events",
+    "insights",
     "settings",
     "account",
   ];
@@ -222,6 +224,7 @@ export default function App() {
     schedules: "Schedules",
     compliance: "Compliance",
     events: "Events",
+    insights: "Insights",
     settings: "Settings",
     account: "My Account",
   };
@@ -320,6 +323,7 @@ export default function App() {
               { type: "link", text: "Schedules", href: "#/schedules" },
               { type: "link", text: "Compliance", href: "#/compliance" },
               { type: "link", text: "Events", href: "#/events" },
+              { type: "link", text: "Insights", href: "#/insights" },
               { type: "divider" },
               { type: "link", text: "Settings", href: "#/settings" },
             ]}
@@ -364,6 +368,8 @@ export default function App() {
                 <SchedulesPage devices={devices} commandTree={commandTree} pushFlash={pushFlash} />
               ) : page === "compliance" ? (
                 <CompliancePage pushFlash={pushFlash} />
+              ) : page === "insights" ? (
+                <InsightsPage pushFlash={pushFlash} />
               ) : page === "events" ? (
                 <EventsPage devices={devices} eventId={routeParam || null} pushFlash={pushFlash} onNavigate={setActiveHref} />
               ) : (
