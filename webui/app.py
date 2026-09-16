@@ -2977,12 +2977,64 @@ def _fetch_live_topology():
             "output_mbps": sum(outs) if outs else None,
         }
 
+    _assign_edge_states(result, ifaces_by_device)
+
+
+    return result
+
+
+def _assign_edge_states(result, ifaces_by_device):
+    """Fill in every edge's `state` from the status poller's interfaces.
+
+    `ifaces_by_device` is {device_id: {port: iface}}."""
+    def endpoint_state(device_id, port):
+        iface = ifaces_by_device.get(device_id, {}).get(port)
+        if iface is None:
+            return {"status": None, "input_mbps": None, "output_mbps": None}
+        return {"status": iface.get("status"), "input_mbps": iface.get("input_mbps"),
+                "output_mbps": iface.get("output_mbps")}
+
+    def endpoint_state_multi(device_id, ports):
+        # An external edge's `port` can be a port-channel name (e.g. "Po 2")
+        # when the host was reached over a LAG - the status poller only ever
+        # tracks physical interfaces (confirmed live: `show interfaces
+        # status` has no "Po N" row), so state and throughput are combined
+        # across the port-channel's real members rather than looked up under
+        # an aggregate name that is never there.
+        states = [endpoint_state(device_id, p) for p in ports]
+        known = [x["status"] for x in states if x["status"]]
+        ins = [x["input_mbps"] for x in states if x["input_mbps"] is not None]
+        outs = [x["output_mbps"] for x in states if x["output_mbps"] is not None]
+        return {"status": "Up" if "Up" in known else (known[0] if known else None),
+                "input_mbps": sum(ins) if ins else None,
+                "output_mbps": sum(outs) if outs else None}
+
+    # Every external edge on one local port describes that same physical
+    # port, so they must all report the same state. They did not: a port
+    # carries one edge per host on it, and only the edges whose LAG had
+    # been expanded to its physical members could be looked up in the
+    # poller - 39 edges on Po 3, of which 2 reported "Up" and 37 reported
+    # nothing. Consumers then picked whichever happened to come first.
+    # Resolve the members once per port, from everything known about it.
+    members_by_port = {}
+    for edge in result["edges"]:
+        if edge["kind"] == "external":
+            key = (edge["device_id"], edge["port"])
+            members = members_by_port.setdefault(key, [])
+            for m in edge.get("member_ports") or []:
+                if m not in members:
+                    members.append(m)
+    state_by_port = {
+        key: endpoint_state_multi(key[0], members or [key[1]])
+        for key, members in members_by_port.items()
+    }
+
     for edge in result["edges"]:
         if edge["kind"] == "internal":
-            edge["a"]["state"] = _endpoint_state(edge["a"]["device_id"], edge["a"]["port"])
-            edge["b"]["state"] = _endpoint_state(edge["b"]["device_id"], edge["b"]["port"])
+            edge["a"]["state"] = endpoint_state(edge["a"]["device_id"], edge["a"]["port"])
+            edge["b"]["state"] = endpoint_state(edge["b"]["device_id"], edge["b"]["port"])
         else:
-            edge["state"] = _endpoint_state_multi(edge["device_id"], edge.get("member_ports") or [edge["port"]])
+            edge["state"] = state_by_port[(edge["device_id"], edge["port"])]
 
     return result
 

@@ -368,9 +368,16 @@ export default function TopologyMap({ data, showMacTableHosts, onOpenConsole, on
       const id = `${e.device_id}::${e.port}`;
       const p = (ports[id] = ports[id] || {
         id, deviceId: e.device_id, port: e.port, hosts: [],
-        lagMembers: e.member_ports && e.member_ports.length > 1 ? e.member_ports : [],
-        status: e.state?.status, inMbps: e.state?.input_mbps, outMbps: e.state?.output_mbps,
+        lagMembers: [], status: null, inMbps: null, outMbps: null,
       });
+      // Take the best information any edge on this port carries rather
+      // than whichever happened to be first: the API now reports one
+      // state per port, but a chip whose colour depends on host ordering
+      // is the kind of thing that is only wrong sometimes.
+      p.status = p.status || e.state?.status || null;
+      p.inMbps = p.inMbps ?? e.state?.input_mbps ?? null;
+      p.outMbps = p.outMbps ?? e.state?.output_mbps ?? null;
+      if ((e.member_ports || []).length > 1 && p.lagMembers.length === 0) p.lagMembers = e.member_ports;
       p.hosts.push(e);
     }
     const portsByDevice = {};

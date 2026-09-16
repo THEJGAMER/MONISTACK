@@ -388,6 +388,18 @@ So the two halves are separated by what they actually are.
 Nothing is drawn that you cannot click, and nothing is drawn that a table
 would say better - the Links & hosts tab remains for that.
 
+The page no longer watches for link changes itself. It used to, and it
+was both duplicate and wrong: the event system owns link state now
+(`port.link_down`, raised and resolved, de-duplicated, with push behind
+it), and the page's own version keyed by port while a port carries one
+edge per host on it. Only the edges whose LAG had been expanded to
+physical members could be looked up in the poller - 39 edges on Po 3, of
+which 2 said "Up" and 37 said nothing - so the value it remembered
+flipped every crawl and it announced "Po 3 is back up" twice every thirty
+seconds, indefinitely. The API side of that is fixed too: every edge on a
+port now reports that port's state, resolved once from everything known
+about it, rather than leaving consumers to pick whichever came first.
+
 **On colour**: only the status colours are taken from the design tokens
 as values, because they read on a light or a dark page alike. Surfaces,
 borders and text are drawn in `currentColor` and inherit from the

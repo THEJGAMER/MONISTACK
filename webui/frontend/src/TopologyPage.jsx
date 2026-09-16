@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import Button from "@cloudscape-design/components/button";
@@ -108,43 +108,27 @@ export default function TopologyPage({ pushFlash, onOpenConsole, onAddDevice }) 
   const [expandedPortIds, setExpandedPortIds] = useState([]);
   const [portFilterText, setPortFilterText] = useState("");
   const [portPage, setPortPage] = useState(1);
-  const prevStates = useRef(null); // edge key -> status, from the previous fetch (for flap detection)
-  const firstLoad = useRef(true);
+  const [loadError, setLoadError] = useState(null);
 
+  // Link state changes are the event system's job now (port.link_down,
+  // raised and resolved, with de-duplication and push behind it). This
+  // page used to detect them itself and raise a flash per changed edge,
+  // which was both duplicate and wrong: it keyed by port, but a port has
+  // one edge per host on it and only some of those carry a status - 39
+  // edges on Po 3, of which 2 say "Up" and 37 say nothing. So the
+  // remembered value flipped between null and "Up" on every crawl, and
+  // the page announced "Po 3 is back up" twice every thirty seconds,
+  // forever.
   const load = useCallback(async (force) => {
     setLoading(true);
     try {
-      const next = await getTopology({ refresh: force === true });
-      if (!firstLoad.current && prevStates.current) {
-        const nextStates = {};
-        const flap = (key, label, status) => {
-          nextStates[key] = status;
-          const prev = prevStates.current[key];
-          if (prev === undefined || !status || prev === status) return;
-          if (status === "Up" && prev !== "Up") pushFlash("success", `${label} is back up.`);
-          else if (status !== "Up" && prev === "Up") pushFlash("error", `${label} went down.`);
-        };
-        for (const e of next.edges) {
-          if (e.kind === "internal") {
-            const key = `${e.a.device_id}:${e.a.port}`;
-            flap(key, `Link ${e.a.port} ⟷ ${e.b.port}`, e.a.state?.status);
-          } else {
-            flap(`${e.device_id}:${e.port}`, `Link ${e.port} ⟷ ${e.remote_label}`, e.state?.status);
-          }
-        }
-        prevStates.current = nextStates;
-      } else {
-        const initial = {};
-        for (const e of next.edges) {
-          if (e.kind === "internal") initial[`${e.a.device_id}:${e.a.port}`] = e.a.state?.status;
-          else initial[`${e.device_id}:${e.port}`] = e.state?.status;
-        }
-        prevStates.current = initial;
-      }
-      firstLoad.current = false;
-      setData(next);
+      setData(await getTopology({ refresh: force === true }));
+      setLoadError(null);
     } catch (e) {
-      pushFlash("error", `Could not load topology: ${e.message}`);
+      // The first crawl after a restart takes a while. That is a state to
+      // show, not an error to pop up again on every auto-refresh.
+      setLoadError(e.message);
+      if (force) pushFlash("error", `Could not load topology: ${e.message}`);
     } finally {
       setLoading(false);
     }
@@ -205,6 +189,15 @@ export default function TopologyPage({ pushFlash, onOpenConsole, onAddDevice }) 
     }
   }
 
+  if (!data && loadError) {
+    const warming = /first crawl|503/i.test(loadError);
+    return (
+      <Alert type={warming ? "info" : "error"} header="Topology is not ready yet">
+        {loadError}
+        {warming ? " The page fills in by itself as soon as the crawl finishes." : ""}
+      </Alert>
+    );
+  }
   if (loading && !data) return <Spinner size="large" />;
   if (!data || !layout) return null;
 
