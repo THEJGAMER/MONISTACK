@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
 # Switchboard stack installer - native systemd, no Docker anywhere.
 #
-# Installs any combination of the seven services (webui, prometheus,
-# alertmanager, grafana, exporter, sflow, syslog) onto this host, either
+# Installs any combination of the five services (webui, prometheus,
+# exporter, sflow, syslog) onto this host, either
 # individually or as a pre-set bundle. Detects what is already installed, and can update
 # in place rather than reinstalling.
 #
-# The bundles exist for a specific practical reason, not just convenience.
-# The webui's Rules tab writes Prometheus's alert-rules file and then calls
-# Prometheus's /-/reload, so those two processes must see the *same file*.
-# Split across machines that needs a network filesystem (NFS/CIFS/SMB) with
-# all the failure modes that brings; co-located on one host it is just a
-# real path on disk shared through a Unix group. The `app` bundle is
-# exactly that pairing. See docs/deploy-lxc-4lxcs-native.md.
+# The bundles are just convenient groupings: `app` (webui + Prometheus on
+# one host), `monitoring` (Prometheus + exporter), `collector` (sFlow),
+# `ingest` (sFlow + syslog), `all`. See docs/deploy-lxc-4lxcs-native.md.
 #
 # Every version, URL and path here comes from that guide, where they were
 # actually downloaded and executed rather than taken from documentation.
@@ -23,8 +19,6 @@ VERSION="1.0.0"
 # Pinned to match docker-compose.yml, so a native install and a Docker one
 # are the same software. Bump both together.
 PROMETHEUS_VERSION="2.55.1"
-ALERTMANAGER_VERSION="0.27.0"
-GRAFANA_VERSION="11.3.1"
 NODE_MAJOR="20"
 # The version the syslog VRL was written and verified against.
 VECTOR_VERSION="0.57.0"
@@ -32,11 +26,9 @@ VECTOR_VERSION="0.57.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-SHARED_GROUP="switchboard-shared"
 SB_HOME=/opt/switchboard
 SB_DATA="$SB_HOME/data"
 SB_CONF=/etc/switchboard
-ALERT_RULES_FILE="$SB_DATA/prometheus-alerts.yml"
 SFLOW_CONF=/etc/pmacct/sfacctd.conf
 SYSLOG_CONF=/etc/vector/vector.yaml
 SYSLOG_CANDIDATE=/etc/vector/vector.candidate.yaml
@@ -124,14 +116,12 @@ ask_secret() {
 
 # ---------------------------------------------------------------- modules
 
-ALL_MODULES=(webui prometheus alertmanager grafana exporter sflow syslog)
+ALL_MODULES=(webui prometheus exporter sflow syslog)
 
 module_desc() {
   case "$1" in
     webui)        echo "Switchboard web UI (FastAPI + systemd, port 8080)";;
     prometheus)   echo "Prometheus v$PROMETHEUS_VERSION (port 9090)";;
-    alertmanager) echo "Alertmanager v$ALERTMANAGER_VERSION (port 9093)";;
-    grafana)      echo "Grafana v$GRAFANA_VERSION (port 3000)";;
     exporter)     echo "SSH-polling metrics exporter (port 9101)";;
     sflow)        echo "sFlow collector - sfacctd into Postgres (UDP 6343)";;
     syslog)       echo "Syslog receiver - Vector v$VECTOR_VERSION into Loki (UDP/TCP 514)";;
@@ -142,8 +132,6 @@ module_unit() {
   case "$1" in
     webui)        echo "switchboard-webui";;
     prometheus)   echo "prometheus";;
-    alertmanager) echo "alertmanager";;
-    grafana)      echo "grafana";;
     exporter)     echo "s4048-exporter";;
     sflow)        echo "sfacctd";;
     syslog)       echo "vector";;
@@ -152,9 +140,8 @@ module_unit() {
 
 bundle_modules() {
   case "$1" in
-    # The no-shared-filesystem pairing - see the header.
     app)        echo "webui prometheus";;
-    monitoring) echo "prometheus alertmanager grafana";;
+    monitoring) echo "prometheus exporter";;
     # Its own bundle rather than part of `app`: the collector is usually
     # given its own host so switch sampling traffic lands somewhere it
     # cannot compete with the webui, and it is the only module whose
@@ -164,15 +151,15 @@ bundle_modules() {
     # keeping ingest off the webui host means a flood of flows or log
     # lines cannot starve the thing people are looking at.
     ingest)     echo "sflow syslog";;
-    all)        echo "webui prometheus alertmanager grafana exporter sflow syslog";;
+    all)        echo "webui prometheus exporter sflow syslog";;
     *)          echo "";;
   esac
 }
 
 bundle_desc() {
   case "$1" in
-    app)        echo "webui + Prometheus together, sharing the alert-rules file on local disk (no NFS/CIFS/SMB needed)";;
-    monitoring) echo "Prometheus + Alertmanager + Grafana - the metrics/alerting side, no webui";;
+    app)        echo "webui + Prometheus together on one host";;
+    monitoring) echo "Prometheus + the SSH-polling exporter - the metrics side, no webui";;
     collector)  echo "sFlow collector only - for a dedicated LXC/VM the switches sample into";;
     ingest)     echo "Both receivers - sFlow and syslog - on one dedicated host";;
     all)        echo "Everything on this one host";;
@@ -217,12 +204,6 @@ installed_version() {
     prometheus)
       [[ -x /opt/prometheus/prometheus ]] || return 0
       /opt/prometheus/prometheus --version 2>&1 | head -1 | sed -E 's/.*version ([0-9.]+).*/\1/';;
-    alertmanager)
-      [[ -x /opt/alertmanager/alertmanager ]] || return 0
-      /opt/alertmanager/alertmanager --version 2>&1 | head -1 | sed -E 's/.*version ([0-9.]+).*/\1/';;
-    grafana)
-      [[ -x /opt/grafana/bin/grafana ]] || return 0
-      /opt/grafana/bin/grafana --version 2>&1 | head -1 | sed -E 's/.*version ([0-9.]+).*/\1/';;
     exporter)
       [[ -d /opt/s4048-exporter ]] || return 0
       echo "installed";;
@@ -238,8 +219,6 @@ installed_version() {
 target_version() {
   case "$1" in
     prometheus)   echo "$PROMETHEUS_VERSION";;
-    alertmanager) echo "$ALERTMANAGER_VERSION";;
-    grafana)      echo "$GRAFANA_VERSION";;
     webui)        (cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null) || echo "unknown";;
     exporter)     (cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null) || echo "unknown";;
     sflow)        (cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null) || echo "unknown";;
@@ -312,17 +291,6 @@ ensure_user() {
   fi
 }
 
-ensure_shared_group() {
-  # Only meaningful when webui and prometheus are on the same host - which
-  # is the entire point of the `app` bundle.
-  if getent group "$SHARED_GROUP" >/dev/null; then
-    ok "group $SHARED_GROUP exists"
-  else
-    run groupadd "$SHARED_GROUP"
-    [[ $DRY_RUN -eq 0 ]] && ok "created group $SHARED_GROUP"
-  fi
-}
-
 fetch_tarball() {
   # fetch_tarball <url> <tmpfile> - fails loudly rather than leaving a
   # truncated archive to fail confusingly at tar/exec time.
@@ -384,8 +352,6 @@ install_webui() {
   step "Installing webui"
   ensure_python
   ensure_user switchboard
-  ensure_shared_group
-  run usermod -aG "$SHARED_GROUP" switchboard
 
   [[ -f "$REPO_DIR/webui/app.py" ]] || die "no webui/app.py - run this from a full repo checkout"
 
@@ -419,13 +385,8 @@ install_webui() {
   run "$SB_HOME/venv/bin/pip" install --quiet --upgrade pip
   run "$SB_HOME/venv/bin/pip" install --quiet -r "$SB_HOME/app/requirements.txt"
 
-  # The shared alert-rules file. 664 + the shared group is what lets the
-  # webui write it and Prometheus read it without a network filesystem.
   run mkdir -p "$SB_DATA"
-  run touch "$ALERT_RULES_FILE"
-  run chown switchboard:"$SHARED_GROUP" "$SB_DATA" "$ALERT_RULES_FILE"
-  run chmod 775 "$SB_DATA"
-  run chmod 664 "$ALERT_RULES_FILE"
+  run chown switchboard:switchboard "$SB_DATA"
 
   write_webui_env
   run chown -R switchboard:switchboard "$SB_HOME/app" "$SB_HOME/venv"
@@ -469,15 +430,10 @@ write_webui_env() {
     return
   fi
   step "Creating $SB_CONF/webui.env"
-  local db loki am secret
+  local db loki secret
   say "  The webui needs a Postgres DSN. Everything else can be edited later."
   db="$(ask '  DATABASE_URL' 'postgresql://switchboard:changeme@127.0.0.1:5432/switchboard')"
   loki="$(ask '  LOKI_URL (blank to skip)' '')"
-  if is_selected prometheus; then
-    am="$(ask '  ALERTMANAGER_URL' 'http://127.0.0.1:9093')"
-  else
-    am="$(ask '  ALERTMANAGER_URL' 'http://127.0.0.1:9093')"
-  fi
   secret="$(openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   local ingest_token
   ingest_token="$(openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -488,14 +444,8 @@ write_webui_env() {
   cat > "$SB_CONF/webui.env" <<EOF
 DATABASE_URL=$db
 LOKI_URL=$loki
-
-ALERTMANAGER_URL=$am
 PROMETHEUS_URL=http://localhost:9090
-PROMETHEUS_RELOAD_URL=http://localhost:9090/-/reload
-
-# Shared with Prometheus on this host - prometheus.yml's rule_files entry
-# must point at this exact path.
-ALERT_RULES_FILE=$ALERT_RULES_FILE
+EXPORTER_URL=http://localhost:9101
 
 SESSION_SECRET_KEY=$secret
 SESSION_COOKIE_SECURE=false
@@ -532,13 +482,10 @@ install_prometheus() {
   step "Installing Prometheus v$PROMETHEUS_VERSION"
   ensure_apt curl
   ensure_user prometheus
-  ensure_shared_group
-  run usermod -aG "$SHARED_GROUP" prometheus
 
   # Config lives in /etc, never inside /opt/prometheus - an update
   # replaces that whole directory, so a prometheus.yml kept in there is
-  # destroyed on every upgrade. Same convention the exporter and
-  # alertmanager already use.
+  # destroyed on every upgrade. Same convention the exporter uses.
   run mkdir -p /etc/prometheus
   # Migrate a config left in the old location by an earlier version of
   # this script (or a hand-rolled install following the guide) *before*
@@ -566,13 +513,6 @@ install_prometheus() {
   write_prometheus_yml
 
   run mkdir -p "$SB_DATA"
-  run touch "$ALERT_RULES_FILE"
-  if getent passwd switchboard >/dev/null; then
-    run chown switchboard:"$SHARED_GROUP" "$ALERT_RULES_FILE"
-  else
-    run chown prometheus:"$SHARED_GROUP" "$ALERT_RULES_FILE"
-  fi
-  run chmod 664 "$ALERT_RULES_FILE"
 
   write_unit prometheus <<'EOF'
 [Unit]
@@ -588,8 +528,7 @@ ExecStart=/opt/prometheus/prometheus \
   --config.file=/etc/prometheus/prometheus.yml \
   --storage.tsdb.path=/var/lib/prometheus \
   --web.console.libraries=/opt/prometheus/console_libraries \
-  --web.console.templates=/opt/prometheus/consoles \
-  --web.enable-lifecycle
+  --web.console.templates=/opt/prometheus/consoles
 Restart=on-failure
 RestartSec=5
 
@@ -609,8 +548,7 @@ write_prometheus_yml() {
     return
   fi
   step "Writing /etc/prometheus/prometheus.yml"
-  local am_target exp_target
-  am_target="$(ask '  Alertmanager host:port' '127.0.0.1:9093')"
+  local exp_target
   exp_target="$(ask '  Exporter host:port' '127.0.0.1:9101')"
 
   if [[ $DRY_RUN -eq 1 ]]; then
@@ -624,14 +562,6 @@ global:
   # ~90s before it even reached "pending" (confirmed live).
   evaluation_interval: 15s
 
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: ["$am_target"]
-
-rule_files:
-  - $ALERT_RULES_FILE
-
 scrape_configs:
   - job_name: s4048
     scrape_interval: 10s
@@ -644,178 +574,6 @@ scrape_configs:
 EOF
   chown -R prometheus:prometheus /etc/prometheus
   ok "wrote /etc/prometheus/prometheus.yml"
-}
-
-# ------------------------------------------------------------ alertmanager
-
-install_alertmanager() {
-  step "Installing Alertmanager v$ALERTMANAGER_VERSION"
-  ensure_apt curl
-  ensure_user alertmanager
-
-  local tmp=/tmp/alertmanager.tar.gz
-  fetch_tarball "https://github.com/prometheus/alertmanager/releases/download/v${ALERTMANAGER_VERSION}/alertmanager-${ALERTMANAGER_VERSION}.linux-amd64.tar.gz" "$tmp"
-  run tar xzf "$tmp" -C /tmp
-  run rm -rf /opt/alertmanager
-  run mv "/tmp/alertmanager-${ALERTMANAGER_VERSION}.linux-amd64" /opt/alertmanager
-  run mkdir -p /var/lib/alertmanager /etc/alertmanager/secrets
-
-  if [[ -f /etc/alertmanager/alertmanager.yml ]]; then
-    # Config *and* the secrets beside it are the operator's - an update
-    # replaces only the binary in /opt. Real Pushover/PagerDuty keys live
-    # in /etc/alertmanager/secrets and must never be overwritten by the
-    # repo's placeholder copies.
-    ok "/etc/alertmanager/alertmanager.yml exists - left untouched"
-    ok "/etc/alertmanager/secrets left untouched"
-  else
-    local webui_url
-    webui_url="$(ask '  webui host:port (for the alert webhook)' "$(hostname -I 2>/dev/null | awk '{print $1}'):8080")"
-    if [[ $DRY_RUN -eq 0 ]]; then
-      if [[ -f "$REPO_DIR/alertmanager/alertmanager.yml" ]]; then
-        sed -E "s#http://[^\"']*/api/alertmanager/webhook#http://$webui_url/api/alertmanager/webhook#g" \
-          "$REPO_DIR/alertmanager/alertmanager.yml" > /etc/alertmanager/alertmanager.yml
-        ok "installed alertmanager.yml from the repo, webhook -> $webui_url"
-      else
-        cat > /etc/alertmanager/alertmanager.yml <<EOF
-route:
-  receiver: switchboard
-  group_wait: 0s
-  group_interval: 5m
-  repeat_interval: 4h
-
-receivers:
-  - name: switchboard
-    webhook_configs:
-      - url: "http://$webui_url/api/alertmanager/webhook"
-EOF
-        ok "wrote a minimal alertmanager.yml (webhook -> $webui_url)"
-      fi
-    fi
-    [[ -d "$REPO_DIR/alertmanager/secrets" ]] && \
-      run bash -c "cp -r '$REPO_DIR'/alertmanager/secrets/* /etc/alertmanager/secrets/ 2>/dev/null || true"
-  fi
-  run chown -R alertmanager:alertmanager /opt/alertmanager /var/lib/alertmanager /etc/alertmanager
-
-  write_unit alertmanager <<'EOF'
-[Unit]
-Description=Alertmanager
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=alertmanager
-Group=alertmanager
-ExecStart=/opt/alertmanager/alertmanager \
-  --config.file=/etc/alertmanager/alertmanager.yml \
-  --storage.path=/var/lib/alertmanager
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  enable_now alertmanager
-  wait_healthy alertmanager http://localhost:9093/-/healthy || true
-}
-
-# ------------------------------------------------------------ grafana
-
-install_grafana() {
-  step "Installing Grafana v$GRAFANA_VERSION"
-  ensure_apt curl
-  ensure_user grafana
-
-  # Provisioning lives in /etc, not /opt/grafana/conf - an update replaces
-  # that whole directory, which would silently wipe the datasource and
-  # dashboard provisioning every upgrade. Grafana's own
-  # `paths.provisioning` setting exists exactly so this can live elsewhere.
-  run mkdir -p /etc/grafana/provisioning/datasources /etc/grafana/provisioning/dashboards
-  if [[ -d /opt/grafana/conf/provisioning/datasources ]] && \
-     [[ ! -f /etc/grafana/provisioning/datasources/switchboard.yml ]]; then
-    run bash -c "cp -r /opt/grafana/conf/provisioning/datasources/*.yml /etc/grafana/provisioning/datasources/ 2>/dev/null || true"
-  fi
-
-  local tmp=/tmp/grafana.tar.gz
-  fetch_tarball "https://dl.grafana.com/oss/release/grafana-${GRAFANA_VERSION}.linux-amd64.tar.gz" "$tmp"
-  run tar xzf "$tmp" -C /tmp
-  run rm -rf /opt/grafana
-  run mv "/tmp/grafana-v${GRAFANA_VERSION}" /opt/grafana
-  run mkdir -p /var/lib/grafana/dashboards /var/log/grafana
-
-  # Dashboards are content, not config: refreshed from the repo each time.
-  # The provisioning *config* pointing at them is what must survive.
-  if [[ -d "$REPO_DIR/grafana/dashboards" ]]; then
-    run bash -c "cp '$REPO_DIR'/grafana/dashboards/*.json /var/lib/grafana/dashboards/ 2>/dev/null || true"
-    run bash -c "cp -r '$REPO_DIR'/grafana/provisioning/dashboards/* /etc/grafana/provisioning/dashboards/ 2>/dev/null || true"
-  fi
-
-  if [[ ! -f /etc/grafana/provisioning/datasources/switchboard.yml ]]; then
-    local prom_url loki_url
-    prom_url="$(ask '  Prometheus URL' 'http://127.0.0.1:9090')"
-    loki_url="$(ask '  Loki URL (blank to skip)' '')"
-    if [[ $DRY_RUN -eq 0 ]]; then
-      mkdir -p /etc/grafana/provisioning/datasources
-      {
-        echo "apiVersion: 1"
-        echo "datasources:"
-        echo "  - name: Prometheus"
-        echo "    type: prometheus"
-        echo "    access: proxy"
-        echo "    url: $prom_url"
-        echo "    isDefault: true"
-        if [[ -n "$loki_url" ]]; then
-          echo "  - name: Loki"
-          echo "    type: loki"
-          echo "    uid: loki"
-          echo "    access: proxy"
-          echo "    url: $loki_url"
-          echo "    jsonData:"
-          echo "      maxLines: 1000"
-        fi
-      } > /etc/grafana/provisioning/datasources/switchboard.yml
-      ok "wrote Grafana datasource provisioning (/etc/grafana)"
-    fi
-  fi
-
-  # Only ask for a password on a first install - on an update the unit
-  # already carries one, and re-prompting would silently reset it.
-  local gpass=""
-  if [[ ! -f /etc/systemd/system/grafana.service ]]; then
-    gpass="$(ask '  Grafana admin password' 'changeme')"
-  else
-    ok "grafana.service exists - keeping its existing admin password"
-  fi
-  run chown -R grafana:grafana /opt/grafana /var/lib/grafana /var/log/grafana /etc/grafana
-
-  if [[ $DRY_RUN -eq 0 && -n "$gpass" ]]; then
-    cat > /etc/systemd/system/grafana.service <<EOF
-[Unit]
-Description=Grafana
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=grafana
-Group=grafana
-Environment=GF_SECURITY_ADMIN_PASSWORD=$gpass
-Environment=GF_USERS_ALLOW_SIGN_UP=false
-ExecStart=/opt/grafana/bin/grafana server \\
-  --homepath=/opt/grafana \\
-  --configOverrides="cfg:default.paths.data=/var/lib/grafana cfg:default.paths.logs=/var/log/grafana cfg:default.paths.provisioning=/etc/grafana/provisioning"
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    ok "wrote /etc/systemd/system/grafana.service"
-  fi
-
-  enable_now grafana
-  wait_healthy grafana http://localhost:3000/api/health 30 || true
 }
 
 # ------------------------------------------------------------ exporter
@@ -1366,8 +1124,8 @@ install_syslog() {
   say ""
   say "  ${C_BOLD}Switchboard fast path.${C_RESET} Besides the archive in Loki, Vector POSTs"
   say "  every parsed event straight to Switchboard as it arrives, so an"
-  say "  interface down or a fan fault pages within a second instead of"
-  say "  waiting on polling and Alertmanager. The token is SYSLOG_INGEST_TOKEN"
+  say "  interface down or a fan fault becomes an event within a second instead of"
+  say "  waiting on Loki polling. The token is SYSLOG_INGEST_TOKEN"
   say "  from Switchboard's /etc/switchboard/webui.env. Leave the token blank"
   say "  to skip the fast path (Loki polling still works, just slower)."
   while :; do
@@ -1500,8 +1258,6 @@ install_module() {
   case "$1" in
     webui)        install_webui;;
     prometheus)   install_prometheus;;
-    alertmanager) install_alertmanager;;
-    grafana)      install_grafana;;
     exporter)     install_exporter;;
     sflow)        install_sflow;;
     syslog)       install_syslog;;
@@ -1533,37 +1289,13 @@ next_steps() {
         say "  3. systemctl restart switchboard-webui && curl -s localhost:8080/readyz"
         say ""
         say "  ${C_YELLOW}One database per deployment.${C_RESET} Two Switchboard instances sharing"
-        say "  one Postgres will fight over alarm state - each reconciles against"
-        say "  its own Alertmanager and closes what the other opened. Confirmed"
-        say "  live: that produced ~19,800 junk rows before it was noticed."
+        say "  one Postgres will double every SSH poll and every event."
         say "";;
       prometheus)
         say "${C_BOLD}prometheus${C_RESET}  http://$ip:9090"
         say "  - Targets: http://$ip:9090/targets (both jobs should read 'up')"
         say "  - Edit /opt/prometheus/prometheus.yml to correct any host:port,"
         say "    then: systemctl reload-or-restart prometheus"
-        if is_selected webui; then
-          say "  - Sharing $ALERT_RULES_FILE with the webui via the"
-          say "    $SHARED_GROUP group, so the Rules tab works with no NFS/CIFS."
-        else
-          say "  ${C_YELLOW}- webui is NOT on this host.${C_RESET} The Rules tab writes"
-          say "    $ALERT_RULES_FILE and calls /-/reload, so it needs that file"
-          say "    shared with wherever the webui runs - which means NFS/CIFS, or"
-          say "    moving them onto one host (the 'app' bundle) instead."
-        fi
-        say "";;
-      alertmanager)
-        say "${C_BOLD}alertmanager${C_RESET}  http://$ip:9093"
-        say "  - Check the webhook URL in /etc/alertmanager/alertmanager.yml"
-        say "    points at the webui host, or alarms will never reach it."
-        say "  - Put real Pushover/PagerDuty credentials in"
-        say "    /etc/alertmanager/secrets/ (chmod 600, owned by alertmanager)."
-        say "  - amtool check-config /etc/alertmanager/alertmanager.yml"
-        say "";;
-      grafana)
-        say "${C_BOLD}grafana${C_RESET}  http://$ip:3000"
-        say "  - Log in as admin with the password you set, then change it."
-        say "  - Dashboards are provisioned from /var/lib/grafana/dashboards."
         say "";;
       exporter)
         say "${C_BOLD}exporter${C_RESET}  http://$ip:9101/metrics"
@@ -1739,8 +1471,7 @@ Bundles:  app, monitoring, collector, ingest, all
 
 Examples:
   sudo $0                                  # interactive
-  sudo $0 --bundle app                     # webui + prometheus, no shared FS needed
-  sudo $0 --install alertmanager,grafana
+  sudo $0 --bundle app                     # webui + prometheus on one host
   sudo $0 --bundle collector               # sFlow collector on its own host
   sudo $0 --install syslog                 # Vector syslog receiver -> Loki
   sudo $0 --test-sflow                     # is anything sampling to us?
@@ -1795,10 +1526,6 @@ main() {
 
   say ""
   say "Selected: ${C_BOLD}${SELECTED[*]}${C_RESET}"
-  if is_selected prometheus && ! is_selected webui && [[ ! -d "$SB_HOME/app" ]]; then
-    warn "Prometheus without the webui on this host: the Rules tab needs the"
-    warn "alert-rules file shared between them (NFS/CIFS, or use --bundle app)."
-  fi
   confirm "Continue?" || die "aborted"
 
   local m

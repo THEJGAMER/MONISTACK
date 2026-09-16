@@ -26,7 +26,7 @@ import webhooks  # noqa: E402
 # --- signing --------------------------------------------------------
 
 def test_signature_round_trips():
-    body = b'{"event":"alarm.opened"}'
+    body = b'{"event":"event.raised"}'
     sig = webhooks.sign("s3cret", body)
 
     assert sig.startswith("sha256=")
@@ -169,7 +169,7 @@ def store():
 
 
 def test_the_secret_is_returned_once_and_never_listed(store):
-    row = store.create("n", "https://x/h", ["alarm.opened"], "admin")
+    row = store.create("n", "https://x/h", ["event.raised"], "admin")
 
     assert row["secret"]
     assert store.list()[0]["secret"] is None
@@ -185,27 +185,27 @@ def test_unknown_events_and_bad_urls_are_refused(store):
 
 def test_dispatcher_delivers_only_to_matching_enabled_hooks(store):
     a = store.create("all", "https://x/all", ["*"], "admin")
-    b = store.create("acks", "https://x/acks", ["alarm.acknowledged"], "admin")
+    b = store.create("acks", "https://x/acks", ["event.resolved"], "admin")
     c = store.create("off", "https://x/off", ["*"], "admin")
     store.update(c["id"], enabled=False)
     sent = []
     d = webhooks.WebhookDispatcher(store, deliver_fn=lambda url, secret, env: (sent.append((url, env["event"])), (200, None))[1])
 
-    d("alarm.opened", {"event": "alarm.opened"})
+    d("event.raised", {"event": "event.raised"})
 
-    assert sent == [("https://x/all", "alarm.opened")]
+    assert sent == [("https://x/all", "event.raised")]
 
 
 def test_dispatcher_records_the_outcome_on_the_row(store):
     h = store.create("n", "https://x/h", ["*"], "admin")
     d = webhooks.WebhookDispatcher(store, deliver_fn=lambda *a: (503, "HTTP 503"))
 
-    d("alarm.opened", {"event": "alarm.opened"})
-    d("alarm.opened", {"event": "alarm.opened"})
+    d("event.raised", {"event": "event.raised"})
+    d("event.raised", {"event": "event.raised"})
     row = store.get(h["id"])
     assert row["consecutive_failures"] == 2 and row["last_status"] == 503
 
-    webhooks.WebhookDispatcher(store, deliver_fn=lambda *a: (200, None))("alarm.opened", {"event": "alarm.opened"})
+    webhooks.WebhookDispatcher(store, deliver_fn=lambda *a: (200, None))("event.raised", {"event": "event.raised"})
     row = store.get(h["id"])
     assert row["consecutive_failures"] == 0 and row["last_error"] is None
 
@@ -218,7 +218,7 @@ def test_it_plugs_into_the_event_bus(store):
     bus.subscribe(d)
 
     bus.emit("command.ran", device="s4048", command="show version")
-    bus.emit("alarm.opened", occurrence={"id": 1})
+    bus.emit("event.raised", occurrence={"id": 1})
     bus.drain_now()
 
     assert [g["event"] for g in got] == ["command.ran"]

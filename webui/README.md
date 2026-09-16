@@ -170,11 +170,10 @@ frontend hides/disables the corresponding buttons too, but that's cosmetic
 - the server enforces independently either way, the same model this app
 already used for the comment-author-only delete rule.
 
-- **viewer** - read-only: browse devices, results, alarms, topology,
+- **viewer** - read-only: browse devices, results, events, topology,
   trends, syslog, compliance results.
 - **operator** - viewer, plus: run commands (`/api/run`, bulk run), device
-  connectivity test/status refresh, alarm actions (ack/unack/resolve/
-  comment/page-now/delay-page/narg), silence create/expire, schedule
+  connectivity test/status refresh, resolving events, event and rule settings, silence create/expire, schedule
   create/update/delete/run-now, save/delete results. Can delete their own
   comments, not anyone else's.
   - **admin** - operator, plus: device CRUD, `/api/settings` changes,
@@ -258,7 +257,7 @@ with backoff; 4xx (other than 429) does not. The last status and the
 consecutive-failure count sit on the row and are never auto-disabled - an
 integration that quietly switches itself off is worse than a red row.
 `GET /api/events` lists the event names; every emit in app.py goes through
-`events.py`'s bus, which is also what drives push paging.
+`events.py`'s bus, which is also what drives push notifications.
 
 Verify a delivery in Python:
 
@@ -268,42 +267,31 @@ expected = "sha256=" + hmac.new(secret.encode(), body_bytes, hashlib.sha256).hex
 hmac.compare_digest(expected, request.headers["X-Switchboard-Signature"])
 ```
 
-## Paging without a pager: the PWA
+## Push notifications for events: the PWA
 
 Switchboard installs as an app (manifest + service worker at root scope,
-`/sw.js`) and pages phones directly through Web Push - no Pushover or
-PagerDuty needed, though both still work via Alertmanager. On **My
-account → Paging on this device** a browser subscribes with its own
-severity floor and a "tell me on resolve" switch, and can send itself a
-test page. Notifications for critical alarms stay on screen until dealt
-with; a re-fire of the same alarm replaces its notification rather than
-stacking; and the notification carries an **Acknowledge** action that
-acks the occurrence using the browser's own session, straight from the
-lock screen.
+`/sw.js`) and notifies phones directly through Web Push - no Pushover or
+PagerDuty. On **My account → Notifications on this device** a browser
+subscribes with its own severity floor and a "tell me on resolve" switch,
+and can send itself a test. A raised event notifies with sound and a
+vibration pattern by severity (critical stays on screen until dismissed);
+the resolve reuses the same notification tag quietly, so it replaces the
+raise rather than piling up. Open tabs play a two-tone cadence per
+severity (toggle on My account). Enrolled devices are listed on My
+account (and, for every user, on Settings) and can be removed.
 
-It is a pager, not a notifier: a page **repeats** on each device at its
-own interval (default every 5 min, up to 12 times) until someone
-acknowledges - the repeat reuses the alarm's notification tag with
-`renotify`, so it re-alerts without piling up and says "[page 3] …
-unacknowledged for 15 min". One acknowledgement, from anywhere, sends a
-`close` push to every device that was paged, so the whole team's phones
-stop together. Enrolled devices are listed on My account (and, for every
-user, on Settings) and can be removed. Open tabs play a synthesised
-two-tone pager cadence per severity (toggle on My account); a closed app
-gets the OS sound and a vibration pattern. The page ledger (`push_pages`)
-is cleared on ack and resolve, and pruned every repeater pass against
-what is still open.
+There is no acknowledge and no repeat-until-acked: actioning an event is
+the ticketing system's job, and it gets the same events over webhooks.
 
 It needs HTTPS (push is a secure-context API) and, on iOS, a home-screen
 install. The VAPID key pair is generated once into `data/push_vapid.json`
 (0600); losing it invalidates every subscription, so back it up with the
-rest of `data/`. The VAPID subject is derived the way PROXMON does it: the https origin
-from `OIDC_REDIRECT_URI` (or `PUBLIC_URL`), else a `mailto:` on that
-hostname, never an IP or localhost - Apple rejects those.
+rest of `data/`. The VAPID subject is derived the way PROXMON does it: the
+https origin from `OIDC_REDIRECT_URI` (or `PUBLIC_URL`), else a `mailto:`
+on that hostname, never an IP or localhost - Apple rejects those.
 `PUSH_VAPID_SUBJECT` overrides it.
 
-Adapted from the PROXMON project's push implementation, then extended for
-paging as above.
+Adapted from the PROXMON project's push implementation.
 
 ## Deployment config: the Settings page, not just `.env`
 
@@ -374,79 +362,77 @@ in Saved Results / Recent results shows "Auto" vs "Manual" (the manual
 `POST /api/results` endpoint still exists, e.g. for scripted use, and rows
 it creates are flagged "Manual").
 
-## Alerting in under a second: the syslog fast path
+## Events: syslog first, SSH as the fallback
 
-PROXMON pages within about a second of a fault because its agent watches
-cheap signals and the server evaluates each report on arrival. A switch
-gives us the same signal for free: it logs a link change, a PSU fault or a
-protocol event to syslog the instant it happens. Until this shipped that
-line took the long way round - Vector, Loki, a 3-second poll, an
-Alertmanager POST, its dispatch, our own webhook, an occurrence, a page:
-several seconds on a good day and minutes when Loki was slow.
+Switchboard does event-driven monitoring, the way PROXMON does it for
+Proxmox: the device tells us something happened and it becomes an
+**event** - info, warning or critical - that stays open until it is over.
+No Alertmanager, no rules file, no pending windows: a switch logs a link
+change, a PSU fault or a protocol event to syslog the instant it happens,
+and that line *is* the signal.
 
-Now Vector's `switchboard_fast` sink (`syslog/vector.yaml`) POSTs every
-interpreted event to **`/api/ingest/syslog`** as it arrives (50 ms batch
-timeout, bearer token `SYSLOG_INGEST_TOKEN`), and Switchboard evaluates
-it on arrival with the same checkers the Loki poll feeds - interface
-down/up (`interface_alerting.process_events`), fan/PSU
-(`hardware_alerting.process_events`) and the **syslog rules** below. Each
-checker keeps a timestamp cursor, so the poll behind the fast path sees
-what it already handled as done; if the fast path goes quiet the poll is
-still there, a few seconds slower.
+**Detection, in order of speed**
 
-The second half is `fastpath.LocalFirstAlertmanager`: every alert this
-app raises goes through one `post_alerts`, and the wrapper opens the
-occurrence, marks it paged and (via the event bus) pushes to phones
-*before* forwarding to Alertmanager. Alertmanager still gets everything
-for its other receivers; it just no longer sits between a fault and a
-phone, and a page still goes out when it is down. An `endsAt` in the past
-closes the occurrence at once, so a link that came back up stops paging
-the moment the switch says so. Occurrences record `detected_via`
-(`syslog`, `loki`, `poll`, a person, or NULL for Alertmanager-learned)
-and `signal_at` (the device's own timestamp), and the alarm's detail
-panel shows "detected via syslog fast path, 0.4 s after the device logged
-it".
+1. **The syslog fast path.** Vector's `switchboard_fast` sink
+   (`syslog/vector.yaml`) POSTs every interpreted line to
+   `/api/ingest/syslog` as it arrives (50 ms batch timeout, bearer token
+   `SYSLOG_INGEST_TOKEN`) and `event_detect.SyslogDetector` evaluates it on
+   arrival: link down/up on **any** port, fan/PSU faults, temperature,
+   memory errors, restarts, config changes, STP topology changes, routing
+   neighbours, and the user's own syslog rules. Measured live: a line is
+   an event about 70 ms after it reaches the receiver.
+2. **The Loki poll**, engaged only while the fast path has been silent for
+   30 s. Same detector, same timestamp cursor, so the two paths are one
+   stream.
+3. **The SSH poll** (`status_poller.py`, `event_reconcile.SshReconciler`):
+   what syslog never said. Reconciled from the poller's cached state every
+   15 s, never an extra SSH round trip. Ports raise on a *transition the
+   reconciler observed* (up last poll, down now) - not on absolute state,
+   or every unused port would be an event at startup - except a port
+   someone classified on the Ports tab, which raises if it is down at
+   first sight. A resolve from the poll must postdate the event it would
+   close (a stale snapshot must not close a fresh outage). Fans and PSUs
+   are reconciled directly; consecutive failed polls raise
+   `device.unreachable`; CPU and memory thresholds hold for N polls.
+4. **Timers** close what nothing else can (a topology change after 5 min,
+   a self-test after 60 s, a rule after its auto-resolve), and a device
+   whose syslog goes quiet raises `device.syslog_silent`.
 
-**Syslog rules** (Alerts → Syslog rules) are PROXMON's kmsg fault regex
-for switches: match on the parsed facility and/or mnemonic and/or a
-pattern over the message, pick a severity, and say how the alarm ends - a
-clearing pattern, an auto-resolve timer, or both; one alarm per device or
-per device+interface. Five ship, all off except the self-test:
-spanning-tree topology change, routing neighbour lost, duplicate IP,
-configuration changed. The editor can paste a real line and see which
-rules fire or clear. Rule alarms carry `source=syslog-rule` and are
-heartbeated/reseeded like the other direct alerts.
+**The catalogue** (`event_catalog.py`, Events → Catalogue) lists every
+kind with a default severity, and a site sets its own per kind - `info`,
+`warning`, `critical` or `ignore` - plus thresholds where a kind has them
+(CPU %, memory %, polls, silence minutes). Link down additionally takes a
+per-port severity on the Ports tab. Groups: Ports, Environment, Compute,
+Device, Protocol, Syslog rules, Switchboard.
 
-**Send a test** on that tab is the honest number: it sends one syslog line
-to the receiver in Settings (`syslog_receiver`, Vector's listener), times
-it back through Vector into the ingest endpoint, into an alarm, and to
-the enrolled phones, then the test alarm resolves itself a minute later.
-The Settings health panel has a "Syslog fast path" row: not configured,
-configured-but-silent (the case that hides - the token is set but
-Vector's sink is not pointed here), or receiving with the Vector →
+**The store** (`eventstore.py`): one row per episode - raised once, bumped
+(`count`, `last_seen_at`) while the device keeps reporting it, resolved
+once, with `source` (syslog, loki, ssh, switchboard, timer, or a person),
+`signal_at` (the device's own timestamp) and `resolved_by`. A partial
+unique index keeps one open row per signature (kind + device + subject) so
+the syslog path and the SSH fallback land on the same event. The hooks
+that put `event.raised` / `event.resolved` on the bus fire exactly once
+per transition, in SQL, whichever path drove it - the lesson from the
+alarm era, where events emitted from call sites missed most real alarms.
+
+**Actioning is not here.** No acknowledgements, comments, holds or
+silences: a ticketing system consumes `event.raised` / `event.resolved`
+over webhooks (Settings → Webhooks) or reads `/api/events`, and does the
+rest. Resolving by hand on the Events page is a correction, not an
+action - if the condition is still true the device raises it again.
+
+**Send a test** (Events → Syslog rules & fast path) is the honest number:
+one syslog line to the receiver in Settings (`syslog_receiver`), timed
+back through Vector into the ingest endpoint, into an event, and to the
+enrolled phones. The Settings health panel has a "Syslog fast path" row:
+not configured, configured-but-silent (the case that hides - the token is
+set but Vector's sink is not pointed here), or receiving with the Vector →
 Switchboard latency.
 
 Set-up: `install-stack.sh --install webui` generates
 `SYSLOG_INGEST_TOKEN`; `--install syslog` asks for the Switchboard URL and
-that token and POSTs a test event before deploying anything (the same
-"test the connection before it goes live" discipline as the Loki
-endpoint). No token = no sink, and everything still works through Loki.
-
-## Alarm lifecycle events come from the occurrence store
-
-`alarm.opened` (an occurrence exists - the alarm is pending or firing,
-possibly inside its paging hold), `alarm.paged` (it went to the pager:
-the hold lapsed or there was none - **this** is what pages phones) and
-`alarm.resolved` are emitted by `OccurrenceStore`'s own transitions, not
-by whichever code path happened to drive them. Confirmed live before the
-change: `alarm.opened` was emitted only by the Alertmanager webhook, but
-the 3-second sync tick opens nearly every real occurrence first, so real
-alarms produced no event, no page and no webhook call; and the stale
-sweep closed occurrences without ever emitting `alarm.resolved`, leaving
-the pager ledger behind. Each hook fires exactly once per transition -
-decided in SQL (`INSERT … RETURNING` under the partial unique index, an
-`UPDATE … FOR UPDATE` returning the previous `paged_at`, `UPDATE … WHERE
-resolved_at IS NULL`) - even when the webhook and the tick race.
+that token and POSTs a test event before deploying anything. No token = no
+sink, and detection falls back to the Loki poll and SSH.
 
 ## Syslog: read live from Loki, not re-derived
 
@@ -618,7 +604,7 @@ DOM.
 ## Console: dynamic board layout
 
 All nine sections of the Console page (Devices, Device summary, Commands,
-Output, Recent results, Syslog, Alarm History, Front Panel, Switch Status)
+Output, Recent results, Syslog, Events, Front Panel, Switch Status)
 render simultaneously as a Cloudscape `Board` - the drag/resize/auto-reflow
 dashboard system AWS Console uses for CloudWatch dashboards - instead of
 the fixed sidebar + `Tabs` layout this replaced. Every panel has a drag
@@ -689,7 +675,7 @@ empty Commands panel rather than guessing at syntax.
 
 **Known gaps for the Juniper device specifically** (a deliberate scope
 decision, not an oversight): it has no remote syslog configured, so its
-Syslog and Alarm History tabs are empty - Switch Status instead shows
+Syslog tab is empty - Switch Status instead shows
 live alarms straight from `show chassis alarms`/`show system alarms`
 polling. Per-port transceiver diagnostics aren't polled automatically
 (no slow-cadence Junos equivalent to Dell's transceiver poll yet), though
@@ -713,7 +699,7 @@ integrated with Front Panel (a firewall appliance, not a switch chassis -
 faking one would violate this app's own rule against fabricating hardware
 layouts) or Topology/LLDP (it isn't part of the LLDP-discovered switch
 fabric, so `/api/topology` skips it entirely rather than showing it as a
-permanently-isolated node) or Syslog/Alarm History (no remote syslog
+permanently-isolated node) or Syslog (no remote syslog
 configured for it yet, same deliberate gap as the Juniper device).
 
 ## Layout

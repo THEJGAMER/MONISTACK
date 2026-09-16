@@ -54,9 +54,4 @@ command_run_duration_seconds = Histogram(
 # placeholder receiver docstring for why this exists instead of a real
 # Slack/email/PagerDuty destination. Counting them (rather than just
 # logging) makes "is alerting actually flowing end to end" itself
-# observable from this same /metrics endpoint.
-alertmanager_notifications_total = Counter(
-    "switchboard_alertmanager_notifications_total",
-    "Alertmanager webhook notifications received",
-    ["alertname", "status"],
-)
+

@@ -86,147 +86,61 @@ CREATE TABLE IF NOT EXISTS compliance_config (
     data TEXT NOT NULL
 );
 
--- Prometheus alert rule definitions (ROADMAP 3.2's Rules tab) - Postgres
--- is the source of truth; prometheus/alerts.yml is a generated file
--- (see alert_rules.py) kept only because Prometheus itself needs an
--- actual file on disk to load rules from. `expr`/`for_seconds` are
--- seeded from the rules verified live in the original alerting work and
--- deliberately NOT editable from the UI (a PromQL typo has no
--- pre-flight validation) - only `severity` (drives Pushover priority
--- via alertmanager.yml's template) and `enabled` are.
-CREATE TABLE IF NOT EXISTS alert_rules (
-    name TEXT PRIMARY KEY,
-    expr TEXT NOT NULL,
-    for_seconds INTEGER NOT NULL DEFAULT 0,
-    severity TEXT NOT NULL,
-    summary_template TEXT NOT NULL,
-    description_template TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    updated_at TEXT NOT NULL
-);
--- Added after alert_rules already shipped (same catch-up pattern as
--- interface_alert_rules.severity above) - how long this specific rule's
--- alarms are held before paging (see paging.py), overriding the app-wide
--- PAGE_DELAY_SECONDS default. NULL means "use the app-wide default", not
--- "page instantly" - a rule that has never had this touched should not
--- silently start paging immediately once the column exists.
-ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS page_delay_seconds INTEGER;
 
--- Per-interface down-alerting config (ROADMAP 3.2's Interfaces tab) -
--- unlike prometheus/alerts.yml's fleet-wide rules, this is genuinely
--- per-(device,port): which specific interfaces should alert at all (most
--- ports are legitimately unused/down and shouldn't), and whether a
--- down transition alerts immediately or only after staying down for
--- `delay_seconds` (checked, not just slept - see interface_alerting.py).
--- Evaluated by a Switchboard-side loop (reusing status_poller.py's
--- already-polled interface state, no extra SSH) that posts straight to
--- Alertmanager's /api/v2/alerts, rather than being expressed as
--- PromQL - a dynamic per-port rule set isn't something Prometheus rule
--- files are a good fit for.
-CREATE TABLE IF NOT EXISTS interface_alert_rules (
-    device_id TEXT NOT NULL,
-    port TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 0,
-    mode TEXT NOT NULL DEFAULT 'immediate',
-    delay_seconds INTEGER NOT NULL DEFAULT 60,
-    severity TEXT NOT NULL DEFAULT 'warning',
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (device_id, port)
-);
--- severity was added after interface_alert_rules already shipped - this
--- table predates it on any deployment that ran the earlier migration, so
--- CREATE TABLE IF NOT EXISTS above is a no-op there and this catches it up.
-ALTER TABLE interface_alert_rules ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'warning';
 
--- Alert history (ROADMAP 3.2's History tab) - every notification
--- Alertmanager sends its webhook receiver (app.py's
--- /api/alertmanager/webhook) gets persisted here, covering both
--- Prometheus-rule-based alerts (prometheus/alerts.yml) and the
--- directly-posted per-interface alerts (interface_alerting.py) - both
--- route through the same Alertmanager receiver, so this one table is a
--- complete history regardless of which of the two alerting paths raised
--- it. Alertmanager's own /api/v2/alerts only shows currently-active (or
--- very recently resolved) alerts, not history - this is what makes past
--- alerts queryable after they've resolved and aged out there.
-CREATE TABLE IF NOT EXISTS alert_history (
-    id BIGSERIAL PRIMARY KEY,
-    alertname TEXT NOT NULL,
-    status TEXT NOT NULL,
-    severity TEXT,
-    summary TEXT,
-    labels TEXT NOT NULL,
-    received_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_alert_history_received ON alert_history(received_at DESC);
--- Added after alert_history already shipped (same catch-up pattern as
--- interface_alert_rules.severity above). Lets a history row be correlated
--- with the acknowledgement/audit records for the same alert identity,
--- which are keyed by fingerprint rather than by the (mutable) summary text.
-ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS fingerprint TEXT;
-CREATE INDEX IF NOT EXISTS idx_alert_history_fingerprint ON alert_history(fingerprint);
 
--- One row per *occurrence* of an alarm: a single fired-to-resolved
--- episode, with its own id. This is the unit everything else hangs off,
--- and the reason is record-keeping: if a port flaps four times, that is
--- four separate things that happened, each with its own acknowledgement,
--- its own discussion and its own audit trail. Collapsing them into one
--- long-lived row per alarm signature loses that separation - you can no
--- longer say who handled the second occurrence versus the fourth.
---
--- `signature` is the label-set fingerprint (alert_acks.fingerprint_for).
--- It deliberately does NOT identify the occurrence; it groups occurrences
--- of the same underlying alarm so a new one can link back to its
--- predecessors, the way a ticketing system opens a fresh ticket and
--- references the previous ones rather than reopening a closed one.
---
--- Rows are created and closed from the Alertmanager webhook
--- (app.py's /api/alertmanager/webhook), which every alert path in this
--- app already funnels through - both Prometheus rules and the
--- directly-posted per-interface alerts.
-CREATE TABLE IF NOT EXISTS alert_occurrences (
-    id BIGSERIAL PRIMARY KEY,
-    signature TEXT NOT NULL,
-    alertname TEXT NOT NULL,
-    severity TEXT,
-    summary TEXT,
-    labels TEXT NOT NULL,
-    started_at TEXT NOT NULL,
-    resolved_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_occurrences_signature ON alert_occurrences(signature, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_occurrences_started ON alert_occurrences(started_at DESC);
--- At most one open occurrence per signature: a second "firing" for an
--- alarm that is already open is the same episode being re-notified
--- (Alertmanager repeat_interval, or this app's own heartbeat), not a new
--- one. Enforced in the database rather than only in code, because the
--- webhook can be delivered concurrently.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_occurrences_one_open
-    ON alert_occurrences(signature) WHERE resolved_at IS NULL;
 
--- Paging control (see paging.py). An alarm is held back from paging for a
--- short investigation window rather than paging the instant it fires:
---   page_at         when the hold lifts and it pages (NULL = already paged)
---   paged_at        when it actually paged
---   paging_disabled operator turned paging off for this occurrence (NARG)
---   silence_id      the Alertmanager silence currently holding it back
--- The hold is an Alertmanager silence, not a Switchboard-side queue, so
--- Alertmanager remains the thing that actually delivers pages: if
--- Switchboard is down, no hold gets created and the alarm pages
--- immediately. The failure mode is "pages sooner than you wanted", never
--- "never pages", which is the right way round for a pager.
-ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS page_at TEXT;
-ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS paged_at TEXT;
-ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS paging_disabled INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS silence_id TEXT;
--- How the alarm was detected (syslog fast path, loki poll, ssh poll, a
--- person; NULL = learned from Alertmanager) and when the device logged
--- the signal that raised it - the numbers behind "paged 0.4s after".
-ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS detected_via TEXT;
-ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS signal_at TEXT;
 
 -- Syslog rules: alarms raised straight from what a device logs (see
 -- webui/syslog_alerting.py). `key` marks the shipped defaults so the
 -- self-test rule can be put back if deleted; `builtin` rows cannot be.
+-- Events (webui/eventstore.py): one row per episode of something noticed
+-- - raised, bumped while it keeps being reported, resolved once. The
+-- partial unique index keeps one open row per signature (kind + device +
+-- subject) so the syslog path and the SSH fallback land on the same event.
+CREATE TABLE IF NOT EXISTS events (
+    id BIGSERIAL PRIMARY KEY,
+    signature TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    device_id TEXT,
+    device TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    detail TEXT,
+    labels TEXT NOT NULL DEFAULT '{}',
+    source TEXT NOT NULL,
+    signal_at TEXT,
+    raised_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    count INTEGER NOT NULL DEFAULT 1,
+    resolved_at TIMESTAMPTZ,
+    resolved_by TEXT,
+    resolve_detail TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_one_open ON events(signature) WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_events_raised ON events(raised_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id, raised_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, raised_at DESC);
+
+-- Per-site severity (and thresholds) for each event kind in the
+-- catalogue (webui/event_catalog.py); absent = the catalogue default.
+CREATE TABLE IF NOT EXISTS event_settings (
+    kind TEXT PRIMARY KEY,
+    severity TEXT NOT NULL,
+    params TEXT NOT NULL DEFAULT '{}',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Per-port link-down severity; absent = the port.link_down setting,
+-- 'ignore' = never raise for this port.
+CREATE TABLE IF NOT EXISTS port_settings (
+    device_id TEXT NOT NULL,
+    port TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    PRIMARY KEY (device_id, port)
+);
+
 CREATE TABLE IF NOT EXISTS syslog_alert_rules (
     id BIGSERIAL PRIMARY KEY,
     key TEXT UNIQUE,
@@ -244,17 +158,6 @@ CREATE TABLE IF NOT EXISTS syslog_alert_rules (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Acknowledgement of a single occurrence (not of the alarm in general):
--- acknowledging today's flap says nothing about tomorrow's, which is the
--- whole point of keeping occurrences separate. Deliberately NOT a
--- silence - the alarm keeps firing and still notifies on state changes;
--- an ack only records that a human has taken it.
-CREATE TABLE IF NOT EXISTS alarm_acks (
-    occurrence_id BIGINT PRIMARY KEY REFERENCES alert_occurrences(id) ON DELETE CASCADE,
-    acked_by TEXT NOT NULL,
-    acked_at TEXT NOT NULL,
-    note TEXT
-);
 
 -- Audit/event log: every operator-initiated mutation in the app (alert
 -- ack/unack/manual resolve, silence create/expire, alert-rule and
@@ -280,23 +183,6 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts DESC);
 ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS fingerprint TEXT;
 CREATE INDEX IF NOT EXISTS idx_audit_log_fingerprint ON audit_log(fingerprint);
 
--- Discussion thread on a single alarm (the Communication tab) - the
--- human back-and-forth while an incident is being worked, kept separate
--- from audit_log on purpose. audit_log answers "who changed what, and
--- can I trust this record" and is append-only; this is conversation,
--- where being able to delete your own typo is normal and expected.
--- Mixing them would mean either an audit trail with holes in it or a
--- discussion nobody can correct. Keyed by fingerprint (see alert_acks.py)
--- so a thread follows one specific alarm across every recurrence, which
--- is what makes a shared link to it useful to a colleague.
-CREATE TABLE IF NOT EXISTS alarm_comments (
-    id BIGSERIAL PRIMARY KEY,
-    occurrence_id BIGINT NOT NULL REFERENCES alert_occurrences(id) ON DELETE CASCADE,
-    author TEXT NOT NULL,
-    body TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_alarm_comments_occurrence ON alarm_comments(occurrence_id, created_at);
 
 -- Ties an audit entry to the specific occurrence it was about, so one
 -- occurrence's operator history can be pulled without dragging in every
@@ -533,22 +419,7 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     failures INTEGER NOT NULL DEFAULT 0,
     last_error TEXT
 );
--- Pager behaviour per device: re-page every `repeat_minutes` while the
--- alarm is open and unacknowledged (0 = once only), up to `max_repeats`.
-ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS repeat_minutes INTEGER NOT NULL DEFAULT 5;
-ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS max_repeats INTEGER NOT NULL DEFAULT 12;
 
--- Which device has been paged how many times for which alarm. This is what
--- lets a repeat know it is a repeat, an ack close the page on every other
--- device, and a cap stop a forgotten alarm paging forever.
-CREATE TABLE IF NOT EXISTS push_pages (
-    occurrence_id BIGINT NOT NULL,
-    endpoint TEXT NOT NULL,
-    count INTEGER NOT NULL DEFAULT 1,
-    first_paged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_paged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (occurrence_id, endpoint)
-);
 
 -- sFlow reports interfaces as SNMP ifIndex integers, which mean nothing to
 -- a human. Dell OS9 encodes them arithmetically (verified against the real
@@ -568,28 +439,6 @@ CREATE TABLE IF NOT EXISTS sflow_ifindex (
     PRIMARY KEY (device_id, ifindex)
 );
 
--- Last time *any* Switchboard instance observed this occurrence's alarm
--- actually active (firing in Alertmanager, or pending in Prometheus).
---
--- Exists because occurrence closing used to be absence-based: "anything
--- open that I can't currently see firing is over". That is only correct
--- if this process has a complete view, and it silently isn't in two real
--- cases. The one found live: two Switchboard instances sharing this
--- database (a dev stack and a deployed one, confirmed via
--- pg_stat_activity - two distinct client_addr, the second connected
--- continuously since 2026-08-02) each reconcile against their *own*
--- Alertmanager, so each kept closing occurrences the other had just
--- opened, which the other immediately reopened. That ping-pong produced
--- ~19,800 junk occurrence rows for a single continuously-down device.
--- The second case needs no second instance at all: a brief Alertmanager
--- or Prometheus blip empties the local view for one tick and closes every
--- open alarm spuriously.
---
--- With this column, closing becomes evidence-based - an occurrence is
--- only closed once nobody has seen it active for a grace period - so a
--- partial or momentarily-empty view can no longer end an alarm that is
--- still really happening.
-ALTER TABLE alert_occurrences ADD COLUMN IF NOT EXISTS last_seen_at TEXT;
 """
 
 

@@ -35,40 +35,28 @@ def test_vapid_keys_are_generated_once_and_reloaded(tmp_path):
 
 # --- payloads -------------------------------------------------------
 
-def _env(event, **occ):
-    return {"event": event, "occurrence": {"id": 7, "alertname": "FanFailure", "severity": "critical",
-                                            "summary": "Fan tray 2 down", "device": "s4048",
-                                            "paged_at": "2026-09-15T10:00:00+00:00", **occ}}
+def _env(event, **ev):
+    data = {"id": 7, "kind": "port.link_down", "kind_name": "Link down", "severity": "critical", "device": "S4048",
+            "subject": "Te 1/47", "title": "Link down: Te 1/47 on S4048", "detail": "SNMP_TRAP_LINK_DOWN ...", **ev}
+    return {"event": event, "event_data": data}
 
 
-def test_a_paged_alarm_pages_with_an_acknowledge_action():
-    p = push.payload_for("alarm.paged", _env("alarm.paged"))
-
-    assert p["title"].startswith("CRITICAL: FanFailure")
-    assert "s4048" in p["title"]
-    assert p["url"] == "/#/alarms/7"
-    assert p["tag"] == "switchboard-alarm-7", "same alarm re-firing replaces its notification"
-    assert [a["action"] for a in p["actions"]] == ["ack", "open"]
+def test_a_raised_event_is_a_notification():
+    p = push.payload_for("event.raised", _env("event.raised"))
+    assert p["title"] == "CRITICAL: Link down: Te 1/47 on S4048"
+    assert p["url"] == "/#/events/7" and p["tag"] == "switchboard-event-7"
+    assert [a["action"] for a in p["actions"]] == ["open"], "no acknowledge: actioning is the ticketing system's"
 
 
-def test_a_resolved_alarm_says_so_and_has_no_ack():
-    p = push.payload_for("alarm.resolved", _env("alarm.resolved"))
-
-    assert p["title"].startswith("Resolved: FanFailure")
-    assert p["severity"] == "ok"
-    assert [a["action"] for a in p["actions"]] == ["open"]
+def test_a_resolved_event_replaces_it_quietly():
+    p = push.payload_for("event.resolved", _env("event.resolved", resolved_by="ssh", resolve_detail="port up"))
+    assert p["title"].startswith("Resolved: Link down") and p["severity"] == "ok" and p["quiet"] is True
+    assert p["tag"] == "switchboard-event-7" and p["body"] == "Resolved by ssh: port up"
 
 
-def test_other_events_are_not_pages():
+def test_other_bus_events_are_not_notifications():
     assert push.payload_for("command.ran", {"event": "command.ran"}) is None
-    assert push.payload_for("alarm.commented", _env("alarm.commented")) is None
-
-
-def test_an_opened_occurrence_is_not_yet_a_page():
-    """Opened means pending, or firing but held. The phone goes off on
-    alarm.paged - when the hold lapses - not before, or the paging hold
-    would delay Alertmanager's receivers only."""
-    assert push.payload_for("alarm.opened", _env("alarm.opened")) is None
+    assert push.payload_for("event.raised", {"event": "event.raised"}) is None
 
 
 # --- store + notifier against a real Postgres --------------------------
@@ -82,12 +70,7 @@ CREATE TABLE push_subscriptions (
     endpoint TEXT PRIMARY KEY, subscription TEXT NOT NULL, username TEXT NOT NULL, label TEXT,
     min_severity TEXT NOT NULL DEFAULT 'warning', notify_resolved INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_used_at TIMESTAMPTZ,
-    failures INTEGER NOT NULL DEFAULT 0, last_error TEXT,
-    repeat_minutes INTEGER NOT NULL DEFAULT 5, max_repeats INTEGER NOT NULL DEFAULT 12);
-CREATE TABLE push_pages (
-    occurrence_id BIGINT NOT NULL, endpoint TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 1,
-    first_paged_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_paged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (occurrence_id, endpoint));
+    failures INTEGER NOT NULL DEFAULT 0, last_error TEXT);
 """
 
 
@@ -160,26 +143,36 @@ def test_a_non_subscription_is_refused(store):
         store.upsert(_sub("https://push/1"), "jacob", min_severity="loud")
 
 
-def test_severity_floor_and_resolve_flag_decide_who_is_paged(store):
+def test_severity_floor_and_resolve_flag_decide_who_is_told(store):
     store.upsert(_sub("https://push/crit-only"), "a", min_severity="critical", notify_resolved=False)
     store.upsert(_sub("https://push/all"), "b", min_severity="info", notify_resolved=True)
     sent = []
     n = push.PushNotifier(store, _Keys(), send_fn=lambda sub, payload: (sent.append((sub["endpoint"], payload["title"])), (True, None, False))[1])
 
-    n("alarm.paged", _env("alarm.paged", severity="warning"))
-    n("alarm.paged", _env("alarm.paged", severity="critical"))
-    n("alarm.resolved", _env("alarm.resolved"))
+    n("event.raised", _env("event.raised", severity="warning"))
+    n("event.raised", _env("event.raised", severity="critical"))
+    n("event.resolved", _env("event.resolved", severity="critical"))
 
     endpoints = [e for e, _ in sent]
     assert endpoints.count("https://push/crit-only") == 1, "critical only, and never a resolve"
     assert endpoints.count("https://push/all") == 3
 
 
+def test_a_resolve_is_only_told_to_devices_that_would_have_heard_the_raise(store):
+    store.upsert(_sub("https://push/crit"), "a", min_severity="critical", notify_resolved=True)
+    sent = []
+    n = push.PushNotifier(store, _Keys(), send_fn=lambda sub, payload: (sent.append(payload["title"]), (True, None, False))[1])
+
+    n("event.resolved", _env("event.resolved", severity="warning"))
+
+    assert sent == []
+
+
 def test_a_subscription_the_service_says_is_gone_is_pruned(store):
     store.upsert(_sub("https://push/dead"), "a", min_severity="info")
     n = push.PushNotifier(store, _Keys(), send_fn=lambda sub, payload: (False, "410 Gone", True))
 
-    n("alarm.paged", _env("alarm.paged"))
+    n("event.raised", _env("event.raised"))
 
     assert store.list() == []
 
@@ -188,8 +181,8 @@ def test_other_failures_are_counted_not_pruned(store):
     store.upsert(_sub("https://push/flaky"), "a", min_severity="info")
     n = push.PushNotifier(store, _Keys(), send_fn=lambda sub, payload: (False, "timeout", False))
 
-    n("alarm.paged", _env("alarm.paged"))
-    n("alarm.paged", _env("alarm.paged"))
+    n("event.raised", _env("event.raised"))
+    n("event.raised", _env("event.raised"))
 
     row = store.list()[0]
     assert row["failures"] == 2 and row["last_error"] == "timeout"
@@ -201,22 +194,11 @@ def test_nothing_is_sent_when_keys_are_unavailable(store):
     sent = []
     n = push.PushNotifier(store, keys, send_fn=lambda *a: (sent.append(1), (True, None, False))[1])
 
-    n("alarm.paged", _env("alarm.paged"))
+    n("event.raised", _env("event.raised"))
 
     assert sent == []
 
 
-def test_a_resolve_for_an_alarm_that_never_paged_is_silent(store):
-    """A pending-only occurrence that cleared, or one that recovered inside
-    its hold, paged nobody - so "Resolved" would be the first anyone heard
-    of it. Confirmed live: 51969 resolved without ever paging."""
-    store.upsert(_sub("https://push/all"), "b", min_severity="info", notify_resolved=True)
-    sent = []
-    n = push.PushNotifier(store, _Keys(), send_fn=lambda sub, payload: (sent.append(payload["title"]), (True, None, False))[1])
-
-    n("alarm.resolved", _env("alarm.resolved", paged_at=None))
-
-    assert sent == []
 
 
 # --- the VAPID subject (PROXMON's defaultSubject, ported) ---------------

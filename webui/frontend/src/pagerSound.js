@@ -73,14 +73,14 @@ export function playPagerTone(severity = "warning") {
 
 // Wire once from the app root: every push the service worker receives is
 // posted here; play the tone unless the user turned it off or the push is
-// the "acknowledged elsewhere" close (that one should be quiet).
+// a resolve (those are quiet).
 export function listenForPages(onPage) {
   if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return () => {};
   const handler = (e) => {
     const msg = e.data || {};
     if (msg.type !== "switchboard-page") return;
     const payload = msg.payload || {};
-    if (!payload.close && isPagerSoundEnabled()) playPagerTone(payload.severity);
+    if (!payload.quiet && isPagerSoundEnabled()) playPagerTone(payload.severity);
     if (onPage) onPage(payload);
   };
   navigator.serviceWorker.addEventListener("message", handler);

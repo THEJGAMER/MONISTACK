@@ -19,7 +19,7 @@ import CopyToClipboard from "@cloudscape-design/components/copy-to-clipboard";
 import {
   getSettings, updateSettings, getSettingsHealth,
   listApiTokens, createApiToken, revokeApiToken,
-  listEvents, listWebhooks, createWebhook, updateWebhook, deleteWebhook, testWebhook,
+  listWebhookEvents, listWebhooks, createWebhook, updateWebhook, deleteWebhook, testWebhook,
   listPushSubscriptions, unsubscribePush,
 } from "./api.js";
 import { useHasRole } from "./AuthContext.jsx";
@@ -32,24 +32,16 @@ const SERVICE_FIELDS = [
     placeholder: "http://loki-host:3100",
   },
   {
-    key: "alertmanager_url",
-    label: "Alertmanager URL",
-    description:
-      "Where alarms are posted and paging holds (silences) are created. Wrong here means alerts fire into nothing.",
-    placeholder: "http://alertmanager-host:9093",
-  },
-  {
     key: "prometheus_url",
     label: "Prometheus URL",
-    description: "Read for pending-rule state on the Alerts page.",
+    description: "The metrics store the exporter feeds. Only used for the health check below.",
     placeholder: "http://prometheus-host:9090",
   },
   {
-    key: "prometheus_reload_url",
-    label: "Prometheus reload URL",
-    description:
-      "Called after the Rules tab writes alerts.yml. Leave blank to derive it from the Prometheus URL above.",
-    placeholder: "(derived from Prometheus URL)",
+    key: "exporter_url",
+    label: "Exporter URL",
+    description: "Only used for the health check below - Prometheus scrapes the exporter directly, not the webui.",
+    placeholder: "http://exporter-host:9101",
   },
   {
     key: "sflow_collector",
@@ -64,13 +56,6 @@ const SERVICE_FIELDS = [
     description:
       "Where the devices send syslog (Vector), as host:port. Only the fast-path self-test on the Alerts page uses it: it sends one line there and times it back through Vector into Switchboard.",
     placeholder: "192.168.0.144:514",
-  },
-  {
-    key: "exporter_url",
-    label: "Exporter URL",
-    description:
-      "Only used for the health check below - Prometheus scrapes the exporter directly, not the webui.",
-    placeholder: "http://exporter-host:9101",
   },
 ];
 
@@ -215,7 +200,7 @@ function WebhooksSection({ pushFlash }) {
 
   const load = useCallback(async () => {
     try {
-      const [h, ev] = await Promise.all([listWebhooks(), listEvents()]);
+      const [h, ev] = await Promise.all([listWebhooks(), listWebhookEvents()]);
       setHooks(h);
       setEventOptions(ev.map((e) => ({ label: e.name, value: e.name, description: e.description })));
     } catch (e) {

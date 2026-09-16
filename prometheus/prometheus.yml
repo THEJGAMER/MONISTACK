@@ -12,14 +12,6 @@ global:
   # guess from documentation.
   evaluation_interval: 15s
 
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: ["alertmanager:9093"]
-
-rule_files:
-  - /etc/prometheus/alerts.yml
-
 scrape_configs:
   - job_name: s4048
     # 10s, down from the global 30s default (2026-08-02, same investigation

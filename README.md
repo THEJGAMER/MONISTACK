@@ -3,14 +3,16 @@
 Monitors Dell EMC OS9 switches (started with one S4048-ON at
 `192.168.4.106`, now any number of them registered through the webui's
 Devices page) purely over SSH `show` commands instead of SNMP. Stack: a
-custom Python exporter (Prometheus format) + Prometheus + Grafana, all run
-via Docker Compose.
+custom Python exporter (Prometheus format) + Prometheus for metrics, and
+Switchboard for everything a person looks at - including event-driven
+monitoring from syslog (with SSH as the fallback), which replaced the
+Prometheus/Alertmanager alerting on 2026-09-16.
 
 There's a second, complementary piece: [syslog/](syslog/README.md) — the
 switch also sends syslog to an LXC (`192.168.0.144`), where Vector parses it
 into structured events (interface link-state changes, auth events, etc.).
-That's what makes "interface goes down" show up immediately instead of
-waiting on the next 30s poll.
+Vector also POSTs each parsed line straight to Switchboard, which turns
+it into an event within about 70 ms - see webui/README.md "Events".
 
 A third piece, [webui/](webui/README.md) — **Switchboard** — is a web app,
 built with the real Cloudscape design system (what AWS Console itself uses,
@@ -81,8 +83,8 @@ exposed" below).
 
 This repo supports two ways to run the exporter itself:
 
-1. **Directly on an LXC** (no Docker) — see [docs/deploy-lxc-exporter.md](docs/deploy-lxc-exporter.md) (or [Deploying on an LXC](#deploying-on-an-lxc) below for the other split options). Point the `prometheus/prometheus.yml` `targets` at the LXC's IP:9101, and still run Prometheus/Grafana via Docker Compose (or however you already run them) elsewhere.
-2. **Everything in Docker Compose** (exporter + Prometheus + Grafana bundled) — the original all-in-one path, described right here.
+1. **Directly on an LXC** (no Docker) — see [docs/deploy-lxc-exporter.md](docs/deploy-lxc-exporter.md) (or [Deploying on an LXC](#deploying-on-an-lxc) below for the other split options). Point the `prometheus/prometheus.yml` `targets` at the LXC's IP:9101, and still run Prometheus via Docker Compose (or however you already run it) elsewhere.
+2. **Everything in Docker Compose** (exporter + Prometheus + webui bundled) — the all-in-one path, described right here.
 
 ### Docker Compose (all-in-one)
 
@@ -92,7 +94,6 @@ docker compose up -d --build
 
 - Exporter metrics: http://localhost:9101/metrics
 - Prometheus: http://localhost:9090
-- Grafana: http://localhost:3000 (admin / value of `GRAFANA_ADMIN_PASSWORD` in `.env`, default `admin`)
   - Dashboard "Dell S4048-ON (SSH polled)" is auto-provisioned.
 
 Credentials live in `.env` (gitignored, not committed). `.env.example` shows
@@ -103,7 +104,7 @@ the shape.
 Every metric below carries a `device_id` label too (the same id shown in
 the webui's Devices page) - omitted from the list for brevity. Metric
 *names* still say `s4048_*` even though this can now poll more than one
-switch - renaming them would break every existing Grafana dashboard and
+switch - renaming them would break every existing dashboard and
 Prometheus alert rule, which is a separate, bigger change than adding a
 label was.
 
@@ -174,19 +175,17 @@ sudo ./packaging/install-stack.sh --bundle app # webui + Prometheus on this host
 sudo ./packaging/install-stack.sh --update     # after a git pull
 ```
 
-Bundles exist for a practical reason rather than convenience. The webui's
-Rules tab writes Prometheus's alert-rules file and then calls Prometheus's
-`/-/reload`, so both processes must see the **same file**. Split across
-machines that needs NFS/CIFS/SMB; co-located it's just a path on disk
-shared through a Unix group - which is what `--bundle app` sets up.
+Bundles are convenient groupings, nothing more: `app` is the webui and
+Prometheus on one host, `monitoring` is Prometheus and the exporter,
+`collector` the sFlow collector, `ingest` sFlow and syslog receivers.
 
 | Bundle | Modules | For |
 |---|---|---|
 | `app` | webui + prometheus | The pairing that avoids needing a shared filesystem |
-| `monitoring` | prometheus + alertmanager + grafana | The metrics/alerting side, no webui |
+| `monitoring` | prometheus + exporter | The metrics side, no webui |
 | `all` | everything | One-host install |
 
-Individual modules: `webui`, `prometheus`, `alertmanager`, `grafana`,
+Individual modules: `webui`, `prometheus`,
 `exporter`. It detects what's already present, only updates what's out of
 date, prints per-module next steps when it finishes, and has `--dry-run`.
 
@@ -198,8 +197,6 @@ replaces wholesale:
 |---|---|---|
 | webui | `/etc/switchboard/webui.env` | untouched |
 | prometheus | `/etc/prometheus/prometheus.yml` | untouched |
-| alertmanager | `/etc/alertmanager/` incl. `secrets/` | untouched |
-| grafana | `/etc/grafana/provisioning/` + admin password in the unit | untouched |
 | exporter | `/etc/s4048-exporter/exporter.env` | untouched |
 
 Only the binaries, the Python app files, the frontend bundle and the
@@ -214,16 +211,15 @@ read them if you want to understand or customise any step.
 Five full walkthroughs, depending on what you need:
 
 - **[docs/deploy-lxc-docker.md](docs/deploy-lxc-docker.md)** — the whole
-  stack (webui + exporter + Prometheus + Alertmanager + Grafana) via
+  stack (webui + exporter + Prometheus) via
   `docker compose`, in one LXC.
 - **[docs/deploy-lxc-split.md](docs/deploy-lxc-split.md)** — the same five
   services, but each on its own LXC for maximum isolation - covers what
   breaks (compose's built-in service-name DNS) and how each piece is
   reconnected across real IPs instead.
 - **[docs/deploy-lxc-4lxcs.md](docs/deploy-lxc-4lxcs.md)** — a middle
-  ground: `webui` and `prometheus` share one LXC (they're coupled at the
-  filesystem level via the Rules tab's `alerts.yml`, so keeping them
-  together avoids needing NFS), the rest each get their own.
+  ground: `webui` and `prometheus` share one LXC, the rest each get their
+  own.
 - **[docs/deploy-lxc-4lxcs-native.md](docs/deploy-lxc-4lxcs-native.md)** —
   the same 4-LXC split, but with **no Docker anywhere**: every service as
   a real systemd unit, built/installed directly on the host. Every command
@@ -231,7 +227,7 @@ Five full walkthroughs, depending on what you need:
   not guessed from documentation.
 - **[docs/deploy-lxc-exporter.md](docs/deploy-lxc-exporter.md)** — just the
   exporter, native, no Docker, as a systemd service (`packaging/`) - for
-  when Prometheus/Grafana already exist elsewhere. Point them at
+  when Prometheus already exists elsewhere. Point it at
   `<lxc-ip>:9101`.
 
 Both install paths for the exporter-only route were smoke-tested against

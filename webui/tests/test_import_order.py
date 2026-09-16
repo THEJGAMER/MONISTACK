@@ -102,5 +102,5 @@ def test_the_syslog_poller_threads_are_actually_alive():
     and a NameError on their first line kills them within milliseconds."""
     import app  # noqa: F401
     names = {t.name for t in threading.enumerate()}
-    for wanted in ("interface-alert-syslog-checker", "hardware-alert-syslog-checker", "topology-refresh"):
+    for wanted in ("event-timers", "ssh-reconcile", "syslog-fallback", "topology-refresh"):
         assert wanted in names, f"thread {wanted} is not running"

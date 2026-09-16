@@ -13,8 +13,8 @@ or fail. Emitting enqueues; a single worker thread drains the queue and
 calls every subscriber, catching and logging anything they raise so one
 broken subscriber cannot starve the others.
 
-Event names are dotted, lowercase, past tense: `alarm.opened`,
-`alarm.acknowledged`, `alarm.resolved`, `command.ran`. The payload is a
+Event names are dotted, lowercase, past tense: `event.raised`,
+`event.resolved`, `command.ran`. The payload is a
 plain dict that is safe to serialise as JSON and send outside the app - no
 credentials, no session state.
 """
@@ -30,12 +30,8 @@ log = logging.getLogger("webui.events")
 # The catalogue. Kept here so the webhook settings page and the docs list
 # the same names the emitters actually use.
 EVENTS = {
-    "alarm.opened": "An occurrence was opened: the alarm is pending or firing (it may still be inside its paging hold)",
-    "alarm.acknowledged": "Someone acknowledged an alarm",
-    "alarm.unacknowledged": "An acknowledgement was withdrawn",
-    "alarm.commented": "A comment was added to an alarm",
-    "alarm.resolved": "An alarm stopped firing, or was resolved by hand",
-    "alarm.paged": "The alarm went to the pager: it fired and any paging hold lapsed - this is what pages phones",
+    "event.raised": "Something was noticed: a link down, a fault, a rule match - with a severity (info, warning, critical)",
+    "event.resolved": "The event is over: the device said so, the SSH poll saw it, a timer expired, or a person resolved it",
     "command.ran": "A command was run against a device and its result saved",
     "device.created": "A device was added",
     "device.updated": "A device was edited",

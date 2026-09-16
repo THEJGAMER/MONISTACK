@@ -57,7 +57,7 @@ def client(monkeypatch):
 
 
 def test_a_viewer_token_can_read(client):
-    r = client.get("/api/events", headers={"Authorization": "Bearer sb_" + "v" * 40})
+    r = client.get("/api/webhooks/events", headers={"Authorization": "Bearer sb_" + "v" * 40})
 
     assert r.status_code == 200
 
@@ -91,7 +91,7 @@ def test_the_tokens_role_wins_over_a_cookie_in_the_same_request(client):
 def test_a_revoked_token_is_401_not_a_cookie_fallback(client):
     client.cookies.set("switchboard_session", _session_cookie("admin"))
 
-    r = client.get("/api/events", headers={"Authorization": "Bearer sb_" + "r" * 40})
+    r = client.get("/api/webhooks/events", headers={"Authorization": "Bearer sb_" + "r" * 40})
 
     assert r.status_code == 401
     assert "revoked" in r.json()["detail"]
@@ -100,16 +100,16 @@ def test_a_revoked_token_is_401_not_a_cookie_fallback(client):
 def test_a_garbage_bearer_is_401(client):
     client.cookies.set("switchboard_session", _session_cookie("admin"))
 
-    r = client.get("/api/events", headers={"Authorization": "Bearer not-a-token-at-all"})
+    r = client.get("/api/webhooks/events", headers={"Authorization": "Bearer not-a-token-at-all"})
 
     assert r.status_code == 401
 
 
 def test_no_bearer_means_the_session_path_as_before(client):
-    assert client.get("/api/events").status_code == 401
+    assert client.get("/api/webhooks/events").status_code == 401
 
     client.cookies.set("switchboard_session", _session_cookie("viewer"))
-    assert client.get("/api/events").status_code == 200
+    assert client.get("/api/webhooks/events").status_code == 200
 
 
 def test_the_api_docs_are_where_the_description_says(client):

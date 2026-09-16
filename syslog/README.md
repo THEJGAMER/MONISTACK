@@ -38,14 +38,14 @@ journal.
 LXC — treat this file as the source of truth and push changes to the LXC
 (see below), not the other way around.
 
-## The fast path (sub-second alarms)
+## The fast path (sub-second events)
 
 Besides the Loki archive, the `switchboard_fast` sink POSTs every
 interpreted event straight to Switchboard's `/api/ingest/syslog` as it
 arrives (50 ms batch timeout, bearer token = `SYSLOG_INGEST_TOKEN` in
-Switchboard's `webui.env`). Switchboard evaluates each event on arrival
-and pages phones before Alertmanager's round trip - see webui/README.md
-"Alerting in under a second". The installer asks for the URL and token
+Switchboard's `webui.env`). Switchboard evaluates each line on arrival and
+raises the event - link down, fan/PSU, and the rest of the catalogue - in
+about 70 ms; see webui/README.md "Events". The installer asks for the URL and token
 and POSTs a test event before deploying (`SB_INGEST_URL`,
 `SB_INGEST_TOKEN` for `-y`); no token removes the sink. The sink is
 isolated from the archive on purpose: healthcheck off, its own small

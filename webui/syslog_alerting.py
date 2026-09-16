@@ -10,12 +10,11 @@ exactly, and/or a regex on the message), severity, how the alarm ends
 (a clearing pattern, an auto-resolve timer, or both) and whether it is
 one alarm per device or per device+interface.
 
-Rules are evaluated by whichever path delivers the event - the fast path
-(/api/ingest/syslog, sub-second) or the Loki poll behind it - and fire
-through the same Alertmanager client as every other checker, so they
-page phones via the local-first wrapper *and* reach Alertmanager's own
-receivers. In-memory state (what is firing, when it expires) is rebuilt
-from Alertmanager on restart, as the other checkers do.
+Rules are evaluated by whichever path delivers the line - the fast path
+(/api/ingest/syslog, sub-second) or the Loki poll behind it - inside
+event_detect.SyslogDetector, and raise `syslog.rule` events like any
+other kind. The event store is the state; the only job left here is the
+per-rule auto-resolve timer.
 """
 import logging
 import re
@@ -25,16 +24,12 @@ from datetime import datetime, timedelta, timezone
 log = logging.getLogger("webui.syslog_alerting")
 
 SEVERITIES = ("info", "warning", "critical")
-SOURCE_LABEL = "syslog-rule"
-HEARTBEAT_SECONDS = 120     # same Alertmanager resolve_timeout reasoning as the other checkers
 MAX_AUTO_RESOLVE = 86400
 
-# Shipped disabled except the self-test - a site turns on what it wants,
-# and can see the pattern before it does. The self-test rule is what the
-# "Send a test" button on the Alerts page fires through.
+# Shipped disabled - a site turns on what it wants, and can see the
+# pattern before it does. (The catalogue in event_catalog.py already
+# covers the common kinds; rules are for a site's own lines.)
 DEFAULT_RULES = [
-    {"key": "selftest", "name": "Switchboard fast-path self-test", "enabled": True, "severity": "warning",
-     "mnemonic": "SWITCHBOARD_SELFTEST", "auto_resolve_seconds": 60, "builtin": True},
     {"key": "stp-topology-change", "name": "Spanning-tree topology change", "enabled": False, "severity": "warning",
      "facility": "STP", "pattern": r"(?i)topology\s*change", "auto_resolve_seconds": 300},
     {"key": "routing-neighbour-lost", "name": "Routing neighbour lost", "enabled": False, "severity": "critical",
@@ -142,8 +137,11 @@ class SyslogRuleStore:
     def seed_defaults(self):
         """First run only (an empty table): the site starts with something
         to look at. Deleting a default later is respected - nothing is
-        re-seeded into a table that has ever had rows. The self-test rule
-        is the exception: `ensure_selftest` puts it back on demand."""
+        re-seeded into a table that has ever had rows."""
+        # The self-test used to be a seeded rule; it is a catalogue kind now
+        # (switchboard.selftest). A site that still carries the old row would
+        # raise the test twice, so it goes - the only default ever removed.
+        self.db.execute("DELETE FROM syslog_alert_rules WHERE key = 'selftest'")
         if self.db.query_one("SELECT 1 FROM syslog_alert_rules LIMIT 1"):
             return 0
         n = 0
@@ -153,15 +151,6 @@ class SyslogRuleStore:
         log.info("seeded %d default syslog rules", n)
         return n
 
-    def ensure_selftest(self, severity="warning"):
-        row = self.get_by_key("selftest")
-        spec = next(r for r in DEFAULT_RULES if r["key"] == "selftest")
-        if row is None:
-            return self.create({**spec, "severity": severity}, key="selftest", builtin=True)
-        if row["severity"] != severity or not row["enabled"]:
-            return self.update(row["id"], {"severity": severity, "enabled": True})
-        return row
-
 
 def _compile(rule):
     return (re.compile(rule["pattern"]) if rule.get("pattern") else None,
@@ -169,7 +158,7 @@ def _compile(rule):
 
 
 def matches(rule, event, _cache={}):
-    """Does this event fire (True), clear (False) or ignore (None) this
+    """Does this line fire (True), clear (False) or ignore (None) this
     rule? Facility/mnemonic are exact; the patterns run over the raw
     message so they can see everything the interpreter saw."""
     fac = (event.get("facility") or "").upper()
@@ -197,141 +186,12 @@ def matches(rule, event, _cache={}):
     return True
 
 
-class SyslogRuleEngine:
-    """In-memory firing state, keyed by (rule id, device key, interface)."""
-
-    def __init__(self):
-        self._active = {}   # identity -> {"labels", "annotations", "posted_at" (monotonic), "expires_at" (monotonic|None)}
-        self.cursor_ns = 0  # newest event timestamp evaluated, see evaluate_new
-
-    def evaluate_new(self, events, rules, device_for, alertmanager):
-        """evaluate() for events that may have been seen before: the fast
-        path and the Loki poll behind it deliver the same events (same
-        Vector timestamps, to the nanosecond), and whichever is first
-        wins. Events must carry `_timestamp_ns`; pass them oldest first."""
-        fresh = []
-        newest = self.cursor_ns
-        for e in events:
-            ts = int(e.get("_timestamp_ns") or 0)
-            if ts and ts <= self.cursor_ns:
-                continue
-            newest = max(newest, ts)
-            fresh.append(e)
-        changed = self.evaluate(fresh, rules, device_for, alertmanager)
-        self.cursor_ns = newest
-        return changed
-
-    def evaluate(self, events, rules, device_for, alertmanager):
-        """`device_for(event)` -> (device_id or "", display name). Returns
-        the number of alarms fired or cleared."""
-        changed = 0
-        for event in events:
-            for rule in rules:
-                if not rule.get("enabled"):
-                    continue
-                verdict = matches(rule, event)
-                if verdict is None:
-                    continue
-                device_id, device_name = device_for(event)
-                interface = (event.get("interface") or "") if rule.get("per_interface") else ""
-                identity = (rule["id"], device_id or device_name, interface)
-                if verdict:
-                    changed += self._fire(identity, rule, event, device_id, device_name, interface, alertmanager)
-                else:
-                    changed += self._clear(identity, alertmanager, reason="clearing message")
-        return changed
-
-    def _labels(self, rule, device_id, device_name, interface):
-        labels = {"alertname": rule["name"], "source": SOURCE_LABEL, "rule_id": str(rule["id"]),
-                  "device": device_name, "severity": rule["severity"]}
-        if device_id:
-            labels["device_id"] = device_id
-        if interface:
-            labels["interface"] = interface
-        return labels
-
-    def _fire(self, identity, rule, event, device_id, device_name, interface, alertmanager):
-        now = time.monotonic()
-        auto = int(rule.get("auto_resolve_seconds") or 0)
-        detail = str(event.get("detail") or event.get("message") or "")[:200]
-        state = self._active.get(identity)
-        labels = self._labels(rule, device_id, device_name, interface)
-        where = f"{device_name}" + (f" {interface}" if interface else "")
-        annotations = {"summary": f"{rule['name']} on {where}: {detail}" if detail else f"{rule['name']} on {where}",
-                       "description": str(event.get("message") or "")[:1000]}
-        is_new = state is None
-        self._active[identity] = {"labels": labels, "annotations": annotations, "posted_at": now,
-                                  "expires_at": (now + auto) if auto > 0 else None}
-        self._post(labels, annotations, alertmanager)
-        if is_new:
-            log.info("syslog rule fired: %r on %s", rule["name"], where)
-        return 1 if is_new else 0
-
-    def _post(self, labels, annotations, alertmanager, ends_at=None):
-        alert = {"labels": labels, "annotations": annotations,
-                 "startsAt": datetime.now(timezone.utc).isoformat()}
-        if ends_at is not None:
-            alert["startsAt"] = (ends_at - timedelta(minutes=1)).isoformat()
-            alert["endsAt"] = ends_at.isoformat()
-        try:
-            alertmanager.post_alerts([alert])
-        except Exception:
-            log.exception("could not post syslog-rule alert %s", labels.get("alertname"))
-
-    def _clear(self, identity, alertmanager, reason):
-        state = self._active.pop(identity, None)
-        if state is None:
-            return 0
-        self._post(state["labels"], {"summary": f"{state['labels']['alertname']} cleared ({reason})"},
-                   alertmanager, ends_at=datetime.now(timezone.utc))
-        log.info("syslog rule cleared (%s): %r on %s", reason, state["labels"]["alertname"], state["labels"].get("device"))
-        return 1
-
-    def tick(self, alertmanager):
-        """Every few seconds: auto-resolve what has expired, heartbeat what
-        is still firing so Alertmanager does not time it out."""
-        now = time.monotonic()
-        n = 0
-        for identity, state in list(self._active.items()):
-            if state["expires_at"] is not None and now >= state["expires_at"]:
-                n += self._clear(identity, alertmanager, reason="auto-resolve")
-            elif now - state["posted_at"] >= HEARTBEAT_SECONDS:
-                state["posted_at"] = now
-                self._post(state["labels"], state["annotations"], alertmanager)
-        return n
-
-    def active(self):
-        return [dict(labels=s["labels"], summary=s["annotations"].get("summary")) for s in self._active.values()]
-
-    def forget_rule(self, rule_id, alertmanager):
-        """A rule being deleted or disabled takes its alarms with it."""
-        n = 0
-        for identity in [i for i in self._active if str(i[0]) == str(rule_id)]:
-            n += self._clear(identity, alertmanager, reason="rule removed")
-        return n
-
-    def reseed_from_alertmanager(self, alertmanager, rules_by_id):
-        """After a restart, adopt what Alertmanager still has firing from
-        us so it keeps being heartbeated and can still auto-resolve."""
-        try:
-            alerts = alertmanager.list_alerts()
-        except Exception:
-            log.warning("could not reseed syslog-rule state from Alertmanager", exc_info=True)
-            return 0
-        now = time.monotonic()
-        seeded = 0
-        for alert in alerts or []:
-            labels = alert.get("labels") or {}
-            if labels.get("source") != SOURCE_LABEL or alert.get("status", {}).get("state") != "active":
-                continue
-            rule = rules_by_id.get(labels.get("rule_id"))
-            if rule is None:
-                continue
-            identity = (rule["id"], labels.get("device_id") or labels.get("device"), labels.get("interface") or "")
-            auto = int(rule.get("auto_resolve_seconds") or 0)
-            self._active[identity] = {"labels": labels, "annotations": alert.get("annotations") or {},
-                                      "posted_at": now, "expires_at": (now + auto) if auto > 0 else None}
-            seeded += 1
-        if seeded:
-            log.info("syslog rule state reseeded from Alertmanager: %d alarm(s) still active", seeded)
-        return seeded
+def expire_rules(store, rules):
+    """Auto-resolve: every rule with a timer closes its open events that
+    have not matched again within it. Called every few seconds."""
+    n = 0
+    for rule in rules:
+        ttl = int(rule.get("auto_resolve_seconds") or 0)
+        if ttl > 0:
+            n += store.expire("syslog.rule", ttl, by="timer", rule_id=rule["id"])
+    return n

@@ -1,9 +1,9 @@
-// The "Syslog rules" tab on the Alerts page: the fast path's state and a
-// self-test that times it, plus the rules that turn log lines into alarms.
+// The "Syslog rules" tab on the Events page: the fast path's state and a
+// self-test that times it, plus the rules that turn log lines into events.
 //
 // The self-test is the honest number: one syslog line sent to the
-// receiver, timed back through Vector into Switchboard, opened as an
-// alarm and pushed to phones - the whole path a real switch message takes,
+// receiver, timed back through Vector into Switchboard, raised as an
+// event and pushed to phones - the whole path a real switch message takes,
 // minus the switch.
 import React, { useEffect, useState } from "react";
 import Container from "@cloudscape-design/components/container";
@@ -87,12 +87,12 @@ export function FastPathCard({ pushFlash }) {
       if (r.ok) {
         pushFlash(
           "success",
-          `Fast path round trip: received in ${ms(r.received_ms)}, alarm open in ${ms(r.alarm_ms)}` +
-            (r.paged_devices ? `, pushed to ${r.paged_devices} device(s) in ${ms(r.push_ms)}` : ", no enrolled device at this severity") +
-            ". The test alarm resolves itself in a minute."
+          `Fast path round trip: received in ${ms(r.received_ms)}, event raised in ${ms(r.event_ms)}` +
+            (r.pushed_devices ? `, pushed to ${r.pushed_devices} device(s) in ${ms(r.push_ms)}` : ", no enrolled device at this severity") +
+            ". The test event resolves itself in a minute."
         );
       } else {
-        pushFlash("error", `Fast-path test failed: ${r.detail || "no alarm opened"}`);
+        pushFlash("error", `Fast-path test failed: ${r.detail || "no event raised"}`);
       }
       refresh();
     } catch (e) {
@@ -122,7 +122,7 @@ export function FastPathCard({ pushFlash }) {
       header={
         <Header
           variant="h2"
-          description="Vector posts every parsed syslog event here the moment it arrives; interface, hardware and syslog-rule alarms open and page from it in well under a second, before Alertmanager's round trip. Loki polling remains as the fallback."
+          description="Vector posts every parsed syslog line here the moment it arrives and it becomes an event in well under a second. Loki polling remains as the fallback for syslog, and the SSH poll for what syslog never said."
           actions={
             <SpaceBetween direction="horizontal" size="xs">
               <Select selectedOption={severity} onChange={({ detail }) => setSeverity(detail.selectedOption)} options={SEVERITIES} />
@@ -151,7 +151,8 @@ export function FastPathCard({ pushFlash }) {
               value:
                 status?.transport_ms_median != null ? `median ${ms(status.transport_ms_median)}, p95 ${ms(status.transport_ms_p95)}` : "-",
             },
-            { label: "Alarms opened locally", value: status ? `${status.local_opens} opened, ${status.local_closes} closed before Alertmanager` : "-" },
+            { label: "Events from syslog", value: status ? `${status.syslog_transitions} transitions; ${status.ignored} lines ignored by setting` : "-" },
+            { label: "Events from the SSH poll", value: status ? `${status.ssh_transitions} transitions` : "-" },
           ]}
         />
         <KeyValuePairs
@@ -167,8 +168,8 @@ export function FastPathCard({ pushFlash }) {
                   </StatusIndicator>
                   {t.ok ? (
                     <Box color="text-body-secondary">
-                      received {ms(t.received_ms)} · alarm {ms(t.alarm_ms)} ·{" "}
-                      {t.paged_devices ? `pushed to ${t.paged_devices} device(s) ${ms(t.push_ms)}` : "no device paged"}
+                      received {ms(t.received_ms)} · event {ms(t.event_ms)} ·{" "}
+                      {t.pushed_devices ? `pushed to ${t.pushed_devices} device(s) ${ms(t.push_ms)}` : "no device notified"}
                     </Box>
                   ) : (
                     <Box color="text-body-secondary">{t.detail}</Box>
@@ -179,16 +180,13 @@ export function FastPathCard({ pushFlash }) {
               ),
             },
             {
-              label: "Rule alarms firing",
-              value: status?.rule_alarms_active?.length ? (
+              label: "Rule events open",
+              value: status?.rule_events_open?.length ? (
                 <SpaceBetween size="xxs">
-                  {status.rule_alarms_active.map((a, i) => (
-                    <Box key={i}>
-                      <StatusIndicator type={severityType(a.labels.severity)}>{a.labels.alertname}</StatusIndicator>{" "}
-                      <Box variant="span" color="text-body-secondary">
-                        {a.labels.device}
-                        {a.labels.interface ? ` ${a.labels.interface}` : ""}
-                      </Box>
+                  {status.rule_events_open.map((a) => (
+                    <Box key={a.id}>
+                      <StatusIndicator type={severityType(a.severity)}>{a.subject}</StatusIndicator>{" "}
+                      <Box variant="span" color="text-body-secondary">{a.device}</Box>
                     </Box>
                   ))}
                 </SpaceBetween>
@@ -275,10 +273,10 @@ function RuleForm({ rule, onClose, onSaved, pushFlash }) {
           </Alert>
         )}
         <ColumnLayout columns={2}>
-          <FormField label="Name" description="Becomes the alarm's name." constraintText="Up to 120 characters.">
+          <FormField label="Name" description="Becomes the event's subject." constraintText="Up to 120 characters.">
             <Input value={form.name} onChange={({ detail }) => set("name")(detail.value)} disabled={rule?.builtin} />
           </FormField>
-          <FormField label="Severity" description="Decides which enrolled phones are paged.">
+          <FormField label="Severity" description="Decides which enrolled phones are notified.">
             <Select
               selectedOption={SEVERITIES.find((s) => s.value === form.severity)}
               onChange={({ detail }) => set("severity")(detail.selectedOption.value)}
@@ -294,15 +292,15 @@ function RuleForm({ rule, onClose, onSaved, pushFlash }) {
           <FormField label="Fires on (regular expression)" description="Run over the whole message. Blank = every message that passes the facility/mnemonic filters." constraintText="Python syntax; (?i) for case-insensitive.">
             <Input value={form.pattern} onChange={({ detail }) => set("pattern")(detail.value)} />
           </FormField>
-          <FormField label="Clears on (regular expression)" description="A matching line resolves the alarm. Blank = only the timer below ends it.">
+          <FormField label="Clears on (regular expression)" description="A matching line resolves the event. Blank = only the timer below ends it.">
             <Input value={form.clear_pattern} onChange={({ detail }) => set("clear_pattern")(detail.value)} />
           </FormField>
-          <FormField label="Auto-resolve after" description="Seconds after the last matching line before the alarm resolves by itself. 0 = never (needs a clearing pattern)." constraintText="0 to 86400">
+          <FormField label="Auto-resolve after" description="Seconds after the last matching line before the event resolves by itself. 0 = never (needs a clearing pattern)." constraintText="0 to 86400">
             <Input type="number" value={String(form.auto_resolve_seconds)} onChange={({ detail }) => set("auto_resolve_seconds")(detail.value)} />
           </FormField>
           <SpaceBetween size="s">
             <Toggle checked={form.per_interface} onChange={({ detail }) => set("per_interface")(detail.checked)}>
-              One alarm per device and interface (when the line names one)
+              One event per device and interface (when the line names one)
             </Toggle>
             <Toggle checked={form.enabled} onChange={({ detail }) => set("enabled")(detail.checked)}>
               Enabled
@@ -384,7 +382,7 @@ export default function SyslogRulesTab({ pushFlash }) {
   }
 
   async function remove(rule) {
-    if (!window.confirm(`Delete the rule "${rule.name}"? Any alarm it is raising clears.`)) return;
+    if (!window.confirm(`Delete the rule "${rule.name}"? Any event it raised resolves.`)) return;
     setBusyId(rule.id);
     try {
       await deleteSyslogRule(rule.id);
@@ -398,7 +396,8 @@ export default function SyslogRulesTab({ pushFlash }) {
   }
 
   const firingByRule = active.reduce((acc, a) => {
-    acc[a.labels.rule_id] = (acc[a.labels.rule_id] || 0) + 1;
+    const id = a.labels?.rule_id;
+    if (id) acc[id] = (acc[id] || 0) + 1;
     return acc;
   }, {});
 
@@ -409,7 +408,7 @@ export default function SyslogRulesTab({ pushFlash }) {
         header={
           <Header
             variant="h2"
-            description="Turn a log line into an alarm the moment it arrives. Match on the parsed facility or mnemonic, a pattern over the message, or both; end it with a clearing line, a timer, or both. Alarms page phones and reach Alertmanager's receivers like every other alarm."
+            description="Turn a log line the catalogue does not know into an event the moment it arrives. Match on the parsed facility or mnemonic, a pattern over the message, or both; end it with a clearing line, a timer, or both."
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <Button iconName="refresh" onClick={refresh} loading={loading} ariaLabel="Refresh" />

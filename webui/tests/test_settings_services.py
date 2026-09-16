@@ -34,38 +34,12 @@ def _session_cookie(app, role, username="test-user"):
 
 # --- reload URL derivation ------------------------------------------
 
-def test_reload_url_derives_from_prometheus_url():
-    """One less thing to keep in sync by hand - and getting it wrong
-    silently breaks the Rules tab's live reload rather than erroring
-    anywhere visible."""
-    assert settings_store.reload_url_for({"prometheus_url": "http://p:9090"}) == "http://p:9090/-/reload"
-
-
-def test_an_explicit_reload_url_wins():
-    got = settings_store.reload_url_for(
-        {"prometheus_url": "http://p:9090", "prometheus_reload_url": "http://proxy/reload"}
-    )
-    assert got == "http://proxy/reload"
-
-
-def test_reload_url_tolerates_a_trailing_slash():
-    assert settings_store.reload_url_for({"prometheus_url": "http://p:9090/"}) == "http://p:9090/-/reload"
-
-
-def test_reload_url_is_blank_when_prometheus_is_unset():
-    assert settings_store.reload_url_for({}) == ""
-
-
-# --- env seeding -----------------------------------------------------
-
 def test_bootstrap_seeds_every_service_from_env(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@h/db")
-    monkeypatch.setenv("ALERTMANAGER_URL", "http://am:9093")
     monkeypatch.delenv("PROMETHEUS_URL", raising=False)
 
     seeded = settings_store.bootstrap_from_env()
 
-    assert seeded["alertmanager_url"] == "http://am:9093"
     # Unset env falls back to the documented default rather than vanishing.
     assert seeded["prometheus_url"] == "http://prometheus:9090"
     assert set(k for k, _, _ in settings_store.SERVICE_SETTINGS) <= set(seeded)
@@ -131,7 +105,7 @@ def test_health_panel_works_when_the_database_is_down(broken_db_client, monkeypa
     assert checks["Postgres"]["ok"] is False
     assert "could not translate host name" in checks["Postgres"]["detail"]
     # The rest still report honestly rather than being suppressed.
-    assert checks["Alertmanager"]["ok"] is True
+    assert checks["Prometheus"]["ok"] is True
 
 
 def test_service_urls_are_applied_even_when_postgres_is_unreachable(broken_db_client, monkeypatch):
@@ -142,11 +116,11 @@ def test_service_urls_are_applied_even_when_postgres_is_unreachable(broken_db_cl
     monkeypatch.setattr(app_module, "_apply_service_settings", lambda d: applied.update(d))
     broken_db_client.cookies.set("switchboard_session", _session_cookie(app_module, "admin"))
 
-    resp = broken_db_client.put("/api/settings", json={"alertmanager_url": "http://new-am:9093"})
+    resp = broken_db_client.put("/api/settings", json={"prometheus_url": "http://new-prom:9090"})
 
     assert resp.status_code == 400  # honest: Postgres genuinely is down
     assert "Saved" in resp.json()["detail"]
-    assert applied["alertmanager_url"] == "http://new-am:9093"
+    assert applied["prometheus_url"] == "http://new-prom:9090"
 
 
 def test_health_still_requires_authentication(broken_db_client):
@@ -156,7 +130,7 @@ def test_health_still_requires_authentication(broken_db_client):
 def test_saving_settings_is_still_admin_only(broken_db_client):
     broken_db_client.cookies.set("switchboard_session", _session_cookie(app_module, "operator"))
 
-    resp = broken_db_client.put("/api/settings", json={"alertmanager_url": "http://x:9093"})
+    resp = broken_db_client.put("/api/settings", json={"prometheus_url": "http://x:9090"})
 
     assert resp.status_code == 403, "role check must survive the DB-independence work"
 
@@ -164,7 +138,7 @@ def test_saving_settings_is_still_admin_only(broken_db_client):
 def test_omitted_fields_keep_their_stored_value(monkeypatch):
     """A partial PUT must not blank settings it didn't mention - the
     frontend sends the whole form, but an API client need not."""
-    stored = {"database_url": "postgresql://u:p@h/db", "alertmanager_url": "http://kept:9093"}
+    stored = {"database_url": "postgresql://u:p@h/db", "exporter_url": "http://kept:9101"}
     saved = {}
     monkeypatch.setattr(app_module, "STORE", object())
     monkeypatch.setattr(app_module, "DB_ERROR", None)
@@ -178,7 +152,7 @@ def test_omitted_fields_keep_their_stored_value(monkeypatch):
     resp = client.put("/api/settings", json={"prometheus_url": "http://new-prom:9090"})
 
     assert resp.status_code == 200, resp.text
-    assert saved["alertmanager_url"] == "http://kept:9093"
+    assert saved["exporter_url"] == "http://kept:9101"
     assert saved["prometheus_url"] == "http://new-prom:9090"
 
 
@@ -256,7 +230,7 @@ def test_a_failing_freshness_query_does_not_break_the_panel(broken_db_client, mo
     checks = _health_checks(broken_db_client)
 
     assert checks["Syslog flow"]["ok"] is False
-    assert "Alertmanager" in checks and checks["Alertmanager"]["ok"] is True
+    assert "Prometheus" in checks and checks["Prometheus"]["ok"] is True
 
 
 # --- sFlow collector + flow health -----------------------------------
@@ -334,7 +308,7 @@ def test_a_failing_flow_query_does_not_break_the_panel(monkeypatch):
     checks = _checks(_healthy_db(monkeypatch))
 
     assert checks["sFlow flow"]["ok"] is False
-    assert checks["Alertmanager"]["ok"] is True, "one failing check must not hide the rest"
+    assert checks["Prometheus"]["ok"] is True, "one failing check must not hide the rest"
 
 
 def test_the_collector_address_round_trips_through_settings(monkeypatch):

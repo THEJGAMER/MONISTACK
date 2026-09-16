@@ -93,24 +93,17 @@ export default function AccountPage({user, pushFlash }) {
   );
 }
 
-// Paging to *this browser on this device*. A subscription is bound to the
+// Notifications to *this browser on this device*. A subscription is bound to the
 // browser, not the account: the same person's phone and laptop subscribe
-// separately, and each sets its own floor and repeat cadence - the phone
-// on critical only, repeating every 2 minutes; the laptop on everything,
-// once. Adapted from PROXMON's push UI and extended into a pager: repeat
-// until acknowledged, an ack anywhere stops the page everywhere, a tone
-// while a tab is open, and removal of any enrolled device.
+// separately, and each sets its own floor - the phone on critical only,
+// the laptop on everything. Adapted from PROXMON's push UI: a tone while a
+// tab is open, a quiet notification when an event resolves, and removal
+// of any enrolled device. No acknowledge: actioning belongs to the
+// ticketing system that consumes the same events over webhooks.
 const SEVERITIES = [
   { label: "Critical only", value: "critical" },
   { label: "Warning and above", value: "warning" },
   { label: "Everything, including info", value: "info" },
-];
-const REPEATS = [
-  { label: "Page once, no repeat", value: "0" },
-  { label: "Every 2 minutes until acknowledged", value: "2" },
-  { label: "Every 5 minutes until acknowledged", value: "5" },
-  { label: "Every 10 minutes until acknowledged", value: "10" },
-  { label: "Every 15 minutes until acknowledged", value: "15" },
 ];
 
 export function PagingSection({ pushFlash }) {
@@ -118,8 +111,6 @@ export function PagingSection({ pushFlash }) {
   const install = useInstallPrompt();
   const [minSeverity, setMinSeverity] = useState(SEVERITIES[1]);
   const [notifyResolved, setNotifyResolved] = useState(true);
-  const [repeat, setRepeat] = useState(REPEATS[2]);
-  const [maxRepeats, setMaxRepeats] = useState("12");
   const [soundOn, setSoundOn] = useState(isPagerSoundEnabled());
   const [busy, setBusy] = useState(false);
   const flash = (type, text) => (pushFlash ? pushFlash(type, text) : null);
@@ -131,15 +122,11 @@ export function PagingSection({ pushFlash }) {
     if (!mine) return;
     setMinSeverity(SEVERITIES.find((o) => o.value === mine.min_severity) || SEVERITIES[1]);
     setNotifyResolved(!!mine.notify_resolved);
-    setRepeat(REPEATS.find((o) => o.value === String(mine.repeat_minutes)) || REPEATS[2]);
-    setMaxRepeats(String(mine.max_repeats ?? 12));
-  }, [mine?.endpoint, mine?.min_severity, mine?.notify_resolved, mine?.repeat_minutes, mine?.max_repeats]);
+  }, [mine?.endpoint, mine?.min_severity, mine?.notify_resolved]);
 
   const prefs = () => ({
     minSeverity: minSeverity.value,
     notifyResolved,
-    repeatMinutes: Number(repeat.value),
-    maxRepeats: Math.max(1, Math.min(100, Number(maxRepeats) || 12)),
   });
 
   async function onSubscribe() {
@@ -157,9 +144,9 @@ export function PagingSection({ pushFlash }) {
     setBusy(true);
     try {
       const p = prefs();
-      await updatePushPrefs({ endpoint: push.endpoint, min_severity: p.minSeverity, notify_resolved: p.notifyResolved, repeat_minutes: p.repeatMinutes, max_repeats: p.maxRepeats });
+      await updatePushPrefs({ endpoint: push.endpoint, min_severity: p.minSeverity, notify_resolved: p.notifyResolved });
       await push.refresh();
-      flash("success", "Paging preferences saved for this device.");
+      flash("success", "Notification preferences saved for this device.");
     } catch (e) {
       flash("error", e.message);
     } finally {
@@ -218,16 +205,8 @@ export function PagingSection({ pushFlash }) {
   const prefsForm = (
     <SpaceBetween size="s">
       <Select selectedOption={minSeverity} onChange={({ detail }) => setMinSeverity(detail.selectedOption)} options={SEVERITIES} disabled={blocked} />
-      <Select selectedOption={repeat} onChange={({ detail }) => setRepeat(detail.selectedOption)} options={REPEATS} disabled={blocked} />
-      {repeat.value !== "0" ? (
-        <SpaceBetween size="xs" direction="horizontal" alignItems="center">
-          <Box>Stop after</Box>
-          <Input value={maxRepeats} onChange={({ detail }) => setMaxRepeats(detail.value.replace(/[^0-9]/g, ""))} inputMode="numeric" disabled={blocked} />
-          <Box>repeats (so a forgotten alarm does not page forever).</Box>
-        </SpaceBetween>
-      ) : null}
       <Toggle checked={notifyResolved} onChange={({ detail }) => setNotifyResolved(detail.checked)} disabled={blocked}>
-        Also tell me when an alarm resolves
+        Also tell me when an event resolves
       </Toggle>
     </SpaceBetween>
   );
@@ -237,9 +216,9 @@ export function PagingSection({ pushFlash }) {
       header={
         <Header
           variant="h2"
-          description="A pager, not a notification: the page repeats until someone acknowledges it, an acknowledgement anywhere stops it everywhere, and Acknowledge is on the notification itself. Delivered through the browser's push service with the app closed - no third-party pager."
+          description="One notification when an event at or above your floor is raised, a quiet one when it resolves. Delivered through the browser's push service with the app closed - no third-party pager."
         >
-          Paging on this device
+          Notifications on this device
         </Header>
       }
     >
@@ -260,13 +239,13 @@ export function PagingSection({ pushFlash }) {
         {prefsForm}
         {!push.subscribed ? (
           <Button variant="primary" onClick={onSubscribe} loading={busy || push.busy} disabled={blocked}>
-            Page this device
+            Notify this device
           </Button>
         ) : (
           <SpaceBetween size="xs" direction="horizontal">
             <Button variant="primary" onClick={onSavePrefs} loading={busy || push.busy}>Save preferences</Button>
             <Button onClick={onTest} loading={busy || push.busy}>Send a test page</Button>
-            <Button onClick={onUnsubscribe} loading={busy || push.busy}>Stop paging this device</Button>
+            <Button onClick={onUnsubscribe} loading={busy || push.busy}>Stop notifying this device</Button>
           </SpaceBetween>
         )}
         <SpaceBetween size="xs" direction="horizontal" alignItems="center">
@@ -301,7 +280,6 @@ export function PagingSection({ pushFlash }) {
               ),
             },
             { id: "sev", header: "Pages on", cell: (r) => r.min_severity },
-            { id: "rep", header: "Repeats", cell: (r) => (r.repeat_minutes ? `every ${r.repeat_minutes} min, up to ${r.max_repeats}` : "once") },
             { id: "res", header: "Resolves", cell: (r) => (r.notify_resolved ? "yes" : "no") },
             { id: "used", header: "Last paged", cell: (r) => (r.last_used_at ? new Date(r.last_used_at).toLocaleString() : "never") },
             {

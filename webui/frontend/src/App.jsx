@@ -28,8 +28,7 @@ const SflowPage = lazy(() => import("./SflowPage.jsx"));
 const BulkRunPage = lazy(() => import("./BulkRunPage.jsx"));
 const SchedulesPage = lazy(() => import("./SchedulesPage.jsx"));
 const CompliancePage = lazy(() => import("./CompliancePage.jsx"));
-const AlertsPage = lazy(() => import("./AlertsPage.jsx"));
-const AlarmsPage = lazy(() => import("./AlarmsPage.jsx"));
+const EventsPage = lazy(() => import("./EventsPage.jsx"));
 const AccountPage = lazy(() => import("./AccountPage.jsx"));
 
 function PageFallback() {
@@ -45,7 +44,7 @@ let flashId = 0;
 /**
  * Real hash routing, replacing the plain useState this app used to keep the
  * current page in. Two things that only work with the URL as the source of
- * truth: pasting a link to a specific alarm actually opens that alarm for
+ * truth: pasting a link to a specific event actually opens that event for
  * whoever you sent it to, and the browser's back button works. Previously
  * the initial hash was ignored entirely, so every deep link silently landed
  * on the Console.
@@ -108,8 +107,8 @@ export default function App() {
   // the pager tone (unless turned off on My account) and say what paged.
   useEffect(() => {
     return listenForPages((payload) => {
-      if (payload.close) return;
-      pushFlash(payload.severity === "critical" ? "error" : "warning", `Paged: ${payload.title || "alarm"}`);
+      if (payload.quiet) return;
+      pushFlash(payload.severity === "critical" ? "error" : "warning", `${payload.title || "event"}`);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -195,8 +194,8 @@ export default function App() {
     })();
   }, [configured, user, deniedMatch, loginFailedMatch, pushFlash]);
 
-  // "#/alarms/6da766d164443d00" -> section "alarms", param "6da766d164443d00".
-  // Only the Alarms page takes a path parameter today; everything else is a
+  // "#/events/1234" -> section "events", param "1234".
+  // Only the Events page takes a path parameter today; everything else is a
   // bare section, so unknown sections still fall through to the Console.
   const [section, routeParam] = activeHref.replace(/^#\/?/, "").split("/");
   const KNOWN_PAGES = [
@@ -208,8 +207,7 @@ export default function App() {
     "bulk-run",
     "schedules",
     "compliance",
-    "alerts",
-    "alarms",
+    "events",
     "settings",
     "account",
   ];
@@ -223,19 +221,18 @@ export default function App() {
     "bulk-run": "Bulk Run",
     schedules: "Schedules",
     compliance: "Compliance",
-    alerts: "Alerts",
-    alarms: "Alarms",
+    events: "Events",
     settings: "Settings",
     account: "My Account",
   };
-  // A deep-linked alarm gets its own breadcrumb level, so someone who
+  // A deep-linked event gets its own breadcrumb level, so someone who
   // arrives from a pasted link can see where they are and get back to the
   // full list without knowing the URL scheme.
   const breadcrumbs = [
     { text: "Switchboard", href: "#/console" },
-    { text: pageTitles[page], href: page === "alarms" ? "#/alarms" : activeHref },
+    { text: pageTitles[page], href: page === "events" ? "#/events" : activeHref },
   ];
-  if (page === "alarms" && routeParam) {
+  if (page === "events" && routeParam) {
     breadcrumbs.push({ text: routeParam, href: activeHref });
   }
 
@@ -322,8 +319,7 @@ export default function App() {
               { type: "link", text: "Bulk Run", href: "#/bulk-run" },
               { type: "link", text: "Schedules", href: "#/schedules" },
               { type: "link", text: "Compliance", href: "#/compliance" },
-              { type: "link", text: "Alerts", href: "#/alerts" },
-              { type: "link", text: "Alarms", href: "#/alarms" },
+              { type: "link", text: "Events", href: "#/events" },
               { type: "divider" },
               { type: "link", text: "Settings", href: "#/settings" },
             ]}
@@ -368,14 +364,8 @@ export default function App() {
                 <SchedulesPage devices={devices} commandTree={commandTree} pushFlash={pushFlash} />
               ) : page === "compliance" ? (
                 <CompliancePage pushFlash={pushFlash} />
-              ) : page === "alerts" ? (
-                <AlertsPage devices={devices} pushFlash={pushFlash} />
-              ) : page === "alarms" ? (
-                <AlarmsPage
-                  fingerprint={routeParam || null}
-                  pushFlash={pushFlash}
-                  onNavigate={setActiveHref}
-                />
+              ) : page === "events" ? (
+                <EventsPage devices={devices} eventId={routeParam || null} pushFlash={pushFlash} onNavigate={setActiveHref} />
               ) : (
                 <ConsolePage
                   devices={devices}

@@ -44,110 +44,22 @@ def test_facility_and_mnemonic_are_exact_filters():
     assert sa.matches(r, {"mnemonic": "OTHER", "message": "anything"}) is None
 
 
-# --- the engine ---------------------------------------------------------------
+# --- the timer ---------------------------------------------------------------------
 
-class _AM:
+class _ExpiringStore:
     def __init__(self):
-        self.posted = []
+        self.calls = []
 
-    def post_alerts(self, alerts):
-        self.posted.extend(alerts)
-
-    def list_alerts(self):
-        return []
+    def expire(self, kind, ttl, by="timer", rule_id=None):
+        self.calls.append((kind, ttl, rule_id))
+        return 1
 
 
-def _device_for(event):
-    return ("dev-1", "S4048") if event.get("device_host") == "S4048" else ("", event.get("device_host") or "unknown")
-
-
-def _ev(msg, host="S4048", **kw):
-    return {"message": msg, "detail": msg, "device_host": host, **kw}
-
-
-def test_a_matching_line_fires_once_and_a_clearing_line_resolves():
-    am, eng = _AM(), sa.SyslogRuleEngine()
-    rules = [_rule()]
-
-    assert eng.evaluate([_ev("%BGP-5-ADJCHANGE: neighbor 10.0.0.1 Down")], rules, _device_for, am) == 1
-    assert eng.evaluate([_ev("%BGP-5-ADJCHANGE: neighbor 10.0.0.1 Down")], rules, _device_for, am) == 0, "already firing"
-    fired = am.posted[0]
-    assert fired["labels"] == {"alertname": "Routing neighbour lost", "source": "syslog-rule", "rule_id": "1",
-                               "device": "S4048", "severity": "critical", "device_id": "dev-1"}
-    assert "endsAt" not in fired and fired["annotations"]["summary"].startswith("Routing neighbour lost on S4048")
-
-    assert eng.evaluate([_ev("%BGP-5-ADJCHANGE: neighbor 10.0.0.1 Up")], rules, _device_for, am) == 1
-    assert "endsAt" in am.posted[-1] and eng.active() == []
-
-
-def test_one_alarm_per_device_or_per_interface_as_the_rule_says():
-    am, eng = _AM(), sa.SyslogRuleEngine()
-    per_dev = [_rule(id=1, pattern="(?i)flap", clear_pattern="")]
-    per_if = [_rule(id=2, pattern="(?i)flap", clear_pattern="", per_interface=True)]
-
-    eng.evaluate([_ev("flap", interface="Te 1/1"), _ev("flap", interface="Te 1/2")], per_dev, _device_for, am)
-    eng.evaluate([_ev("flap", interface="Te 1/1"), _ev("flap", interface="Te 1/2")], per_if, _device_for, am)
-
-    active = eng.active()
-    assert len(active) == 3
-    assert sorted(a["labels"].get("interface", "") for a in active) == ["", "Te 1/1", "Te 1/2"]
-
-
-def test_auto_resolve_and_heartbeat_on_tick(monkeypatch):
-    am, eng = _AM(), sa.SyslogRuleEngine()
-    clock = [1000.0]
-    monkeypatch.setattr(sa.time, "monotonic", lambda: clock[0])
-    eng.evaluate([_ev("%STP-5-TOPO: Topology change")], [_rule(id=3, pattern="(?i)topology", clear_pattern="", auto_resolve_seconds=300)],
-                 _device_for, am)
-    assert eng.tick(am) == 0 and len(am.posted) == 1
-
-    clock[0] += sa.HEARTBEAT_SECONDS
-    eng.tick(am)
-    assert len(am.posted) == 2 and "endsAt" not in am.posted[-1], "heartbeat keeps Alertmanager from timing it out"
-
-    clock[0] += 300
-    assert eng.tick(am) == 1
-    assert "endsAt" in am.posted[-1] and eng.active() == []
-
-
-def test_the_same_event_from_two_paths_is_evaluated_once():
-    """The fast path and the Loki poll carry the same Vector timestamp."""
-    am, eng = _AM(), sa.SyslogRuleEngine()
-    rules = [_rule(pattern="(?i)down", clear_pattern="(?i)up")]
-    ev_down = _ev("bgp down", _timestamp_ns=1000)
-    ev_up = _ev("bgp up", _timestamp_ns=2000)
-
-    assert eng.evaluate_new([ev_down], rules, _device_for, am) == 1        # fast path
-    assert eng.evaluate_new([ev_down], rules, _device_for, am) == 0        # loki poll, same event: skipped
-    assert eng.evaluate_new([ev_up], rules, _device_for, am) == 1
-    assert eng.evaluate_new([ev_down, ev_up], rules, _device_for, am) == 0, "a re-read of both changes nothing"
-    assert eng.cursor_ns == 2000
-
-
-def test_a_disabled_rule_is_ignored_and_a_removed_rule_takes_its_alarms():
-    am, eng = _AM(), sa.SyslogRuleEngine()
-    assert eng.evaluate([_ev("bgp down")], [_rule(enabled=False)], _device_for, am) == 0
-    eng.evaluate([_ev("bgp down")], [_rule()], _device_for, am)
-    assert eng.forget_rule(1, am) == 1 and eng.active() == []
-
-
-def test_an_unknown_sender_still_alarms_under_its_own_name():
-    am, eng = _AM(), sa.SyslogRuleEngine()
-    eng.evaluate([_ev("%SWB-4-SWITCHBOARD_SELFTEST: nonce=1", host="switchboard", mnemonic="SWITCHBOARD_SELFTEST")],
-                 [_rule(id=9, mnemonic="SWITCHBOARD_SELFTEST", pattern="", clear_pattern="")], _device_for, am)
-    labels = am.posted[0]["labels"]
-    assert labels["device"] == "switchboard" and "device_id" not in labels
-
-
-def test_reseed_adopts_alertmanagers_active_rule_alarms():
-    class _AMActive(_AM):
-        def list_alerts(self):
-            return [{"labels": {"alertname": "X", "source": "syslog-rule", "rule_id": "1", "device": "S4048", "device_id": "dev-1", "severity": "critical"},
-                     "annotations": {"summary": "s"}, "status": {"state": "active"}},
-                    {"labels": {"alertname": "Y", "source": "other"}, "status": {"state": "active"}}]
-    eng = sa.SyslogRuleEngine()
-    assert eng.reseed_from_alertmanager(_AMActive(), {"1": _rule()}) == 1
-    assert eng.active()[0]["labels"]["alertname"] == "X"
+def test_only_rules_with_a_timer_expire_their_events():
+    store = _ExpiringStore()
+    rules = [_rule(id=1, auto_resolve_seconds=300), _rule(id=2, auto_resolve_seconds=0), _rule(id=3, auto_resolve_seconds=60)]
+    assert sa.expire_rules(store, rules) == 2
+    assert store.calls == [("syslog.rule", 300, 1), ("syslog.rule", 60, 3)]
 
 
 # --- the store, against Postgres ----------------------------------------------
@@ -201,21 +113,17 @@ def store():
         conn.close()
 
 
-def test_defaults_are_seeded_once_and_only_the_selftest_is_on(store):
+def test_defaults_are_seeded_once_and_all_off(store):
     assert store.seed_defaults() == len(sa.DEFAULT_RULES)
     assert store.seed_defaults() == 0
-    on = [r["name"] for r in store.list(enabled_only=True)]
-    assert on == ["Switchboard fast-path self-test"]
+    assert store.list(enabled_only=True) == []
 
 
-def test_a_deleted_default_stays_deleted_but_the_selftest_comes_back(store):
+def test_a_deleted_default_stays_deleted(store):
     store.seed_defaults()
     stp = next(r for r in store.list() if r["key"] == "stp-topology-change")
     assert store.delete(stp["id"]) is True
     assert store.seed_defaults() == 0 and all(r["key"] != "stp-topology-change" for r in store.list())
-    selftest = store.get_by_key("selftest")
-    assert store.delete(selftest["id"]) is False, "builtin: cannot be deleted"
-    assert store.ensure_selftest("critical")["severity"] == "critical"
 
 
 def test_rules_are_validated(store):

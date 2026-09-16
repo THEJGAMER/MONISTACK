@@ -18,21 +18,11 @@ Two pieces here shorten that to well under a second:
    the fast path through the checkers' timestamp cursor, so exactness of
    `timestamp_ns` matters (see it).
 
-2. `LocalFirstAlertmanager` - every alert this app raises itself (interface
-   down, fan/PSU, syslog rules, manual resolve) goes through
-   `post_alerts`. Wrapping the client makes the occurrence - and the page
-   that follows from it - happen *here, now*, and only then forwards the
-   alert to Alertmanager for its other receivers. Alertmanager's own
-   round trip (dispatch, webhook) still happens; it just no longer sits
-   between a fault and a phone. If Alertmanager is down, the page still
-   goes out.
-
-`signal` / `attributed` carry *how* an alarm was detected into the
-occurrence row (`detected_via`, `signal_at`) so the alarm can say
-"detected via syslog 0.4 s after the switch logged it" - the number that
-proves the path is short, rather than a claim that it is.
+2. The events themselves are raised straight into the event store by
+   event_detect.SyslogDetector (and by event_reconcile.SshReconciler for
+   the SSH fallback) - there is no Alertmanager, no webhook round trip,
+   nothing between a line arriving and a phone buzzing but this process.
 """
-import contextvars
 import json
 import logging
 import re
@@ -40,7 +30,6 @@ import statistics
 import threading
 import time
 from collections import deque
-from contextlib import contextmanager
 from datetime import datetime, timezone
 
 log = logging.getLogger("webui.fastpath")
@@ -114,6 +103,7 @@ class FastPathStats:
         self.last_received_at = None
         self.last_host = None
         self._recent = deque()               # receive times, for events-per-minute
+        self.last_by_host = {}               # device_host/source_ip -> last received_at (for "syslog silent")
         self._transport_ms = deque(maxlen=window)
         self._selftests = {}                 # nonce -> received_at (monotonic + wall)
         self.last_test = None
@@ -126,6 +116,9 @@ class FastPathStats:
             self.last_received_at = received_at
             for e in events:
                 self.last_host = e.get("device_host") or e.get("host") or self.last_host
+                for h in (e.get("device_host"), e.get("source_ip"), e.get("host")):
+                    if h:
+                        self.last_by_host[str(h)] = received_at
                 ts = int(e.get("_timestamp_ns") or 0)
                 if ts:
                     ms = (now_ns - ts) / 1e6
@@ -161,107 +154,6 @@ class FastPathStats:
                 "transport_ms_p95": round(sorted(ms)[int(len(ms) * 0.95) - 1 if len(ms) > 1 else 0], 1) if ms else None,
                 "last_test": self.last_test,
             }
-
-
-# --- how was this alarm detected? ---------------------------------------
-
-CURRENT_SIGNAL = contextvars.ContextVar("fastpath_signal", default=None)
-
-
-@contextmanager
-def signal(event, via="syslog"):
-    """Run a checker for one syslog event with the event's timing in scope,
-    so an occurrence opened as a result records when the device logged the
-    signal and by which path it was detected."""
-    token = CURRENT_SIGNAL.set({
-        "via": via,
-        "signal_at": event.get("device_timestamp") or event.get("timestamp"),
-    })
-    try:
-        yield
-    finally:
-        CURRENT_SIGNAL.reset(token)
-
-
-@contextmanager
-def attributed(via):
-    """Same, for paths that have no single event: the Loki poll ("loki"),
-    an SSH poll ("poll"), or a person resolving by hand (their name)."""
-    token = CURRENT_SIGNAL.set({"via": via, "signal_at": None})
-    try:
-        yield
-    finally:
-        CURRENT_SIGNAL.reset(token)
-
-
-def _iso_to_dt(value):
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-
-class LocalFirstAlertmanager:
-    """Alertmanager client wrapper: an alert we raise becomes an occurrence
-    here first (and pages), then goes to Alertmanager for its receivers.
-
-    `post_alerts` is the one method every checker uses to fire, heartbeat
-    and resolve, so this is the single place the local-first behaviour
-    lives; everything else is passed straight through. A heartbeat
-    (re-posting an alert that is already open) is harmless: open() is
-    idempotent and mark_paged fires exactly once. An alert with an
-    `endsAt` in the past is a resolve and closes the occurrence at once -
-    a link that came back up stops paging the moment the switch says so,
-    not when Alertmanager's resolved notification eventually lands.
-
-    Paging holds are respected: an occurrence someone delayed (page_at
-    set) or turned off (NARG) is not marked paged here."""
-
-    def __init__(self, inner, occurrences, fingerprint_for):
-        self.inner = inner
-        self._occurrences = occurrences          # callable -> OccurrenceStore or None
-        self._fingerprint_for = fingerprint_for
-        self.local_opens = 0
-        self.local_closes = 0
-
-    def __getattr__(self, name):
-        return getattr(self.inner, name)
-
-    def post_alerts(self, alerts):
-        for alert in alerts or []:
-            try:
-                self._apply_locally(alert)
-            except Exception:
-                log.exception("local-first alarm handling failed for %s", (alert.get("labels") or {}).get("alertname"))
-        return self.inner.post_alerts(alerts)
-
-    def _apply_locally(self, alert):
-        store = self._occurrences() if callable(self._occurrences) else self._occurrences
-        if store is None:
-            return
-        labels = alert.get("labels") or {}
-        signature = self._fingerprint_for(labels)
-        ctx = CURRENT_SIGNAL.get() or {}
-        ends = _iso_to_dt(alert.get("endsAt"))
-        if ends is not None and ends <= datetime.now(timezone.utc):
-            if store.close(signature, by=ctx.get("via") or "switchboard"):
-                self.local_closes += 1
-            return
-        annotations = alert.get("annotations") or {}
-        occ = store.open(
-            signature, labels.get("alertname", "unknown"), labels.get("severity"), annotations.get("summary"),
-            labels, started_at=alert.get("startsAt"),
-            detected_via=ctx.get("via") or "poll", signal_at=ctx.get("signal_at"),
-        )
-        if occ is None:
-            return
-        store.touch(signature)
-        if occ.get("paged_at") is None and not occ.get("paging_disabled") and occ.get("page_at") is None:
-            store.mark_paged(occ["id"])
-            self.local_opens += 1
 
 
 # --- the self-test line -------------------------------------------------

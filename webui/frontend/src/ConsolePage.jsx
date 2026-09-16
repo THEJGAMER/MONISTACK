@@ -26,7 +26,7 @@ import {
   getResult,
   deleteResult,
   getSyslog,
-  getAlarmHistory,
+  getDeviceEvents,
   listCommandHistory,
   clearCommandHistory,
   listFavorites,
@@ -135,14 +135,6 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
   // How far back the Alarm History tab looks. 7 days was the silent
   // default; now it is a visible choice, since each step up is a wider
   // Loki query and the tab re-fetches it on its own timer.
-  const ALARM_WINDOWS = [
-    { label: "Last 24 hours", value: "86400" },
-    { label: "Last 7 days", value: "604800" },
-    { label: "Last 30 days", value: "2592000" },
-  ];
-  const [alarmWindow, setAlarmWindow] = useState(ALARM_WINDOWS[1]);
-  const alarmWindowRef = useRef(alarmWindow);
-  alarmWindowRef.current = alarmWindow;
   const [boardItems, setBoardItems] = useState(loadBoardLayout);
   const [history, setHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -288,9 +280,9 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
   async function refreshAlarmHistory(deviceId) {
     setAlarmHistoryLoading(true);
     try {
-      setAlarmHistory(await getAlarmHistory(deviceId, Number(alarmWindowRef.current.value)));
+      setAlarmHistory(await getDeviceEvents(deviceId, 100));
     } catch (e) {
-      pushFlash("error", `Could not load alarm history: ${e.message}`);
+      pushFlash("error", `Could not load events: ${e.message}`);
     } finally {
       setAlarmHistoryLoading(false);
     }
@@ -333,10 +325,10 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
   useEffect(() => {
     if (!selected) return undefined;
     refreshAlarmHistory(selected.id);
-    const t = setInterval(() => refreshAlarmHistory(selected.id), 5 * 60 * 1000);
+    const t = setInterval(() => refreshAlarmHistory(selected.id), 30 * 1000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, alarmWindow]);
+  }, [selected]);
 
   const filteredDevices = useMemo(() => {
     const q = filterText.toLowerCase();
@@ -968,57 +960,51 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
                 ),
               },
               {
-                id: "alarmHistory",
-                label: "Alarm History",
+                id: "events",
+                label: "Events",
                 content: !selected ? (
                   <Box color="text-status-inactive">Select a device first.</Box>
                 ) : (
                   <SpaceBetween size="m">
                     <SpaceBetween size="xs" direction="horizontal" alignItems="center">
-                      <Select
-                        selectedOption={alarmWindow}
-                        onChange={({ detail }) => setAlarmWindow(detail.selectedOption)}
-                        options={ALARM_WINDOWS}
-                      />
-                      <Button
-                        iconName="refresh"
-                        loading={alarmHistoryLoading}
-                        onClick={() => refreshAlarmHistory(selected.id)}
-                      >
+                      <Button iconName="refresh" loading={alarmHistoryLoading} onClick={() => refreshAlarmHistory(selected.id)}>
                         Refresh
                       </Button>
-                      <Box color="text-status-inactive" fontSize="body-s">Refreshes every 5 minutes.</Box>
+                      <Box color="text-status-inactive" fontSize="body-s">
+                        This device's last 100 events. Refreshes every 30 seconds; the Events page has everything.
+                      </Box>
                     </SpaceBetween>
                     <Table
                       variant="embedded"
                       loading={alarmHistoryLoading}
                       items={alarmHistoryPage}
                       pagination={<Pagination {...alarmHistoryPagination} />}
+                      wrapLines
                       columnDefinitions={[
-                        { id: "time", header: "Time", cell: (e) => formatTime(e.device_timestamp) },
+                        { id: "time", header: "Raised", cell: (e) => formatTime(e.raised_at) },
                         {
                           id: "severity",
                           header: "Severity",
-                          cell: (e) => {
-                            if (e.alarm_severity === "critical") return <StatusIndicator type="error">Critical</StatusIndicator>;
-                            if (e.alarm_severity === "minor") return <StatusIndicator type="warning">Minor</StatusIndicator>;
-                            return <StatusIndicator type="success">Recovery</StatusIndicator>;
-                          },
+                          cell: (e) => (
+                            <StatusIndicator type={e.severity === "critical" ? "error" : e.severity === "warning" ? "warning" : "info"}>
+                              {e.severity}
+                            </StatusIndicator>
+                          ),
                         },
-                        { id: "component", header: "Component", cell: (e) => e.alarm_component || "-" },
-                        { id: "message", header: "Message", cell: (e) => e.detail || e.message },
+                        { id: "kind", header: "Event", cell: (e) => e.kind_name },
+                        { id: "what", header: "What", cell: (e) => <a href={`#/events/${e.id}`}>{e.title}</a> },
                         {
-                          id: "current",
-                          header: "",
-                          cell: (e) => (e.is_current ? <StatusIndicator type="in-progress">Active</StatusIndicator> : null),
+                          id: "state",
+                          header: "State",
+                          cell: (e) =>
+                            e.resolved_at ? (
+                              <StatusIndicator type="success">resolved by {e.resolved_by || "-"}</StatusIndicator>
+                            ) : (
+                              <StatusIndicator type="in-progress">open</StatusIndicator>
+                            ),
                         },
                       ]}
-                      empty={
-                        <Box textAlign="center">
-                          No hardware alarm history for this device yet - fan/PSU faults and recoveries will
-                          appear here as they're logged.
-                        </Box>
-                      }
+                      empty={<Box textAlign="center">No events for this device yet.</Box>}
                     />
                   </SpaceBetween>
                 ),

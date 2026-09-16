@@ -189,8 +189,6 @@ export const getSyslog = ({ deviceId, category, limit = 200 } = {}) => {
   return api(`/api/syslog${qs ? `?${qs}` : ""}`);
 };
 
-export const getAlarmHistory = (deviceId, sinceSeconds) =>
-  api(`/api/devices/${deviceId}/alarm-history${sinceSeconds ? `?since_seconds=${sinceSeconds}` : ""}`);
 
 // Runs several sequential SSH commands per device across the whole fleet
 // (LLDP, ARP, MAC table, port-channel membership) - the routine 60s
@@ -242,41 +240,13 @@ export const submitSetup = (body) =>
     body: JSON.stringify(body),
   });
 
-export const getAlerts = () => api("/api/alerts");
-export const getLiveAlerts = () => api("/api/alerts/live");
-export const getAlertsOverview = () => api("/api/alerts/overview");
 export const getAuditLog = (limit = 200) => api(`/api/audit-log?limit=${limit}`);
 
 // Alarm occurrences - one record per fired-to-resolved episode, each with
 // its own id and its own shareable URL. Occurrences of the same alarm are
 // linked (previous_occurrences) rather than merged.
-export const getAlarms = (limit = 200, signature) =>
-  api(`/api/alarms?limit=${limit}${signature ? `&signature=${encodeURIComponent(signature)}` : ""}`);
-export const getAlarm = (id) => api(`/api/alarms/${id}`);
-export const ackAlarm = (id, note) =>
-  api(`/api/alarms/${id}/ack`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ note: note || null }),
-  });
-export const unackAlarm = (id) => api(`/api/alarms/${id}/unack`, { method: "POST" });
-export const resolveAlarm = (id) => api(`/api/alarms/${id}/resolve`, { method: "POST" });
 
 // Paging control for one occurrence (see paging.py).
-export const pageNow = (id) => api(`/api/alarms/${id}/page-now`, { method: "POST" });
-export const delayPage = (id, seconds) =>
-  api(`/api/alarms/${id}/delay-page`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ seconds }),
-  });
-export const nargAlarm = (id, note) =>
-  api(`/api/alarms/${id}/narg`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ note: note || null }),
-  });
-export const enablePaging = (id) => api(`/api/alarms/${id}/enable-paging`, { method: "POST" });
 export const addComment = (id, body) =>
   api(`/api/alarms/${id}/comments`, {
     method: "POST",
@@ -286,32 +256,13 @@ export const addComment = (id, body) =>
 export const deleteComment = (id, commentId) =>
   api(`/api/alarms/${id}/comments/${commentId}`, { method: "DELETE" });
 
-export const listSilences = () => api("/api/silences");
-export const createSilence = (body) =>
-  api("/api/silences", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-export const deleteSilence = (id) => api(`/api/silences/${encodeURIComponent(id)}`, { method: "DELETE" });
 
-export const listAlertRules = () => api("/api/alert-rules");
-export const updateAlertRule = (name, body) =>
-  api(`/api/alert-rules/${encodeURIComponent(name)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
 
-export const listInterfaceAlerts = (deviceId) => api(`/api/interface-alerts?device_id=${encodeURIComponent(deviceId)}`);
 // `port` travels in the body, not the URL - real port names like
 // "Te 1/47" contain a "/" that a path segment can't safely carry (see
 // app.py's InterfaceAlertUpdateRequest for the live-confirmed 404 this
 // avoids).
-export const updateInterfaceAlert = (deviceId, port, body) =>
-  api(`/api/interface-alerts/${encodeURIComponent(deviceId)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ port, ...body }),
-  });
 
-export const getAlertHistory = (limit = 200) => api(`/api/alert-history?limit=${limit}`);
 
 export const getSettings = () => api("/api/settings");
 
@@ -330,7 +281,6 @@ export const createApiToken = (body) =>
 export const revokeApiToken = (id) => api(`/api/tokens/${id}`, { method: "DELETE" });
 
 // --- outbound webhooks (admin) ------------------------------------------
-export const listEvents = () => api("/api/events");
 export const listWebhooks = () => api("/api/webhooks");
 export const createWebhook = (body) =>
   api("/api/webhooks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -353,10 +303,7 @@ export const testPush = (endpoint) =>
 
 // --- the syslog fast path + syslog rules ---------------------------------
 const JSON_HEADERS = { "Content-Type": "application/json" };
-export const getFastPath = () => api("/api/alerting/fast-path");
 // The self-test waits for the line to come back through Vector (up to ~12s).
-export const testFastPath = (severity) =>
-  api("/api/alerting/fast-path/test", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ severity }) }, 30_000);
 export const listSyslogRules = () => api("/api/syslog-rules");
 export const createSyslogRule = (body) =>
   api("/api/syslog-rules", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body) });
@@ -365,3 +312,29 @@ export const updateSyslogRule = (id, body) =>
 export const deleteSyslogRule = (id) => api(`/api/syslog-rules/${id}`, { method: "DELETE" });
 export const matchSyslogRules = (body) =>
   api("/api/syslog-rules/match", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body) });
+
+// --- events -------------------------------------------------------------------
+export const listEvents = (params = {}) => {
+  const q = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== "" && v !== false) q.set(k, v === true ? "1" : v);
+  });
+  const qs = q.toString();
+  return api(`/api/events${qs ? `?${qs}` : ""}`);
+};
+export const getEvent = (id) => api(`/api/events/${id}`);
+export const resolveEvent = (id, note) =>
+  api(`/api/events/${id}/resolve`, { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ note }) });
+export const getDeviceEvents = (deviceId, limit = 50) => api(`/api/devices/${encodeURIComponent(deviceId)}/events?limit=${limit}`);
+export const getEventCatalog = () => api("/api/events/catalog");
+export const updateEventKind = (kind, body) =>
+  api(`/api/events/catalog/${encodeURIComponent(kind)}`, { method: "PUT", headers: JSON_HEADERS, body: JSON.stringify(body) });
+export const resetEventKind = (kind) => api(`/api/events/catalog/${encodeURIComponent(kind)}`, { method: "DELETE" });
+export const getPortSettings = (deviceId) => api(`/api/events/ports/${encodeURIComponent(deviceId)}`);
+export const setPortSeverity = (deviceId, port, severity) =>
+  api(`/api/events/ports/${encodeURIComponent(deviceId)}/${encodeURIComponent(port)}`, { method: "PUT", headers: JSON_HEADERS, body: JSON.stringify({ severity }) });
+export const getFastPath = () => api("/api/events/fast-path");
+// The self-test waits for the line to come back through Vector (up to ~12s).
+export const testFastPath = (severity) =>
+  api("/api/events/fast-path/test", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ severity }) }, 30_000);
+export const listWebhookEvents = () => api("/api/webhooks/events");

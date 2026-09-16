@@ -1,22 +1,18 @@
-/* Switchboard service worker: Web Push paging + a minimal app shell.
+/* Switchboard service worker: Web Push for events + a minimal app shell.
  *
  * Served from the site root (see app.py's /sw.js route) so its scope
  * covers the whole app - a worker served under /static/ could only
  * control /static/, and then no push would ever reach it.
  *
- * Pager semantics, not notification semantics:
- * - a critical page stays on screen until dealt with, and re-alerts
- *   (sound/vibration) on every repeat because repeats reuse the alarm's
- *   tag with renotify - one notification per alarm, updated, never a pile;
- * - the Acknowledge action acks from the lock screen using the browser's
- *   own session cookie, without opening the app;
- * - an "Acknowledged by X" push carries close:true: it dismisses the page
- *   on this device the moment anyone else picks it up, the way one person
- *   answering stops the whole team's pagers;
+ * - a raised event notifies with sound and a vibration pattern by
+ *   severity; critical stays on screen until dismissed;
+ * - the resolve of the same event reuses its tag with `quiet`, so it
+ *   replaces the raise silently rather than piling up;
  * - every push is also posted to any open tab so the page can play the
- *   in-app pager tone (a worker cannot play audio itself).
+ *   in-app tone (a worker cannot play audio itself);
+ * - no acknowledge: actioning belongs to the ticketing system.
  */
-const CACHE = "switchboard-shell-v2";
+const CACHE = "switchboard-shell-v3";
 
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (e) =>
@@ -73,13 +69,11 @@ self.addEventListener("push", (e) => {
 
   e.waitUntil(
     (async () => {
-      if (data.close) {
-        // Someone acknowledged it: take the page down here, then a short
-        // non-sticky note saying who, so the phone stops but the person
-        // holding it still knows what happened.
+      if (data.quiet) {
+        // The event resolved: replace its notification silently.
         const open = await self.registration.getNotifications({ tag });
         for (const n of open) n.close();
-        await self.registration.showNotification(data.title || "Acknowledged", {
+        await self.registration.showNotification(data.title || "Resolved", {
           body: data.body || "",
           tag,
           renotify: false,
@@ -87,7 +81,7 @@ self.addEventListener("push", (e) => {
           icon: "/icons/icon-192.png",
           badge: "/icons/badge-96.png",
           requireInteraction: false,
-          data: { url: data.url || "/", occurrence_id: data.occurrence_id || null, close: true },
+          data: { url: data.url || "/", event_id: data.event_id || null, quiet: true },
         });
         await tellOpenTabs(data);
         return;
@@ -95,8 +89,6 @@ self.addEventListener("push", (e) => {
       await self.registration.showNotification(data.title || "Switchboard", {
         body: data.body || "",
         tag,
-        // renotify: a repeat with the same tag replaces the old
-        // notification *and* alerts again. Without it a repeat is silent.
         renotify: true,
         silent: false,
         icon: "/icons/icon-192.png",
@@ -105,7 +97,7 @@ self.addEventListener("push", (e) => {
         requireInteraction: critical,
         vibrate: VIBRATE[severity] || VIBRATE.warning,
         actions: data.actions || [],
-        data: { url: data.url || "/", occurrence_id: data.occurrence_id || null, severity, repeat: data.repeat || 0 },
+        data: { url: data.url || "/", event_id: data.event_id || null, severity },
       });
       await tellOpenTabs(data);
     })()
@@ -128,35 +120,7 @@ async function focusOrOpen(url) {
 }
 
 self.addEventListener("notificationclick", (e) => {
-  const { url, occurrence_id } = e.notification.data || {};
-  if (e.action === "ack" && occurrence_id) {
-    // Same-origin fetch from the worker carries the session cookie, so
-    // this is authenticated as whoever is logged in on this device. If
-    // that session has expired the ack 401s and the app opens to log in.
-    e.waitUntil(
-      fetch(`/api/alarms/${occurrence_id}/ack`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ note: "Acknowledged from notification" }),
-        credentials: "same-origin",
-      })
-        .then((r) => {
-          if (r.ok) {
-            e.notification.close();
-            return self.registration.showNotification("Acknowledged", {
-              body: e.notification.title,
-              tag: e.notification.tag,
-              silent: true,
-              icon: "/icons/icon-192.png",
-              badge: "/icons/badge-96.png",
-            });
-          }
-          return focusOrOpen(url || "/");
-        })
-        .catch(() => focusOrOpen(url || "/"))
-    );
-    return;
-  }
+  const { url } = e.notification.data || {};
   e.notification.close();
   e.waitUntil(focusOrOpen(url || "/"));
 });

@@ -27,12 +27,7 @@ DEFAULT_LOKI_URL = "http://192.168.0.145:3100"
 # that (see the module docstring for why).
 SERVICE_SETTINGS = (
     ("loki_url", "LOKI_URL", DEFAULT_LOKI_URL),
-    ("alertmanager_url", "ALERTMANAGER_URL", "http://alertmanager:9093"),
     ("prometheus_url", "PROMETHEUS_URL", "http://prometheus:9090"),
-    # Blank means "derive from prometheus_url" - one less thing to keep in
-    # sync by hand, and getting it wrong silently breaks the Rules tab's
-    # live reload rather than erroring anywhere obvious.
-    ("prometheus_reload_url", "PROMETHEUS_RELOAD_URL", ""),
     # Not used to scrape (Prometheus does that) - only so the Settings page
     # can show whether the exporter is actually up.
     ("exporter_url", "EXPORTER_URL", "http://s4048-exporter:9101"),
@@ -48,16 +43,6 @@ SERVICE_SETTINGS = (
     # host:port, e.g. "192.168.0.144:514".
     ("syslog_receiver", "SYSLOG_RECEIVER", ""),
 )
-
-
-def reload_url_for(settings_dict):
-    """The Prometheus reload endpoint, derived from prometheus_url unless
-    explicitly overridden."""
-    explicit = (settings_dict.get("prometheus_reload_url") or "").strip()
-    if explicit:
-        return explicit
-    base = (settings_dict.get("prometheus_url") or "").strip().rstrip("/")
-    return f"{base}/-/reload" if base else ""
 
 
 def load():

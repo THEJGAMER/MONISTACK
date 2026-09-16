@@ -16,12 +16,8 @@ things a person deliberately created:
 1. **Deliberate keeps outlive automatic ones.** A saved result someone
    clicked Save on is not the same as the auto-saved copy of every command
    ever run, and they must not share a lifetime.
-2. **Never cascade over human records.** `alarm_acks` and `alarm_comments`
-   are `ON DELETE CASCADE` against `alert_occurrences`, so a naive
-   "delete old occurrences" silently destroys acknowledgements and
-   incident discussion. Confirmed real: a manual cleanup of ~20,800 junk
-   occurrences had to explicitly exclude rows carrying that data, and
-   would otherwise have taken 8 comments and 2 acks with it.
+2. **Resolved only.** An open event is live state, whatever its age; only
+   resolved events age out.
 
 `audit_log` is deliberately the longest-lived and is never trimmed by the
 aggressive default: it is the record of who did what, and an audit trail
@@ -62,17 +58,6 @@ class Policy:
         return _days(self.env_var, self.default_days)
 
 
-# Occurrences are matched on started_at, and any occurrence still carrying
-# human records is excluded outright rather than by age - see rule 2 above.
-_OCCURRENCE_SQL = """
-DELETE FROM alert_occurrences
- WHERE started_at < %s
-   AND resolved_at IS NOT NULL
-   AND id NOT IN (SELECT occurrence_id FROM alarm_comments WHERE occurrence_id IS NOT NULL)
-   AND id NOT IN (SELECT occurrence_id FROM alarm_acks     WHERE occurrence_id IS NOT NULL)
-   AND id NOT IN (SELECT occurrence_id FROM audit_log      WHERE occurrence_id IS NOT NULL)
-"""
-
 # Only the auto-saved copies age out. A result someone explicitly saved is
 # a deliberate keep and is left alone entirely by this policy.
 _RESULTS_SQL = "DELETE FROM results WHERE created_at < %s AND auto_saved = 1"
@@ -103,14 +88,9 @@ POLICIES = [
         note="optics/PSU - low volume, high diagnostic value over long periods",
     ),
     Policy(
-        "alert_history", "RETAIN_ALERT_HISTORY_DAYS", 90,
-        "DELETE FROM alert_history WHERE received_at < %s",
-        note="raw Alertmanager webhook log; the durable record is alert_occurrences",
-    ),
-    Policy(
-        "alert_occurrences", "RETAIN_OCCURRENCES_DAYS", 180,
-        _OCCURRENCE_SQL,
-        note="resolved only, and never one carrying acks/comments/audit entries",
+        "events", "RETAIN_EVENTS_DAYS", 180,
+        "DELETE FROM events WHERE resolved_at IS NOT NULL AND resolved_at < %s",
+        note="resolved only - an open event is live state whatever its age",
     ),
     Policy(
         "results", "RETAIN_AUTOSAVED_RESULTS_DAYS", 90,

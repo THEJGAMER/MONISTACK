@@ -27,12 +27,8 @@ from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
 import junos_parsers
-import alert_acks
 import audit
 import auth
-import occurrences
-import paging
-from alertmanager_client import AlertmanagerClient, AlertmanagerError
 import logging_setup
 import metrics
 import opnsense_parsers
@@ -44,15 +40,16 @@ from devices import DeviceConfigError, StoredDevice, load_devices
 from loki_client import LokiClient, LokiError
 from results_store import ResultsStore
 from scheduler import ScheduleStore
-import alert_rules
 import command_history
 import compliance
-import hardware_alerting
-import interface_alerting
 import retention
 import api_tokens
 import dns_cache
+import event_catalog
+import event_detect
+import event_reconcile
 import events
+import eventstore
 import fastpath
 import push as push_module
 import syslog_alerting
@@ -74,58 +71,19 @@ DEVICES_PATH = os.environ.get("DEVICES_FILE", str(BASE_DIR / "devices.yaml"))
 LEGACY_STORE_PATH = os.environ.get("DEVICE_STORE_FILE", str(BASE_DIR / "data" / "devices_store.json"))
 LEGACY_SQLITE_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "data" / "switchboard.db"))
 
-# Alertmanager (ROADMAP 3.2), unlike Loki, is a fixed service in this same
-# docker-compose stack rather than something reachable at a
-# deployment-specific address on a separate host - a plain env-var default
-# is enough, no need for the Settings-page-editable DSN treatment Loki
-# gets.
-ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "http://alertmanager:9093")
-# Local-first (see fastpath.py): an alert this app raises opens its
-# occurrence and pages here, then goes to Alertmanager for its receivers.
-# OCCURRENCES is looked up at call time - it does not exist yet here, and
-# _load_database replaces it on every reconfiguration.
-ALERTMANAGER = fastpath.LocalFirstAlertmanager(
-    AlertmanagerClient(ALERTMANAGER_URL), lambda: globals().get("OCCURRENCES"), alert_acks.fingerprint_for)
-PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
-# How long an alarm is held back from paging so it can be looked at first
-# (see paging.py). 0 disables the hold entirely and restores "page the
-# instant it fires". Applies to new alarms only - anything already held
-# keeps the window it was given.
-PAGE_DELAY_SECONDS = int(os.environ.get("PAGE_DELAY_SECONDS", "120"))
-# How long an open occurrence must go without *any* instance reporting its
-# alarm active before it's closed (see occurrences.stale_open). Needs to
-# comfortably exceed the 3s sync tick plus a slow Alertmanager/Prometheus
-# round trip, so a single slow or failed poll never ends a live alarm;
-# 90s costs at most that much delay on a resolve, against the alternative
-# of spuriously closing and reopening real alarms every few seconds.
-OCCURRENCE_CLOSE_GRACE_SECONDS = int(os.environ.get("OCCURRENCE_CLOSE_GRACE_SECONDS", "90"))
 # How quiet the syslog pipeline may go before the Settings health panel
 # calls it stale. Generous by default: a small fleet can genuinely be
 # silent for a while, and this should flag "the pipeline is dead", not
 # "the switches had nothing to say for ten minutes".
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
+EXPORTER_URL = os.environ.get("EXPORTER_URL", "http://s4048-exporter:9101")
 SYSLOG_STALE_AFTER_SECONDS = int(os.environ.get("SYSLOG_STALE_AFTER_SECONDS", "1800"))
 # Same idea for sFlow. Shorter than syslog's window because sFlow is
 # continuous by nature - a switch with any traffic at all samples
 # constantly, so silence means the pipeline is broken rather than "nothing
 # happened to be said".
 SFLOW_STALE_AFTER_SECONDS = int(os.environ.get("SFLOW_STALE_AFTER_SECONDS", "600"))
-PAGER = paging.PagingController(ALERTMANAGER, PAGE_DELAY_SECONDS)
-# Holds placed before an alarm exists as an occurrence, keyed by signature.
-# A hold has to be in place *before* Alertmanager dispatches (group_wait is
-# 0s, so the webhook telling us it fired arrives after the page would have
-# gone out), but the occurrence record only exists once it has fired - so
-# the hold waits here in between. In-memory on purpose: losing it across a
-# restart means the alarm pages immediately, which is the safe direction.
-PENDING_HOLDS = {}
 
-# Where the Rules tab writes the generated alert rules file, and where it
-# asks Prometheus to reload from - see docker-compose.yml for both the
-# writable bind mount at this exact path and --web.enable-lifecycle.
-ALERT_RULES_FILE = os.environ.get("ALERT_RULES_FILE", str(BASE_DIR / "data" / "prometheus-alerts.yml"))
-PROMETHEUS_RELOAD_URL = os.environ.get("PROMETHEUS_RELOAD_URL", "http://prometheus:9090/-/reload")
-# Not scraped by the webui (Prometheus does that) - held only so the
-# Settings page can report whether the exporter is actually reachable.
-EXPORTER_URL = os.environ.get("EXPORTER_URL", "http://s4048-exporter:9101")
 # Where sfacctd runs. Never connected to - flows arrive via Postgres - but
 # named by the health panel so "no flows" comes with somewhere to look.
 SFLOW_COLLECTOR = os.environ.get("SFLOW_COLLECTOR", "")
@@ -478,8 +436,6 @@ STORE = None
 RESULTS = None
 TOPOLOGY_STORE = None
 SCHEDULES = None
-ALERT_RULES = None
-INTERFACE_ALERT_RULES = None
 COMMAND_HISTORY = None
 FAVORITES = None
 DNS = dns_cache.DnsCache()
@@ -493,23 +449,7 @@ PUSH_KEYS = None
 SFLOW = None
 NETFLOW = None
 SFLOW_IFINDEX = None
-OCCURRENCES = None
 AUDIT = None
-# Not reset on DB reconfigure like the stores above - it's just in-memory
-# down-tracking state (see InterfaceAlertChecker's docstring), no reason
-# to lose it because Settings saved a new Postgres DSN.
-INTERFACE_ALERT_CHECKER = interface_alerting.InterfaceAlertChecker()
-# Re-establish tracking for whatever InterfaceDown alerts are still
-# genuinely active in Alertmanager right now, so a webui restart mid-alert
-# doesn't orphan them (see InterfaceAlertChecker.reseed_from_alertmanager
-# and reconcile_via_poll's docstring - a real restart-mid-outage bug that
-# left a resolved-in-reality alert paging for ~10 extra minutes).
-INTERFACE_ALERT_CHECKER.reseed_from_alertmanager(ALERTMANAGER)
-# Same in-memory, not-reset-on-DB-reconfigure treatment as
-# INTERFACE_ALERT_CHECKER above, for the same reason - see
-# hardware_alerting.py's HardwareAlertChecker docstring.
-HARDWARE_ALERT_CHECKER = hardware_alerting.HardwareAlertChecker()
-HARDWARE_ALERT_CHECKER.reseed_from_alertmanager(ALERTMANAGER)
 
 # The syslog fast path (fastpath.py): Vector POSTs events here as they
 # arrive; the token is what lets it. Blank = endpoint answers 503 and
@@ -517,8 +457,17 @@ HARDWARE_ALERT_CHECKER.reseed_from_alertmanager(ALERTMANAGER)
 SYSLOG_INGEST_TOKEN = (os.environ.get("SYSLOG_INGEST_TOKEN") or "").strip()
 SYSLOG_RECEIVER = (os.environ.get("SYSLOG_RECEIVER") or "").strip()
 FAST_PATH = fastpath.FastPathStats()
-SYSLOG_RULES = None   # syslog_alerting.SyslogRuleStore, once the database is up
-SYSLOG_RULE_ENGINE = syslog_alerting.SyslogRuleEngine()
+# Event-driven monitoring (see event_catalog.py): built once the database
+# is up. The syslog detector and the SSH reconciler both write into one
+# event store; nothing sits between a signal and an event but this process.
+SYSLOG_RULES = None      # syslog_alerting.SyslogRuleStore
+EVENTS = None            # eventstore.EventStore
+EVENT_SETTINGS = None    # event_catalog.EventSettings
+PORT_SETTINGS = None     # event_catalog.PortSettings
+SYSLOG_DETECTOR = None   # event_detect.SyslogDetector
+SSH_RECONCILER = None    # event_reconcile.SshReconciler
+_LIST_CACHE = {}
+_STARTED_AT = datetime.now(timezone.utc)
 DEVICES = []
 DEVICES_BY_ID = {}
 LOKI = None
@@ -723,47 +672,9 @@ def _port_state_for(device_id, port):
     return None
 
 
-def _port_state_and_polled_at_for(device_id, port):
-    """Like _port_state_for, but also returns the status poller's own
-    `last_polled` timestamp - interface_alerting.py's reconcile_via_poll
-    needs this to tell a genuinely fresh SSH poll apart from re-reading
-    the same cached snapshot it already considered."""
-    status = STATUS.get(device_id, include_interfaces=True)
-    if status is None:
-        return None, None
-    polled_at = status.get("last_polled")
-    for iface in status.get("interfaces", []):
-        if iface.get("port") == port:
-            return iface.get("port_state"), polled_at
-    return None, polled_at
-
-
 def _device_name_for(device_id):
     device = DEVICES_BY_ID.get(device_id)
     return device.name if device else device_id
-
-
-# Per-interface down-alerting (ROADMAP 3.2's Interfaces tab, see
-# interface_alerting.py) - same 30s cadence as the status poller's fast
-# poll, since it's reading that same already-polled state rather than
-# doing its own SSH.
-def _interface_alert_loop():
-    while True:
-        time.sleep(30)
-        if DB is None or INTERFACE_ALERT_RULES is None:
-            continue
-        try:
-            configs = INTERFACE_ALERT_RULES.list()
-        except Exception:
-            log.exception("interface alert config lookup failed")
-            continue
-        try:
-            INTERFACE_ALERT_CHECKER.check_once(configs, _port_state_for, _device_name_for, ALERTMANAGER)
-        except Exception:
-            log.exception("interface alert check failed")
-
-
-threading.Thread(target=_interface_alert_loop, daemon=True, name="interface-alert-checker").start()
 
 
 # Fast path for "immediate" mode - a 30s-bounded SSH poll cycle isn't
@@ -801,106 +712,6 @@ class PollBackoff:
         return min(self.cap, self.base * (2 ** self.failures))
 
 
-def _interface_alert_syslog_loop():
-    backoff = PollBackoff()
-    while True:
-        time.sleep(backoff.delay)
-        if DB is None or INTERFACE_ALERT_RULES is None or LOKI is None:
-            continue
-        try:
-            configs = INTERFACE_ALERT_RULES.list()
-        except Exception:
-            log.exception("interface alert config lookup failed (syslog path)")
-            continue
-        try:
-            with fastpath.attributed("loki"):
-                ok = INTERFACE_ALERT_CHECKER.check_via_syslog(configs, LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
-            backoff.ok() if ok else backoff.failed()
-        except Exception:
-            backoff.failed()
-            log.exception("interface alert syslog check failed")
-
-
-threading.Thread(target=_interface_alert_syslog_loop, daemon=True, name="interface-alert-syslog-checker").start()
-
-
-# Reconciliation for currently-alerting immediate-mode ports (ROADMAP
-# 3.2, user request 2026-08-01) - every 5s, checks whether a still-firing
-# alert's real polled state has since gone back up, in case the syslog
-# "up" event that would normally resolve it got missed (Vector hiccup,
-# Loki ingestion gap). See interface_alerting.py's reconcile_via_poll for
-# why this is safe against the stale-read hazard that ruled out a
-# simpler "just let check_once resolve too" design.
-def _interface_alert_reconcile_loop():
-    while True:
-        time.sleep(5)
-        if DB is None or INTERFACE_ALERT_RULES is None:
-            continue
-        try:
-            configs = INTERFACE_ALERT_RULES.list()
-        except Exception:
-            log.exception("interface alert config lookup failed (reconcile path)")
-            continue
-        try:
-            INTERFACE_ALERT_CHECKER.reconcile_via_poll(configs, _port_state_and_polled_at_for, _device_name_for, ALERTMANAGER)
-        except Exception:
-            log.exception("interface alert reconcile check failed")
-
-
-threading.Thread(target=_interface_alert_reconcile_loop, daemon=True, name="interface-alert-reconciler").start()
-
-
-def _env_and_polled_at_for(device_id):
-    """Like _port_state_and_polled_at_for, but the whole environment
-    (fans/psus) rather than one interface - hardware_alerting.py's
-    reconcile_via_poll needs both the raw show-environment shape and the
-    freshness timestamp for the same stale-read-hazard reasons
-    interface_alerting.py's reconcile_via_poll does."""
-    status = STATUS.get(device_id)
-    if status is None:
-        return None, None
-    return status.get("env"), status.get("last_polled")
-
-
-# Fan/PSU hardware alerting - same syslog-primary/poll-fallback shape as
-# interface alerting above, minus the immediate/delayed mode split (no
-# per-entity opt-in table here - see hardware_alerting.py for why). Only
-# two loops are needed, not three: reconcile_via_poll here does both the
-# fire and resolve/restart-recovery jobs interface_alerting.py splits
-# across check_once and reconcile_via_poll, since there's no "confirmed
-# down for N seconds" delayed-mode concept to keep separate.
-
-
-def _hardware_alert_syslog_loop():
-    backoff = PollBackoff()
-    while True:
-        time.sleep(backoff.delay)
-        if LOKI is None:
-            continue
-        try:
-            with fastpath.attributed("loki"):
-                ok = HARDWARE_ALERT_CHECKER.check_via_syslog(LOKI, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
-            backoff.ok() if ok else backoff.failed()
-        except Exception:
-            backoff.failed()
-            log.exception("hardware alert syslog check failed")
-
-
-threading.Thread(target=_hardware_alert_syslog_loop, daemon=True, name="hardware-alert-syslog-checker").start()
-
-
-def _hardware_alert_reconcile_loop():
-    while True:
-        time.sleep(10)
-        try:
-            HARDWARE_ALERT_CHECKER.reconcile_via_poll(
-                list(DEVICES_BY_ID.keys()), _env_and_polled_at_for, _device_name_for, ALERTMANAGER
-            )
-        except Exception:
-            log.exception("hardware alert reconcile check failed")
-
-
-threading.Thread(target=_hardware_alert_reconcile_loop, daemon=True, name="hardware-alert-reconciler").start()
 
 
 # --- the syslog fast path: evaluate on arrival ---------------------------
@@ -910,13 +721,20 @@ threading.Thread(target=_hardware_alert_reconcile_loop, daemon=True, name="hardw
 # keeps a timestamp cursor, so the poll behind this sees what the fast
 # path already handled as done.
 
-_LIST_CACHE = {}
 
+
+# --- event-driven monitoring ------------------------------------------------
+# Syslog first: Vector POSTs each parsed line to /api/ingest/syslog the
+# moment it arrives (fastpath.py) and event_detect turns it into an event
+# transition. The Loki poll behind it engages only while the fast path is
+# silent. The SSH poll (status_poller) is the fallback for what syslog
+# never said, reconciled every cycle by event_reconcile. Timers close what
+# nothing else can. Everything lands in one event store; the store's hooks
+# put every transition on the bus for push and webhooks.
 
 def _cached_list(key, ttl, fn):
-    """A per-batch DB read for interface configs / rules would be one
-    query per syslog event under load; a few seconds of staleness for a
-    rule edit is nothing."""
+    """A per-line DB read for the rule list would be one query per syslog
+    line under load; a few seconds of staleness for a rule edit is nothing."""
     now = time.monotonic()
     hit = _LIST_CACHE.get(key)
     if hit and now - hit[0] < ttl:
@@ -927,355 +745,135 @@ def _cached_list(key, ttl, fn):
 
 
 def _device_for_event(event):
-    """(device_id or "", display name) for a syslog event - by source
+    """(device_id or "", display name) for a syslog line - by source
     address first (that is what the devices table records), then by the
-    hostname the device wrote into the line, else the hostname itself so
-    a sender we do not manage still alarms under its own name."""
+    hostname the device wrote into the line, else the hostname itself so a
+    sender we do not manage still raises under its own name."""
     host = event.get("source_ip") or event.get("device_host") or event.get("host") or ""
     for d in DEVICES_BY_ID.values():
         if d.host == host:
             return d.id, d.name
     name = str(event.get("device_host") or event.get("host") or host or "unknown")
     for d in DEVICES_BY_ID.values():
-        if d.name.lower() == name.lower():
+        if d.host == name or d.name.lower() == name.lower():
             return d.id, d.name
     return "", name
 
 
-def _handle_syslog_events(events):
-    """Run every checker over freshly arrived events. Returns how many
-    alarms fired or cleared. Each event runs inside fastpath.signal so
-    the occurrence it opens records when the device logged it."""
-    if not events:
+def _handle_syslog_events(events, source="syslog"):
+    """Run the detectors over freshly arrived lines. Returns transitions."""
+    if not events or SYSLOG_DETECTOR is None:
         return 0
-    configs = _cached_list("interface_configs", 5, lambda: INTERFACE_ALERT_RULES.list() if INTERFACE_ALERT_RULES is not None else [])
     rules = _cached_list("syslog_rules", 5, lambda: SYSLOG_RULES.list(enabled_only=True) if SYSLOG_RULES is not None else [])
-    acted = 0
-    for event in sorted(events, key=lambda e: int(e.get("_timestamp_ns") or 0)):
-        with fastpath.signal(event):
-            try:
-                acted += INTERFACE_ALERT_CHECKER.process_events([event], configs, DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
-            except Exception:
-                log.exception("fast path: interface check failed")
-            try:
-                acted += HARDWARE_ALERT_CHECKER.process_events([event], DEVICES_BY_ID, ALERTMANAGER, _device_name_for)
-            except Exception:
-                log.exception("fast path: hardware check failed")
-            if rules:
-                try:
-                    acted += SYSLOG_RULE_ENGINE.evaluate_new([event], rules, _device_for_event, ALERTMANAGER)
-                except Exception:
-                    log.exception("fast path: syslog rules failed")
-    return acted
+    ordered = sorted(events, key=lambda e: int(e.get("_timestamp_ns") or 0))
+    return SYSLOG_DETECTOR.process(ordered, _device_for_event, rules=rules, source=source)
 
 
-def _syslog_rules_tick_loop():
-    """Auto-resolve expired rule alarms and heartbeat the rest."""
+def _event_timers_loop():
+    """Every 10s: expire timer-resolved kinds and rule events; raise or
+    resolve "syslog silent" per device from what the fast path has seen."""
     while True:
-        time.sleep(3)
-        if SYSLOG_RULES is None:
+        time.sleep(10)
+        if EVENTS is None:
             continue
         try:
-            SYSLOG_RULE_ENGINE.tick(ALERTMANAGER)
+            for entry in event_catalog.CATALOG:
+                if entry.get("ttl_seconds"):
+                    EVENTS.expire(entry["kind"], entry["ttl_seconds"])
+            if SYSLOG_RULES is not None:
+                syslog_alerting.expire_rules(EVENTS, _cached_list("syslog_rules", 5, lambda: SYSLOG_RULES.list(enabled_only=True)))
         except Exception:
-            log.exception("syslog rule tick failed")
+            log.exception("event timer pass failed")
+        try:
+            _check_syslog_silence()
+        except Exception:
+            log.exception("syslog-silence check failed")
 
 
-threading.Thread(target=_syslog_rules_tick_loop, daemon=True, name="syslog-rules-tick").start()
+def _check_syslog_silence():
+    """A device whose syslog has gone quiet for longer than the threshold
+    raises device.syslog_silent; the next line from it resolves. Only
+    meaningful once the fast path has heard *something* since start -
+    before that, silence is ours, not the device's."""
+    if not SYSLOG_INGEST_TOKEN or FAST_PATH.total == 0 or EVENT_SETTINGS is None:
+        return
+    minutes = int(EVENT_SETTINGS.params_for("device.syslog_silent").get("minutes", 30))
+    threshold = minutes * 60
+    now = datetime.now(timezone.utc)
+    if (now - _STARTED_AT).total_seconds() < threshold:
+        return
+    for d in list(DEVICES):
+        last = FAST_PATH.last_by_host.get(d.host) or FAST_PATH.last_by_host.get(d.name)
+        subject = "syslog"
+        if last is None or (now - last).total_seconds() > threshold:
+            sev = EVENT_SETTINGS.severity_for("device.syslog_silent")
+            if sev == "ignore":
+                continue
+            EVENTS.raise_event("device.syslog_silent", sev, d.id, d.name, subject,
+                               f"No syslog from {d.name} for {minutes} min",
+                               detail=("never since start" if last is None else f"last line {last.isoformat()}"), source="switchboard")
+        else:
+            open_ev = EVENTS.open_kind("device.syslog_silent", d.id, subject)
+            if open_ev:
+                EVENTS.resolve(open_ev["signature"], by="syslog", detail="a line arrived")
 
 
-def _syslog_rules_fallback_loop():
-    """The Loki poll behind the fast path, for rules - engaged only while
-    the fast path has been silent for 30s (Vector's sink down, token
-    wrong, Switchboard just restarted mid-burst). While events are
-    flowing this does nothing, so it costs Loki nothing in the normal
-    case; when they are not, rules still fire, a few seconds late."""
+threading.Thread(target=_event_timers_loop, daemon=True, name="event-timers").start()
+
+
+def _ssh_reconcile_loop():
+    """Every 15s, reconcile each device's cached SSH poll with the open
+    events (event_reconcile.py) - never an extra SSH round trip."""
+    while True:
+        time.sleep(15)
+        if SSH_RECONCILER is None:
+            continue
+        for d in list(DEVICES):
+            try:
+                SSH_RECONCILER.reconcile(d.id, d.name, STATUS.get(d.id, include_interfaces=True))
+            except Exception:
+                log.exception("ssh reconcile failed for %s", d.id)
+
+
+threading.Thread(target=_ssh_reconcile_loop, daemon=True, name="ssh-reconcile").start()
+
+
+def _syslog_fallback_loop():
+    """The Loki poll behind the fast path, engaged only while the fast
+    path has been silent for 30s (or was never configured). While lines
+    are flowing this costs Loki nothing; when they are not, events still
+    happen, a few seconds late. The detector's cursor makes the two paths
+    one stream."""
     backoff = PollBackoff(base=5.0)
     while True:
         time.sleep(backoff.delay)
-        if LOKI is None or SYSLOG_RULES is None:
+        if LOKI is None or SYSLOG_DETECTOR is None:
             continue
         last = FAST_PATH.last_received_at
         if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < 30:
             backoff.ok()
             continue
         try:
-            rules = SYSLOG_RULES.list(enabled_only=True)
-        except Exception:
-            log.exception("syslog rule lookup failed (fallback path)")
-            continue
-        if not rules:
-            continue
-        try:
-            events = LOKI.query_range(filters=None, limit=200, since_seconds=20)
+            events_ = LOKI.query_range(filters=None, limit=200, since_seconds=20)
         except Exception:
             backoff.failed()
             continue
         backoff.ok()
         try:
-            with fastpath.attributed("loki"):
-                SYSLOG_RULE_ENGINE.evaluate_new(sorted(events, key=lambda e: int(e.get("_timestamp_ns") or 0)),
-                                                rules, _device_for_event, ALERTMANAGER)
+            _handle_syslog_events(events_, source="loki")
         except Exception:
-            log.exception("syslog rules fallback evaluation failed")
+            log.exception("syslog fallback evaluation failed")
 
 
-threading.Thread(target=_syslog_rules_fallback_loop, daemon=True, name="syslog-rules-fallback").start()
+threading.Thread(target=_syslog_fallback_loop, daemon=True, name="syslog-fallback").start()
 
 
-def _place_hold(labels, signature=None):
-    """Puts the investigation hold on an alarm that is about to fire, and
-    remembers it until the occurrence exists to attach it to. Safe to call
-    more than once for the same alarm - a second call while a hold is
-    already recorded is a no-op rather than a stacked silence.
-
-    Only ever called for Prometheus-rule ("environmental" hardware) alarms
-    - see _paging_scheduler_loop's docstring for why interface alerts are
-    deliberately excluded from paging holds entirely.
-
-    The duration comes from the alert rule's own page_delay_seconds if one
-    is set (Rules tab), falling back to the app-wide PAGE_DELAY_SECONDS -
-    looked up by alertname, since that's the identity a Rules tab entry
-    has and labels don't carry a rule name of their own."""
-    alertname = labels.get("alertname")
-    delay_seconds = PAGE_DELAY_SECONDS
-    if ALERT_RULES is not None and alertname:
-        try:
-            delay_seconds = ALERT_RULES.page_delay_for(alertname, PAGE_DELAY_SECONDS)
-        except Exception:
-            log.exception("could not look up page delay for rule %s - using app-wide default", alertname)
-    if delay_seconds <= 0:
-        return
-    signature = signature or alert_acks.fingerprint_for(labels)
-    if signature in PENDING_HOLDS:
-        return
-    silence_id, page_at = PAGER.hold_for_duration(labels, delay_seconds)
-    if silence_id:
-        PENDING_HOLDS[signature] = (silence_id, page_at.isoformat())
-        log.info("paging held for %ss: %s", delay_seconds, alertname)
-
-
-def _gather_pending_alerts():
-    """Every alert currently inside a confirmation window and nowhere
-    else - Prometheus rules still in their `for:` window, plus
-    interface_alerting's delayed-mode ports still counting down toward
-    `delay_seconds`. Same two sources api_list_alerts_live merges for the
-    Active alerts tab's "pending" rows; factored out here so the occurrence
-    sync loop can open a record for them too."""
-    pending = _prometheus_pending_rules()
-    if DB is not None and INTERFACE_ALERT_RULES is not None:
-        try:
-            configs = INTERFACE_ALERT_RULES.list()
-            pending += INTERFACE_ALERT_CHECKER.pending_entries(configs, _device_name_for)
-        except Exception:
-            log.exception("could not compute pending interface-alert entries for occurrence sync")
-    return pending
-
-
-def _sync_occurrences():
-    """Opens and closes occurrences from real system state - Alertmanager's
-    own alert list, plus Prometheus/interface "pending" state - rather than
-    relying on the Alertmanager webhook.
-
-    The webhook can't be the source of truth here, confirmed live: a
-    silence suppresses *every* receiver, including this app's webhook. Since
-    paging holds are silences (paging.py), a held alarm produced no webhook
-    at all - so it got no occurrence, no countdown, and nothing to press
-    Page now on. The webhook also never fires for something that never
-    crosses Prometheus's `for:` window at all: a condition that goes
-    pending and clears again before ever firing produces zero
-    notifications, so it was previously invisible everywhere, including
-    the alarm log - confirmed live (a Te 1/47 flap and an EX3300 flap, both
-    real, neither logged anywhere for later investigation). This function
-    fixes both gaps by opening a record for a pending alarm immediately,
-    the moment Prometheus or interface_alerting first reports it - not
-    waiting for it to actually fire.
-
-    Alertmanager's /api/v2/alerts *does* list suppressed alerts (state
-    "suppressed"), so polling it sees held and silenced alarms alike. The
-    webhook still records notification history and closes occurrences
-    promptly for the unheld, already-firing case; this loop is what makes
-    the record complete rather than only covering alarms that happened to
-    notify."""
-    try:
-        alerts = ALERTMANAGER.list_alerts() or []
-    except AlertmanagerError:
-        return  # transient - next tick will catch up
-
-    firing_signatures = set()
-    for alert in alerts:
-        labels = alert.get("labels", {})
-        signature = alert_acks.fingerprint_for(labels)
-        firing_signatures.add(signature)
-        occurrence = OCCURRENCES.open(
-            signature,
-            labels.get("alertname", "unknown"),
-            labels.get("severity"),
-            alert.get("annotations", {}).get("summary"),
-            labels,
-            started_at=alert.get("startsAt"),
-        )
-        if occurrence is None or occurrence["paged_at"] or occurrence["paging_disabled"]:
-            continue
-        if occurrence["page_at"] is None:
-            held = PENDING_HOLDS.pop(signature, None)
-            if held:
-                OCCURRENCES.set_paging(occurrence["id"], held[1], held[0])
-            else:
-                # Nothing held it back, so Alertmanager has already
-                # notified - record that instead of showing a countdown
-                # for a page that has been and gone.
-                OCCURRENCES.mark_paged(occurrence["id"])
-
-    # A pending alarm gets its own occurrence too - opened now, with no
-    # page_at yet (that arrives once _place_hold actually places a hold, or
-    # once it fires for real and the branch above takes over). This is what
-    # makes a condition that never crosses `for:` still end up logged: it
-    # gets a record the moment it's first seen, not the moment it fires.
-    pending_signatures = set()
-    for alert in _gather_pending_alerts():
-        labels = alert.get("labels", {})
-        signature = alert_acks.fingerprint_for(labels)
-        pending_signatures.add(signature)
-        if signature in firing_signatures:
-            continue  # already open via the real alert above - don't reopen/duplicate
-        OCCURRENCES.open(
-            signature,
-            labels.get("alertname", "unknown"),
-            labels.get("severity"),
-            alert.get("annotations", {}).get("summary"),
-            labels,
-            started_at=alert.get("startsAt"),
-        )
-
-    # Anything open that's neither firing nor still pending is over. The
-    # case worth naming: an alarm that recovered *inside* its paging hold,
-    # which is exactly what the hold exists for - it closes here having
-    # never paged. A pending-only alarm that simply cleared before ever
-    # firing closes the same way, which is the fix for the logging gap
-    # above: it now has a start time, an end time, and a full timeline,
-    # instead of never having existed as a record at all.
-    # Record that everything we *can* see is genuinely still active, before
-    # deciding what to close. Closing is deliberately evidence-based -
-    # "nobody has seen this active for a while" - rather than absence-based
-    # ("it isn't in my view this instant"), because this instance's view is
-    # not always complete. Found live: a second Switchboard sharing this
-    # database reconciles against its own Alertmanager, so each instance
-    # kept closing occurrences the other had just opened and the other
-    # immediately reopened them - ~19,800 junk rows for one continuously
-    # down device. The same flaw bites a single instance whenever
-    # Alertmanager or Prometheus blips for one tick. See db.py's
-    # last_seen_at comment.
-    never_closing = firing_signatures | pending_signatures
-    for signature in never_closing:
-        OCCURRENCES.touch(signature)
-
-    for occurrence in OCCURRENCES.stale_open(OCCURRENCE_CLOSE_GRACE_SECONDS):
-        if occurrence["signature"] in never_closing:
-            continue
-        if occurrence["silence_id"]:
-            PAGER.release(occurrence["silence_id"])
-        # A pending alarm can have a hold already placed (by _place_hold,
-        # ahead of ever firing) without it having been attached to the row
-        # yet - that only happens once it actually fires. Release it here
-        # too, or a hold placed for something that recovered while merely
-        # pending would just sit until Alertmanager auto-expires it rather
-        # than being cleaned up the moment we know it's no longer needed.
-        held = PENDING_HOLDS.pop(occurrence["signature"], None)
-        if held:
-            PAGER.release(held[0])
-        OCCURRENCES.close(occurrence["signature"], by="sync")
-        if occurrence["paged_at"] is None:
-            log.info("alarm %s cleared without ever paging", occurrence["id"])
-
-
-def _paging_scheduler_loop():
-    """Three jobs, all on the same 3s tick:
-
-    1. Put the paging hold on Prometheus rule alerts while they're still in
-       their `for:` window - the only moment that's possible, since
-       Alertmanager dispatches the instant they fire.
-
-       Deliberately Prometheus-rule alerts only - PSU/fan/device/optic
-       alarms, the "environmental" hardware alarms. Interface link-state
-       alerts (InterfaceDown) never get a paging hold: confirmed live this
-       was a real mistake when it briefly existed - a hold was appearing
-       on a genuine, real-time interface-down page, adding a 120s
-       investigation delay the user never asked for and doesn't apply to
-       interfaces at all. The Interfaces tab already has its own, separate
-       "immediate vs delayed" concept (how long a port must stay down
-       before it's even considered a fault, per interface_alerting.py) -
-       that's the only delay meant to apply to interface alerts. Once one
-       fires, it pages immediately, same as before paging holds existed.
-    2. Keep occurrences in step with Alertmanager, including suppressed
-       ones the webhook can never report (see above).
-    3. Mark an occurrence paged once its hold lapses, so the record matches
-       what Alertmanager actually did."""
-    while True:
-        time.sleep(3)
-        if DB is None or OCCURRENCES is None:
-            continue
-        try:
-            for alert in _prometheus_pending_rules():
-                _place_hold(alert.get("labels", {}))
-        except Exception:
-            log.exception("paging pre-hold check failed")
-        try:
-            _sync_occurrences()
-        except Exception:
-            log.exception("occurrence sync failed")
-        try:
-            for occurrence in OCCURRENCES.due_to_page():
-                OCCURRENCES.mark_paged(occurrence["id"])
-                log.info("alarm %s paging hold lapsed - now paging", occurrence["id"])
-        except Exception:
-            log.exception("paging due-check failed")
-
-
-threading.Thread(target=_paging_scheduler_loop, daemon=True, name="paging-scheduler").start()
-
-
-def _backfill_alert_history_fingerprints():
-    """Fills in alert_history.fingerprint for rows written before that
-    column existed. Without this, every alert that fired before the
-    per-alarm ticket view shipped is invisible to it (the incidents query
-    groups by fingerprint), which would make an install with real history
-    look like it had never alerted at all.
-
-    Done in Python rather than SQL because the fingerprint is a sha256 over
-    the sorted label set - the same function that fingerprints live alerts
-    (alert_acks.fingerprint_for), so backfilled rows land on exactly the
-    same identity as new ones for the same alarm. Runs every startup and is
-    a no-op once there's nothing left to fill."""
-    try:
-        rows = DB.query("SELECT id, labels FROM alert_history WHERE fingerprint IS NULL LIMIT 10000")
-    except Exception:
-        log.exception("could not read alert history for fingerprint backfill")
-        return
-    if not rows:
-        return
-    filled = 0
-    for row in rows:
-        try:
-            fingerprint = alert_acks.fingerprint_for(json.loads(row["labels"]))
-            DB.execute("UPDATE alert_history SET fingerprint = %s WHERE id = %s", (fingerprint, row["id"]))
-            filled += 1
-        except Exception:
-            log.exception("could not backfill fingerprint for alert_history id=%s", row["id"])
-    log.info("backfilled fingerprints for %d alert history row(s)", filled)
-
-
-def _wire_occurrence_events(store):
-    """Every alarm lifecycle event comes from the occurrence store's own
-    transitions, not from whichever code path happened to drive them.
-    Confirmed live: emitting alarm.opened only from the Alertmanager
-    webhook meant a real alarm the 3s sync tick opened first (nearly all
-    of them - the tick beats the webhook) never paged anyone and never
-    reached a webhook; and an occurrence the stale sweep closed never
-    produced alarm.resolved, so its pager ledger was never cleared."""
-    store.on_opened = lambda occ: events.BUS.emit("alarm.opened", occurrence=_occ_payload(occ))
-    store.on_paged = lambda occ: events.BUS.emit("alarm.paged", occurrence=_occ_payload(occ))
-    store.on_closed = lambda occ, by: events.BUS.emit("alarm.resolved", occurrence=_occ_payload(occ), by=by or "switchboard")
+def _wire_event_hooks(store):
+    """Every event transition goes onto the bus from the store itself -
+    webhooks and push subscribe there. Exactly once per transition,
+    whichever path (syslog, SSH, timer, a person) drove it."""
+    store.on_raised = lambda ev: events.BUS.emit("event.raised", event_data=ev)
+    store.on_resolved = lambda ev: events.BUS.emit("event.resolved", event_data=ev)
 
 
 def _wire_event_bus():
@@ -1308,27 +906,22 @@ def _load_database(dsn):
     devices + status polling from it. Raises on a bad DSN/unreachable host
     so callers (setup wizard, Settings save) can report a clear error
     without disturbing whatever was working before the attempt."""
-    global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES
-    global OCCURRENCES, AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW, SFLOW_IFINDEX, NETFLOW, API_TOKENS, WEBHOOKS, PUSH_SUBS
-    global SYSLOG_RULES
+    global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES
+    global AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW, SFLOW_IFINDEX, NETFLOW, API_TOKENS, WEBHOOKS, PUSH_SUBS
+    global SYSLOG_RULES, EVENTS, EVENT_SETTINGS, PORT_SETTINGS, SYSLOG_DETECTOR, SSH_RECONCILER
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
     new_topology_store = TopologyStore(new_db)
     new_schedules = ScheduleStore(new_db)
-    new_alert_rules = alert_rules.AlertRuleStore(new_db)
-    new_interface_alert_rules = interface_alerting.InterfaceAlertConfigStore(new_db)
-    new_occurrences = occurrences.OccurrenceStore(new_db)
     new_audit = audit.AuditLog(new_db)
     new_command_history = command_history.CommandHistoryStore(new_db)
     new_favorites = command_history.CommandFavoritesStore(new_db)
     new_sflow = sflow_store.SFlowStore(new_db, source="switches")
     new_netflow = sflow_store.SFlowStore(new_db, source="firewall")
     new_ifindex = sflow_store.IfIndexMap(new_db)
-    DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES, ALERT_RULES, INTERFACE_ALERT_RULES = (
-        new_db, new_store, new_results, new_topology_store, new_schedules, new_alert_rules, new_interface_alert_rules
-    )
-    OCCURRENCES, AUDIT = new_occurrences, new_audit
+    DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES = new_db, new_store, new_results, new_topology_store, new_schedules
+    AUDIT = new_audit
     COMMAND_HISTORY, FAVORITES = new_command_history, new_favorites
     SFLOW = new_sflow
     NETFLOW = new_netflow
@@ -1337,13 +930,17 @@ def _load_database(dsn):
     WEBHOOKS = webhooks_module.WebhookStore(new_db)
     PUSH_SUBS = push_module.PushSubscriptionStore(new_db)
     SYSLOG_RULES = syslog_alerting.SyslogRuleStore(new_db)
+    EVENTS = eventstore.EventStore(new_db)
+    EVENT_SETTINGS = event_catalog.EventSettings(new_db)
+    PORT_SETTINGS = event_catalog.PortSettings(new_db)
+    SYSLOG_DETECTOR = event_detect.SyslogDetector(EVENTS, EVENT_SETTINGS, PORT_SETTINGS)
+    SSH_RECONCILER = event_reconcile.SshReconciler(EVENTS, EVENT_SETTINGS, PORT_SETTINGS)
     _LIST_CACHE.clear()
     try:
         SYSLOG_RULES.seed_defaults()
-        SYSLOG_RULE_ENGINE.reseed_from_alertmanager(ALERTMANAGER, {str(r["id"]): r for r in SYSLOG_RULES.list()})
     except Exception:
-        log.exception("syslog rules: seeding/reseeding failed - rules still evaluate, state starts empty")
-    _wire_occurrence_events(OCCURRENCES)
+        log.exception("syslog rules: seeding failed - rules still evaluate")
+    _wire_event_hooks(EVENTS)
     try:
         _wire_event_bus()
     except Exception:
@@ -1354,15 +951,6 @@ def _load_database(dsn):
 
     _migrate_legacy_json_devices()
     _migrate_legacy_sqlite()
-    _backfill_alert_history_fingerprints()
-    try:
-        OCCURRENCES.backfill_from_history(alert_acks.fingerprint_for)
-    except Exception:
-        log.exception("could not backfill alarm occurrences from history")
-    try:
-        OCCURRENCES.repair_stale_paging_on_resolved()
-    except Exception:
-        log.exception("could not repair stale paging state on resolved alarms")
 
     for device_id in list(_session_locks):
         STATUS.stop(device_id)
@@ -1384,9 +972,7 @@ def _apply_settings(settings_dict):
     wizard or Settings page saves a new config. Raises on a bad Postgres
     DSN; callers decide how to surface that (500 at boot vs. a 400 back to
     the wizard/settings form)."""
-    global LOKI_URL, DATABASE_URL, CONFIGURED, DB_ERROR, LOKI
-    global ALERTMANAGER_URL, PROMETHEUS_URL, PROMETHEUS_RELOAD_URL, EXPORTER_URL
-    global ALERTMANAGER, PAGER
+    global DATABASE_URL, CONFIGURED, DB_ERROR
     # Validate the DSN before committing any globals, so a failed update
     # (e.g. a typo'd Postgres URL) can't half-apply - the previously-working
     # DB connection is left untouched.
@@ -1406,24 +992,14 @@ def _apply_service_settings(settings_dict):
     on it that requires the database to already work is unreachable
     precisely when it's needed. An admin whose Postgres is down must still
     be able to correct the Alertmanager or Loki address."""
-    global LOKI_URL, LOKI, ALERTMANAGER_URL, PROMETHEUS_URL, PROMETHEUS_RELOAD_URL
-    global EXPORTER_URL, ALERTMANAGER, PAGER, SFLOW_COLLECTOR, SYSLOG_RECEIVER
+    global LOKI_URL, LOKI, PROMETHEUS_URL, EXPORTER_URL, SFLOW_COLLECTOR, SYSLOG_RECEIVER
     LOKI_URL = settings_dict.get("loki_url") or settings_store.DEFAULT_LOKI_URL
     LOKI = LokiClient(LOKI_URL)
-    ALERTMANAGER_URL = settings_dict.get("alertmanager_url") or ALERTMANAGER_URL
     PROMETHEUS_URL = settings_dict.get("prometheus_url") or PROMETHEUS_URL
-    PROMETHEUS_RELOAD_URL = settings_store.reload_url_for(settings_dict) or PROMETHEUS_RELOAD_URL
     EXPORTER_URL = settings_dict.get("exporter_url") or EXPORTER_URL
     # Blank is a legitimate value here ("not recorded"), so this one is
     # assigned as given rather than falling back to the previous value.
     SFLOW_COLLECTOR = settings_dict.get("sflow_collector", SFLOW_COLLECTOR) or ""
-    # Rebuilt rather than mutated so a URL change takes effect immediately
-    # instead of at the next restart. PAGER holds its own reference to the
-    # client, so it has to be rebuilt too or it keeps talking to the old
-    # address - a silent failure where holds would be placed nowhere.
-    ALERTMANAGER = fastpath.LocalFirstAlertmanager(
-        AlertmanagerClient(ALERTMANAGER_URL), lambda: globals().get("OCCURRENCES"), alert_acks.fingerprint_for)
-    PAGER = paging.PagingController(ALERTMANAGER, PAGE_DELAY_SECONDS)
     SYSLOG_RECEIVER = settings_dict.get("syslog_receiver", SYSLOG_RECEIVER) or ""
 
 
@@ -1528,11 +1104,7 @@ class SetupRequest(BaseModel):
 class SettingsUpdateRequest(BaseModel):
     database_url: Optional[str] = None  # blank = keep current
     loki_url: Optional[str] = None
-    alertmanager_url: Optional[str] = None
     prometheus_url: Optional[str] = None
-    # Blank is meaningful here, unlike the others: it means "derive from
-    # prometheus_url" (settings.reload_url_for).
-    prometheus_reload_url: Optional[str] = None
     exporter_url: Optional[str] = None
     # Blank is meaningful: "collector address not recorded".
     sflow_collector: Optional[str] = None
@@ -1622,9 +1194,7 @@ def api_get_settings(user: str = Depends(require_auth)):
     return {
         "database_url_display": settings_store.redact_dsn(DATABASE_URL) if DATABASE_URL else None,
         "loki_url": LOKI_URL,
-        "alertmanager_url": ALERTMANAGER_URL,
         "prometheus_url": PROMETHEUS_URL,
-        "prometheus_reload_url": PROMETHEUS_RELOAD_URL,
         "exporter_url": EXPORTER_URL,
         "sflow_collector": SFLOW_COLLECTOR,
         "syslog_receiver": SYSLOG_RECEIVER,
@@ -1756,7 +1326,6 @@ def api_settings_health(user: str = Depends(require_auth)):
 
     for name, url, path in (
         ("Loki", LOKI_URL, "/ready"),
-        ("Alertmanager", ALERTMANAGER_URL, "/-/healthy"),
         ("Prometheus", PROMETHEUS_URL, "/-/healthy"),
         ("Exporter", EXPORTER_URL, "/metrics"),
     ):
@@ -1788,7 +1357,7 @@ def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_
         submitted = submitted.strip()
         # prometheus_reload_url is legitimately blank (it derives from
         # prometheus_url); the rest fall back rather than being blanked.
-        blank_ok = key in ("prometheus_reload_url", "sflow_collector", "syslog_receiver")
+        blank_ok = key in ("sflow_collector", "syslog_receiver")
         new_settings[key] = submitted or ("" if blank_ok else fallback)
 
     # The service URLs are applied and saved first, and never gated behind
@@ -1812,7 +1381,7 @@ def api_update_settings(req: SettingsUpdateRequest, user: str = Depends(require_
 # Light per-IP throttle on the token-exchange endpoint - defense in depth,
 # not the primary brute-force protection (that's Keycloak's job now, same
 # as any OIDC-fronted app). In-memory, same proportionate spirit as other
-# in-process state in this file (e.g. PENDING_HOLDS above) - losing it on
+# in-process state in this file - losing it on
 # restart just resets the window, not a security regression.
 _auth_attempts = {}
 _auth_attempts_lock = threading.Lock()
@@ -2767,347 +2336,6 @@ def _clamp_window(since_seconds):
     return max(60, min(v, LOKI_MAX_WINDOW_SECONDS))
 
 
-@app.get("/api/devices/{device_id}/alarm-history")
-def api_alarm_history(
-    device_id: str,
-    limit: int = 300,
-    since_seconds: int = 604800,
-    user: str = Depends(require_auth_and_db),
-):
-    """Historical hardware alarms for this device, read from Loki.
-
-    Alarm classification is done via `hardware_alerting._classify_alarm`
-    (shared with the live syslog-based fan/PSU alerting in that module -
-    see its docstring for why this stayed a second implementation rather
-    than trusting Vector, not a third one when live alerting was added),
-    from each event's `facility`/`detail` fields, rather than trusted from
-    whatever `alarm_severity`/`alarm_component` syslog/vector.yaml's
-    `interpret_switch_event` transform may have already stamped on the
-    event. Two reasons: (1) that transform has already shipped one real
-    bug where the fields were silently missing entirely because a deploy
-    step was skipped, and another where "alarm cleared" recoveries were
-    misread as new active alarms - relying only on Vector for this again
-    means a future regression there silently empties this whole feature
-    with no error anywhere; (2) events ingested before that transform
-    existed have `facility`/`detail` (extracted by the interpreter since
-    day one) but no alarm_* fields at all, so reclassifying here recovers
-    real alarm history instead of only showing events from after the fix.
-
-    Filtered server-side via LogQL on `facility` (chassis-manager /
-    environment-monitor facilities that emit fan/PSU/temperature alarms)
-    rather than fetching `limit` raw lines and filtering after - alarm
-    events are rare next to routine auth churn, so without the
-    server-side filter they'd get starved out of the window the same way
-    category filtering used to be.
-
-    `is_current` is computed here, not trusted from any single log line:
-    for each distinct `alarm_component` (e.g. "Fan tray 2 of Unit 1"), the
-    most recent tagged event for that component is the current truth: if
-    it's a fault (`alarm_active: true`) with no later recovery event logged
-    yet, that component's alarm is still in progress."""
-    device = DEVICES_BY_ID.get(device_id)
-    if device is None:
-        raise HTTPException(status_code=404, detail="unknown device")
-
-    try:
-        events = LOKI.query_range(
-            filters=['facility=~"CHMGR|ENVMON|RPM|OSTATE"'], limit=limit, since_seconds=_clamp_window(since_seconds)
-        )
-    except LokiError as e:
-        raise HTTPException(status_code=502, detail=f"Loki unreachable: {e}")
-
-    events = [e for e in events if e.get("source_ip") == device.host or e.get("device_host") == device.host]
-
-    alarm_events = []
-    for e in events:
-        detail = e.get("detail") or e.get("message") or ""
-        classified = hardware_alerting._classify_alarm(detail)
-        if classified["alarm_severity"] is None and classified["alarm_active"] is not False:
-            continue  # not alarm-relevant text (e.g. fan-speed-% telemetry)
-        e.update(classified)
-        alarm_events.append(e)
-
-    # events are already newest-first (LokiClient sorts by timestamp desc)
-    latest_seen = set()
-    for e in alarm_events:
-        comp = e.get("alarm_component")
-        is_latest_for_component = comp is not None and comp not in latest_seen
-        if comp is not None:
-            latest_seen.add(comp)
-        e["is_current"] = bool(is_latest_for_component and e.get("alarm_active") is True)
-
-    return alarm_events[:limit]
-
-
-# Alerting (ROADMAP 3.2) - proxies Alertmanager's own REST API rather than
-# re-storing alert/silence state in Postgres. Alertmanager is the source
-# of truth for both; Switchboard just gives a UI for them next to
-# everything else instead of a separate tab/tool. See
-# alertmanager/alertmanager.yml for how alerts actually get here
-# (Prometheus evaluating prometheus/alerts.yml's rules against the
-# exporter's s4048_* metrics) and its docstring for why the receiver is
-# currently a webhook back into this app rather than a real
-# Slack/email/PagerDuty destination.
-@app.get("/api/alerts")
-def api_list_alerts(user: str = Depends(require_auth_and_db)):
-    try:
-        return ALERTMANAGER.list_alerts()
-    except AlertmanagerError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-def _prometheus_pending_rules():
-    """Prometheus's own rule-evaluation state includes a "pending" phase
-    for anything currently inside its `for:` confirmation window - real
-    condition, not yet old enough to fire (see prometheus/alerts.yml).
-    Alertmanager never sees these at all (Prometheus only forwards alerts
-    that have crossed `for:`), so /api/alerts (the raw Alertmanager
-    passthrough above) has no way to show them - which is exactly the gap
-    that made a genuine, already-detected PSU failure look like "no alarm"
-    for the ~74s it spent confirming (2026-08-01 investigation). Best
-    effort: an unreachable Prometheus just means no pending rows, not a
-    500 for the whole alerts page."""
-    try:
-        req = urllib.request.Request(f"{PROMETHEUS_URL}/api/v1/rules")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        log.warning("could not reach Prometheus for pending-rule state", exc_info=True)
-        return []
-    out = []
-    for group in data.get("data", {}).get("groups", []):
-        for rule in group.get("rules", []):
-            if rule.get("type") != "alerting":
-                continue
-            for alert in rule.get("alerts", []):
-                if alert.get("state") != "pending":
-                    continue
-                out.append({
-                    "labels": alert.get("labels", {}),
-                    "annotations": rule.get("annotations", {}),
-                    "status": {"state": "pending"},
-                    "startsAt": alert.get("activeAt"),
-                })
-    return out
-
-
-def _prometheus_firing_fingerprints():
-    """Label-set fingerprints Prometheus itself currently considers firing
-    (state == "firing" in the rules API) - used to tell a genuinely-firing
-    Alertmanager alert apart from one whose underlying condition has
-    already cleared but hasn't been resolved in Alertmanager yet (see
-    "resolving" in api_list_alerts_live below). Best effort, same as
-    _prometheus_pending_rules."""
-    try:
-        req = urllib.request.Request(f"{PROMETHEUS_URL}/api/v1/rules")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None  # unknown, not "nothing firing" - caller must not treat this as "clear"
-    fps = set()
-    for group in data.get("data", {}).get("groups", []):
-        for rule in group.get("rules", []):
-            if rule.get("type") != "alerting":
-                continue
-            for alert in rule.get("alerts", []):
-                if alert.get("state") == "firing":
-                    fps.add(tuple(sorted(alert.get("labels", {}).items())))
-    return fps
-
-
-@app.get("/api/alerts/live")
-def api_list_alerts_live(user: str = Depends(require_auth_and_db)):
-    """Everything the Active alerts tab needs in one call: Alertmanager's
-    real alerts, annotated with a best-effort "resolving" state when the
-    underlying condition has already cleared but Alertmanager hasn't
-    formally resolved yet (the exact gap a restart-orphaned interface
-    alert fell into - see interface_alerting.py's reconcile_via_poll),
-    plus synthetic "pending" rows for anything still inside a confirmation
-    window (Prometheus `for:` and interface_alerting's delayed-mode
-    `delay_seconds`) that Alertmanager doesn't know about at all yet."""
-    try:
-        am_alerts = ALERTMANAGER.list_alerts()
-    except AlertmanagerError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-    firing_fps = _prometheus_firing_fingerprints()
-    for alert in am_alerts:
-        if alert.get("status", {}).get("state") != "active":
-            continue
-        labels = alert.get("labels", {})
-        alertname = labels.get("alertname")
-        if alertname == "InterfaceDown":
-            state = _port_state_for(labels.get("device_id"), labels.get("port"))
-            if state is not None and state != "down":
-                alert["status"]["state"] = "resolving"
-        elif firing_fps is not None:
-            fp = tuple(sorted(labels.items()))
-            if fp not in firing_fps:
-                alert["status"]["state"] = "resolving"
-
-    pending = _prometheus_pending_rules()
-    if DB is not None and INTERFACE_ALERT_RULES is not None:
-        try:
-            configs = INTERFACE_ALERT_RULES.list()
-            pending += INTERFACE_ALERT_CHECKER.pending_entries(configs, _device_name_for)
-        except Exception:
-            log.exception("could not compute pending interface-alert entries")
-
-    # Drop a synthetic pending row if Alertmanager already has that exact
-    # alarm. Alertmanager keeps a just-resolved alert visible briefly, so
-    # an alarm that clears and immediately re-enters its `for:` window can
-    # otherwise appear twice at once - once from each source - which reads
-    # as two separate faults on the same thing.
-    am_fingerprints = {alert_acks.fingerprint_for(a.get("labels", {})) for a in am_alerts}
-    pending = [p for p in pending if alert_acks.fingerprint_for(p.get("labels", {})) not in am_fingerprints]
-
-    combined = am_alerts + pending
-    # Attach the currently-open occurrence (if any) so the UI can link a
-    # live alert to its alarm record and show who has taken *this* episode.
-    for alert in combined:
-        fp = alert_acks.fingerprint_for(alert.get("labels", {}))
-        alert["fingerprint"] = fp
-        alert["occurrence"] = None
-        alert["ack"] = None
-        if OCCURRENCES is None:
-            continue
-        try:
-            occurrence = OCCURRENCES.open_for(fp)
-        except Exception:
-            log.exception("could not look up open occurrence for %s", fp)
-            continue
-        if occurrence is not None:
-            alert["occurrence"] = occurrence["id"]
-            alert["ack"] = OCCURRENCES.ack_for(occurrence["id"])
-    return combined
-
-
-class NoteRequest(BaseModel):
-    note: Optional[str] = None
-
-
-class CommentRequest(BaseModel):
-    body: str
-
-
-def _require_occurrence(occurrence_id):
-    occurrence = OCCURRENCES.get(occurrence_id)
-    if occurrence is None:
-        raise HTTPException(status_code=404, detail="unknown alarm")
-    return occurrence
-
-
-
-
-@app.post("/api/alarms/{occurrence_id}/ack")
-def api_ack_occurrence(occurrence_id: int, req: NoteRequest, user: str = Depends(require_operator)):
-    """Acknowledges one occurrence: records who/when/why without
-    suppressing anything. Scoped to this occurrence deliberately - taking
-    today's flap says nothing about the next one, and the log should show
-    that rather than implying the alarm as a whole is handled forever."""
-    occurrence = _require_occurrence(occurrence_id)
-    ack = OCCURRENCES.ack(occurrence_id, user, req.note)
-    events.BUS.emit("alarm.acknowledged", occurrence=_occ_payload(occurrence), by=user, note=req.note)
-    AUDIT.record(user, "alert.ack", occurrence["alertname"], {"note": req.note},
-                 occurrence["signature"], occurrence_id)
-    log.info("user=%s acknowledged alarm %s (%s)", user, occurrence_id, occurrence["alertname"])
-    return ack
-
-
-@app.post("/api/alarms/{occurrence_id}/unack")
-def api_unack_occurrence(occurrence_id: int, user: str = Depends(require_operator)):
-    occurrence = _require_occurrence(occurrence_id)
-    if not OCCURRENCES.unack(occurrence_id):
-        raise HTTPException(status_code=404, detail="that alarm is not acknowledged")
-    events.BUS.emit("alarm.unacknowledged", occurrence=_occ_payload(occurrence), by=user)
-    AUDIT.record(user, "alert.unack", occurrence["alertname"], None, occurrence["signature"], occurrence_id)
-    log.info("user=%s un-acknowledged alarm %s", user, occurrence_id)
-    return {"ok": True}
-
-
-def _alertmanager_notification_stats():
-    """Per-integration notification counters straight from Alertmanager's
-    /metrics. These are the reliable ground truth for "did a notification
-    actually go out" - confirmed live during the 2026-08-01 work that
-    `docker logs alertmanager` does NOT print a line for a clean first-try
-    send (only retries/failures log reliably), so the logs look silent even
-    when delivery is working perfectly."""
-    sent, failed = {}, {}
-    try:
-        with urllib.request.urlopen(f"{ALERTMANAGER_URL}/metrics", timeout=5) as resp:
-            body = resp.read().decode(errors="replace")
-    except (urllib.error.URLError, OSError):
-        return None
-    for line in body.splitlines():
-        if line.startswith("#"):
-            continue
-        m = re.match(r'alertmanager_notifications_(failed_)?total\{integration="([^"]+)"\}\s+([0-9.e+]+)', line)
-        if not m:
-            continue
-        target = failed if m.group(1) else sent
-        target[m.group(2)] = int(float(m.group(3)))
-    return {
-        "sent": {k: v for k, v in sent.items() if v},
-        "failed": {k: v for k, v in failed.items() if v},
-    }
-
-
-@app.get("/api/alerts/overview")
-def api_alerts_overview(user: str = Depends(require_auth_and_db)):
-    """Everything the Overview tab shows: how many alerts are in each
-    state, how many are owned (acked) vs unowned, and whether the alerting
-    pipeline itself is actually healthy - the last part matters because
-    every count above reads zero both when nothing is wrong and when the
-    thing that detects what's wrong is down, and those two look identical
-    on a dashboard that only shows counts."""
-    counts = {"current": 0, "pending": 0, "resolving": 0, "suppressed": 0}
-    severities = {"critical": 0, "warning": 0, "other": 0}
-    acked = unacked = 0
-    alertmanager_ok, alerts_error = True, None
-    try:
-        alerts = api_list_alerts_live(user=user)
-    except HTTPException as e:
-        alerts, alertmanager_ok, alerts_error = [], False, str(e.detail)
-
-    for alert in alerts:
-        state = alert.get("status", {}).get("state")
-        if state == "active":
-            counts["current"] += 1
-        elif state in counts:
-            counts[state] += 1
-        sev = alert.get("labels", {}).get("severity")
-        severities[sev if sev in severities else "other"] += 1
-        if alert.get("ack"):
-            acked += 1
-        else:
-            unacked += 1
-
-    active_silences = 0
-    try:
-        active_silences = sum(1 for s in ALERTMANAGER.list_silences() if s.get("status", {}).get("state") == "active")
-    except AlertmanagerError:
-        pass
-
-    prometheus_ok = _prometheus_firing_fingerprints() is not None
-    notifications = _alertmanager_notification_stats()
-
-    return {
-        "counts": counts,
-        "severities": severities,
-        "acknowledged": acked,
-        "unacknowledged": unacked,
-        "active_silences": active_silences,
-        "pipeline": {
-            "alertmanager_ok": alertmanager_ok,
-            "alertmanager_error": alerts_error,
-            "prometheus_ok": prometheus_ok,
-            "notifications": notifications,
-        },
-        "page_delay_seconds": PAGE_DELAY_SECONDS,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
 @app.get("/api/audit-log")
 def api_get_audit_log(
     limit: int = 200,
@@ -3116,524 +2344,6 @@ def api_get_audit_log(
     user: str = Depends(require_admin),
 ):
     return AUDIT.list(limit=limit, action_prefix=action_prefix, fingerprint=fingerprint)
-
-# Wording for each event kind as it appears on an alarm's timeline. Keeps
-# the vocabulary in one place rather than scattered through the frontend,
-# so the log and the timeline can't drift into describing the same event
-# two different ways.
-_TIMELINE_KINDS = {
-    "firing": ("fired", "Alarm raised - notifications sent"),
-    "resolved": ("resolved", "Alarm cleared - resolve notifications sent"),
-    "alert.ack": ("acknowledged", "Acknowledged"),
-    "alert.unack": ("unacknowledged", "Acknowledgement removed"),
-    "alert.resolve": ("manually resolved", "Manually resolved from Switchboard"),
-    "alert.comment": ("comment", "Comment posted"),
-    "alert.comment_deleted": ("comment removed", "Comment deleted by its author"),
-}
-
-
-def _occurrence_state(occurrence, firing_signatures, pending_signatures):
-    """An occurrence is open until a resolve notification closes it.
-
-    Three ways a still-open occurrence can look, and they mean different
-    things: genuinely firing/suppressed in Alertmanager ("open"); still
-    only inside a confirmation window and never yet confirmed ("pending" -
-    see _gather_pending_alerts, and the alarm log gap this state exists to
-    close); or open in our record but present in neither ("expired" - it
-    aged out via Alertmanager's resolve_timeout without ever resolving,
-    the one state that means the pipeline dropped something, so it's kept
-    distinct rather than laundered into "resolved")."""
-    if occurrence["resolved_at"]:
-        return "resolved"
-    if occurrence["signature"] in firing_signatures:
-        return "open"
-    if occurrence["signature"] in pending_signatures:
-        return "pending"
-    return "expired"
-
-
-def _live_signatures(user):
-    """Firing/suppressed signatures and pending-only signatures, as two
-    separate sets - api_list_alerts_live mixes both kinds of row together
-    (it has to, for the Active alerts tab), so this splits them back apart
-    by each row's own status.state rather than duplicating either
-    Alertmanager or Prometheus call."""
-    firing, pending = set(), set()
-    try:
-        for alert in api_list_alerts_live(user=user):
-            fp = alert["fingerprint"]
-            if alert.get("status", {}).get("state") == "pending":
-                pending.add(fp)
-            else:
-                firing.add(fp)
-    except HTTPException:
-        pass
-    return firing, pending
-
-
-def _decorate(occurrence, firing_signatures, pending_signatures, ack=None, comments=0, total=None):
-    return {
-        **occurrence,
-        "state": _occurrence_state(occurrence, firing_signatures, pending_signatures),
-        "ack": ack,
-        "comments": comments,
-        "occurrences_for_signature": total,
-    }
-
-
-@app.get("/api/alarms")
-def api_list_alarms(limit: int = 200, signature: Optional[str] = None, user: str = Depends(require_auth_and_db)):
-    """The alarm log: one row per occurrence, newest first.
-
-    Deliberately NOT one row per alarm signature. Four flaps of the same
-    port are four rows here, because they are four separate things that
-    happened, each with its own acknowledgement and discussion. Passing
-    `signature` filters to the history of one particular alarm."""
-    occurrences = OCCURRENCES.list(limit=limit, signature=signature)
-    ids = [o["id"] for o in occurrences]
-    acks = OCCURRENCES.acks_by_occurrence(ids)
-    counts = OCCURRENCES.comment_counts(ids)
-    firing, pending = _live_signatures(user)
-    return [_decorate(o, firing, pending, acks.get(o["id"]), counts.get(o["id"], 0)) for o in occurrences]
-
-
-@app.get("/api/alarms/{occurrence_id}")
-def api_get_alarm(occurrence_id: int, request: Request, user: str = Depends(require_auth_and_db)):
-    """One occurrence in full: its own timeline, its own discussion, and a
-    list of *earlier* occurrences of the same alarm - linked, not merged,
-    so an external ticketing system fed from this can decide for itself
-    whether to reopen a prior ticket or cross-reference it."""
-    occurrence = _require_occurrence(occurrence_id)
-    firing, pending = _live_signatures(user)
-    signature = occurrence["signature"]
-
-    # System events belonging to this occurrence only: notifications
-    # between its start and its end (or now, if still open).
-    upper = occurrence["resolved_at"] or datetime.now(timezone.utc).isoformat()
-    history = DB.query(
-        "SELECT status, summary, received_at FROM alert_history "
-        "WHERE fingerprint = %s AND received_at >= %s AND received_at <= %s ORDER BY received_at ASC",
-        (signature, occurrence["started_at"], upper),
-    )
-    system_events = []
-    for h in history:
-        kind, description = _TIMELINE_KINDS.get(h["status"], (h["status"], h["status"]))
-        system_events.append({
-            "ts": h["received_at"], "kind": kind, "actor": "system",
-            "description": description, "summary": h["summary"],
-        })
-
-    # The occurrence's own started_at/resolved_at are the guaranteed record
-    # of this alarm's real state transitions - fired, and (if applicable)
-    # cleared - independent of whether alert_history ever recorded them.
-    # This matters because it doesn't always: a silence suppresses *every*
-    # Alertmanager receiver, including this app's webhook (confirmed live
-    # earlier - see paging.py), so an alarm held under a paging delay, or
-    # covered by an ordinary maintenance-window silence, produces zero
-    # alert_history rows while suppressed. Without this, an alarm that
-    # genuinely fired and genuinely resolved - a real down-to-up transition
-    # - could show an empty timeline on its own ticket. Only added when
-    # alert_history doesn't already have a matching row within a few
-    # seconds, so the common (unheld, promptly-notified) case doesn't show
-    # the same transition twice.
-    def _has_nearby(kind, ts, window_seconds=5):
-        target = datetime.fromisoformat(ts)
-        for e in system_events:
-            if e["kind"] != kind:
-                continue
-            try:
-                other = datetime.fromisoformat(e["ts"])
-            except ValueError:
-                continue
-            if abs((other - target).total_seconds()) <= window_seconds:
-                return True
-        return False
-
-    if not _has_nearby("fired", occurrence["started_at"]):
-        system_events.append({
-            "ts": occurrence["started_at"], "kind": "fired", "actor": "system",
-            "description": "Alarm raised", "summary": occurrence["summary"],
-        })
-    if occurrence["resolved_at"] and not _has_nearby("resolved", occurrence["resolved_at"]):
-        system_events.append({
-            "ts": occurrence["resolved_at"], "kind": "resolved", "actor": "system",
-            "description": "Alarm cleared", "summary": None,
-        })
-    system_events.sort(key=lambda e: e["ts"])
-
-    operator_events = []
-    for e in AUDIT.list(limit=500, occurrence_id=occurrence_id):
-        kind, description = _TIMELINE_KINDS.get(e["action"], (e["action"], e["action"]))
-        detail = e["detail"] or {}
-        operator_events.append({
-            "ts": e["ts"], "kind": kind, "actor": e["actor"], "action": e["action"],
-            "description": description, "summary": detail.get("note"),
-        })
-
-    previous = OCCURRENCES.previous_for(signature, occurrence_id)
-    prev_acks = OCCURRENCES.acks_by_occurrence([p["id"] for p in previous])
-
-    return {
-        **_decorate(
-            occurrence, firing, pending,
-            ack=OCCURRENCES.ack_for(occurrence_id),
-            comments=0,
-            total=OCCURRENCES.count_for(signature),
-        ),
-        "events": sorted(system_events + operator_events, key=lambda e: e["ts"]),
-        "system_events": system_events,
-        "operator_events": operator_events,
-        "comments": OCCURRENCES.comments_for(occurrence_id),
-        "previous_occurrences": [_decorate(p, firing, pending, prev_acks.get(p["id"])) for p in previous],
-        # So the UI knows which comments offer a delete control. The server
-        # enforces the same rule independently (see api_delete_comment).
-        "current_user": user,
-        "current_role": request.session.get("role"),
-    }
-
-
-@app.get("/api/alarms/{occurrence_id}/comments")
-def api_list_comments(occurrence_id: int, user: str = Depends(require_auth_and_db)):
-    _require_occurrence(occurrence_id)
-    return OCCURRENCES.comments_for(occurrence_id)
-
-
-@app.post("/api/alarms/{occurrence_id}/comments")
-def api_add_comment(occurrence_id: int, req: CommentRequest, user: str = Depends(require_operator)):
-    occurrence = _require_occurrence(occurrence_id)
-    body = (req.body or "").strip()
-    if not body:
-        raise HTTPException(status_code=400, detail="comment cannot be empty")
-    result = OCCURRENCES.add_comment(occurrence_id, user, body)
-    events.BUS.emit("alarm.commented", occurrence=_occ_payload(occurrence), by=user, note=body)
-    AUDIT.record(user, "alert.comment", occurrence["alertname"], {"note": body},
-                 occurrence["signature"], occurrence_id)
-    return result
-
-
-@app.delete("/api/alarms/{occurrence_id}/comments/{comment_id}")
-def api_delete_comment(occurrence_id: int, comment_id: int, request: Request, user: str = Depends(require_auth_and_db)):
-    """Authors can delete their own comments (a typo in a conversation is
-    worth fixing); nobody else can delete them except an admin (RBAC
-    bypass on this one existing rule), and the deletion itself is audited,
-    so the record of what happened survives the message."""
-    occurrence = _require_occurrence(occurrence_id)
-    comment = OCCURRENCES.get_comment(occurrence_id, comment_id)
-    if comment is None:
-        raise HTTPException(status_code=404, detail="unknown comment")
-    if comment["author"] != user and request.session.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="you can only delete your own comments")
-    OCCURRENCES.delete_comment(comment_id)
-    AUDIT.record(user, "alert.comment_deleted", occurrence["alertname"], {"note": comment["body"]},
-                 occurrence["signature"], occurrence_id)
-    return {"ok": True}
-
-
-class DelayRequest(BaseModel):
-    seconds: int = 300
-
-
-@app.post("/api/alarms/{occurrence_id}/page-now")
-def api_page_now(occurrence_id: int, user: str = Depends(require_operator)):
-    """Skips the remaining investigation window - lifts the hold so
-    Alertmanager pages on its next dispatch."""
-    occurrence = _require_occurrence(occurrence_id)
-    if occurrence["paged_at"]:
-        raise HTTPException(status_code=400, detail="this alarm has already paged")
-    PAGER.release(occurrence["silence_id"])
-    OCCURRENCES.set_paging_disabled(occurrence_id, False, None)
-    updated = OCCURRENCES.mark_paged(occurrence_id)
-    AUDIT.record(user, "alert.page_now", occurrence["alertname"], None, occurrence["signature"], occurrence_id)
-    log.info("user=%s paged alarm %s immediately", user, occurrence_id)
-    return updated
-
-
-@app.post("/api/alarms/{occurrence_id}/delay-page")
-def api_delay_page(occurrence_id: int, req: DelayRequest, user: str = Depends(require_operator)):
-    """Pushes the page further out while investigating. Replaces the
-    existing hold rather than stacking a second one - silences are
-    additive in Alertmanager, so layering them would make "page now"
-    have to unpick an unknown number of them."""
-    occurrence = _require_occurrence(occurrence_id)
-    if occurrence["paged_at"]:
-        raise HTTPException(status_code=400, detail="this alarm has already paged")
-    if req.seconds <= 0 or req.seconds > 86400:
-        raise HTTPException(status_code=400, detail="delay must be between 1s and 24h")
-    PAGER.release(occurrence["silence_id"])
-    page_at = datetime.now(timezone.utc) + timedelta(seconds=req.seconds)
-    silence_id = PAGER.hold_until(
-        occurrence["labels"], page_at, f"Paging delayed {req.seconds}s for investigation by {user}", user
-    )
-    if silence_id is None:
-        raise HTTPException(status_code=502, detail="could not extend the paging hold in Alertmanager")
-    updated = OCCURRENCES.set_paging(occurrence_id, page_at.isoformat(), silence_id)
-    AUDIT.record(user, "alert.page_delay", occurrence["alertname"], {"seconds": req.seconds},
-                 occurrence["signature"], occurrence_id)
-    log.info("user=%s delayed paging for alarm %s by %ss", user, occurrence_id, req.seconds)
-    return updated
-
-
-@app.post("/api/alarms/{occurrence_id}/narg")
-def api_narg(occurrence_id: int, req: NoteRequest, user: str = Depends(require_operator)):
-    """NARG - paging off for this alarm. The alarm stays recorded, stays
-    visible and still resolves normally; only the pager is stopped. Not
-    open-ended (see paging.hold_indefinitely): the hold lapses after 24h
-    so an alarm can't be silently lost by turning paging off and forgetting
-    about it."""
-    occurrence = _require_occurrence(occurrence_id)
-    PAGER.release(occurrence["silence_id"])
-    reason = (req.note or "no reason given").strip()
-    silence_id = PAGER.hold_indefinitely(occurrence["labels"], user, reason)
-    updated = OCCURRENCES.set_paging_disabled(occurrence_id, True, silence_id)
-    AUDIT.record(user, "alert.narg", occurrence["alertname"], {"note": reason},
-                 occurrence["signature"], occurrence_id)
-    log.info("user=%s disabled paging (NARG) for alarm %s: %s", user, occurrence_id, reason)
-    return updated
-
-
-@app.post("/api/alarms/{occurrence_id}/enable-paging")
-def api_enable_paging(occurrence_id: int, user: str = Depends(require_operator)):
-    """Undoes NARG - lifts the hold and lets the alarm page again."""
-    occurrence = _require_occurrence(occurrence_id)
-    PAGER.release(occurrence["silence_id"])
-    updated = OCCURRENCES.set_paging_disabled(occurrence_id, False, None)
-    OCCURRENCES.mark_paged(occurrence_id)
-    AUDIT.record(user, "alert.paging_enabled", occurrence["alertname"], None,
-                 occurrence["signature"], occurrence_id)
-    return updated
-
-
-@app.post("/api/alarms/{occurrence_id}/resolve")
-def api_resolve_alarm(occurrence_id: int, user: str = Depends(require_operator)):
-    """Manually resolves the alarm behind this occurrence by posting an
-    `endsAt` to Alertmanager for its exact label set, which sends the
-    normal resolved notification through every receiver (so a PagerDuty
-    incident closes) and, via the webhook, closes this occurrence.
-
-    A correction tool, not a suppression tool: if the underlying condition
-    is still true the alarm fires again on the next check - as a *new*
-    occurrence, which is the honest record of what happened. What this
-    genuinely fixes is the opposite case, an alert still sitting in
-    Alertmanager after the real condition already cleared."""
-    occurrence = _require_occurrence(occurrence_id)
-    labels = occurrence["labels"]
-    now = datetime.now(timezone.utc)
-    try:
-        with fastpath.attributed(user):
-            ALERTMANAGER.post_alerts([{
-                "labels": labels,
-                "annotations": {"summary": f"Manually resolved by {user}"},
-                "startsAt": (now - timedelta(minutes=1)).isoformat(),
-                "endsAt": now.isoformat(),
-            }])
-    except AlertmanagerError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-    if labels.get("alertname") == "InterfaceDown":
-        INTERFACE_ALERT_CHECKER.forget(labels.get("device_id"), labels.get("port"))
-    elif labels.get("alertname") == hardware_alerting.ALERTNAME:
-        HARDWARE_ALERT_CHECKER.forget(
-            labels.get("device_id"), labels.get("kind"), labels.get("unit"), labels.get("bay")
-        )
-
-    AUDIT.record(user, "alert.resolve", occurrence["alertname"], None, occurrence["signature"], occurrence_id)
-    log.info("user=%s manually resolved alarm %s", user, occurrence_id)
-    return {"ok": True}
-
-
-@app.get("/api/silences")
-def api_list_silences(user: str = Depends(require_auth_and_db)):
-    try:
-        return ALERTMANAGER.list_silences()
-    except AlertmanagerError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-class SilenceMatcher(BaseModel):
-    name: str
-    value: str
-    isRegex: bool = False
-    isEqual: bool = True
-
-
-class SilenceCreateRequest(BaseModel):
-    matchers: list[SilenceMatcher]
-    duration_hours: float
-    comment: str
-
-
-@app.post("/api/silences")
-def api_create_silence(req: SilenceCreateRequest, user: str = Depends(require_operator)):
-    if not req.matchers:
-        raise HTTPException(status_code=400, detail="at least one matcher is required")
-    if req.duration_hours <= 0:
-        raise HTTPException(status_code=400, detail="duration_hours must be positive")
-    now = datetime.now(timezone.utc)
-    starts_at = now.isoformat()
-    ends_at = (now + timedelta(hours=req.duration_hours)).isoformat()
-    try:
-        result = ALERTMANAGER.create_silence(
-            [m.model_dump() for m in req.matchers], starts_at, ends_at, user, req.comment
-        )
-    except AlertmanagerError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    log.info("user=%s created silence %s (%dh): %s", user, result.get("silenceID"), req.duration_hours, req.comment)
-    AUDIT.record(user, "silence.create", result.get("silenceID"), {
-        "matchers": [m.model_dump() for m in req.matchers],
-        "duration_hours": req.duration_hours,
-        "comment": req.comment,
-    })
-    return result
-
-
-@app.delete("/api/silences/{silence_id}")
-def api_delete_silence(silence_id: str, user: str = Depends(require_operator)):
-    try:
-        ALERTMANAGER.delete_silence(silence_id)
-    except AlertmanagerError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    log.info("user=%s deleted silence %s", user, silence_id)
-    AUDIT.record(user, "silence.expire", silence_id)
-    return {"ok": True}
-
-
-@app.post("/api/alertmanager/webhook")
-async def api_alertmanager_webhook(request: Request):
-    """Receiver for Alertmanager's webhook notifications (see
-    alertmanager/alertmanager.yml) - unauthenticated like /healthz, since
-    Alertmanager doesn't send this app's basic-auth credentials. Every
-    notification here also gets a copy sent to Pushover (a second,
-    separate receiver on the same route), and is persisted to the
-    `alert_history` table (see /api/alert-history) - this one receiver
-    covers both Prometheus-rule alerts and interface_alerting.py's
-    directly-posted per-interface alerts, since both go through
-    Alertmanager the same way."""
-    payload = await request.json()
-    now = datetime.now(timezone.utc).isoformat()
-    for alert in payload.get("alerts", []):
-        labels = alert.get("labels", {})
-        name = labels.get("alertname", "unknown")
-        status = alert.get("status", "unknown")
-        severity = labels.get("severity")
-        summary = alert.get("annotations", {}).get("summary", "")
-        metrics.alertmanager_notifications_total.labels(alertname=name, status=status).inc()
-        log.info("alertmanager: %s %s - %s", status, name, summary)
-        if DB is not None:
-            try:
-                DB.execute(
-                    "INSERT INTO alert_history (alertname, status, severity, summary, labels, received_at, fingerprint) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (name, status, severity, summary, json.dumps(labels), now, alert_acks.fingerprint_for(labels)),
-                )
-            except Exception:
-                log.exception("could not record alert history for %s", name)
-        # Open or close this alarm's occurrence. A repeated "firing" for an
-        # already-open alarm is the same episode being re-notified, not a
-        # new occurrence (see occurrences.py) - so flap counts stay honest
-        # rather than inflating with every repeat_interval re-send.
-        if OCCURRENCES is not None:
-            signature = alert_acks.fingerprint_for(labels)
-            try:
-                if status == "firing":
-                    occurrence = OCCURRENCES.open(signature, name, severity, summary, labels)
-                    held = PENDING_HOLDS.pop(signature, None)
-                    if occurrence and held and occurrence.get("page_at") is None and occurrence.get("paged_at") is None:
-                        OCCURRENCES.set_paging(occurrence["id"], held[1], held[0])
-                    elif occurrence and held is None and occurrence.get("paged_at") is None:
-                        # No hold was in place, so Alertmanager has already
-                        # notified - record that rather than showing a
-                        # countdown for a page that has been and gone.
-                        OCCURRENCES.mark_paged(occurrence["id"])
-                elif status == "resolved":
-                    held = PENDING_HOLDS.pop(signature, None)
-                    open_occurrence = OCCURRENCES.open_for(signature)
-                    if open_occurrence and open_occurrence.get("silence_id"):
-                        # Recovered inside its investigation window - drop
-                        # the hold so it doesn't sit suppressing the next
-                        # occurrence of the same alarm.
-                        PAGER.release(open_occurrence["silence_id"])
-                    elif held:
-                        PAGER.release(held[0])
-                    OCCURRENCES.close(signature, by="alertmanager")
-            except Exception:
-                log.exception("could not update alarm occurrence for %s", name)
-    return {"ok": True}
-
-
-def _ack_timeline():
-    """Replays every ack/unack ever recorded in the audit log into a
-    per-fingerprint, time-ordered timeline. Used to answer "was this alert
-    acknowledged *at the time it fired*, and by whom" for history rows -
-    the alert_acks table alone can't answer that, because un-acking (and
-    acking a later, unrelated recurrence of the same fault) overwrites or
-    deletes the row. The audit log is append-only, so it can."""
-    timeline = {}
-    try:
-        entries = DB.query(
-            "SELECT ts, actor, action, detail FROM audit_log "
-            "WHERE action IN ('alert.ack', 'alert.unack') ORDER BY ts ASC"
-        )
-    except Exception:
-        log.exception("could not load ack timeline")
-        return timeline
-    for entry in entries:
-        try:
-            detail = json.loads(entry["detail"]) if entry["detail"] else {}
-        except json.JSONDecodeError:
-            continue
-        labels = detail.get("labels")
-        if not labels:
-            continue
-        fp = alert_acks.fingerprint_for(labels)
-        timeline.setdefault(fp, []).append({
-            "ts": entry["ts"],
-            "actor": entry["actor"],
-            "acked": entry["action"] == "alert.ack",
-            "note": detail.get("note"),
-        })
-    return timeline
-
-
-def _ack_in_effect_at(timeline, fingerprint, when):
-    """The most recent ack/unack for `fingerprint` at or before `when` -
-    returns the ack if the latest event was an ack, else None."""
-    latest = None
-    for event in timeline.get(fingerprint, []):
-        if event["ts"] <= when:
-            latest = event
-        else:
-            break  # timeline is ascending
-    if latest is None or not latest["acked"]:
-        return None
-    return {"acked_by": latest["actor"], "acked_at": latest["ts"], "note": latest["note"]}
-
-
-@app.get("/api/alert-history")
-def api_get_alert_history(limit: int = 200, user: str = Depends(require_auth_and_db)):
-    limit = max(1, min(limit, 1000))
-    rows = DB.query(
-        "SELECT alertname, status, severity, summary, labels, received_at, fingerprint FROM alert_history "
-        "ORDER BY received_at DESC LIMIT %s",
-        (limit,),
-    )
-    timeline = _ack_timeline()
-    out = []
-    for r in rows:
-        labels = json.loads(r["labels"])
-        # fingerprint is NULL for rows written before that column existed -
-        # recompute from the labels we stored, which is the same input.
-        fingerprint = r["fingerprint"] or alert_acks.fingerprint_for(labels)
-        out.append({
-            "alertname": r["alertname"],
-            "status": r["status"],
-            "severity": r["severity"],
-            "summary": r["summary"],
-            "labels": labels,
-            "received_at": r["received_at"],
-            "fingerprint": fingerprint,
-            "ack": _ack_in_effect_at(timeline, fingerprint, r["received_at"]),
-        })
-    return out
 
 
 @app.get("/api/command-history")
@@ -3722,7 +2432,6 @@ def api_add_favorite(req: FavoriteRequest, user: str = Depends(require_auth_and_
 def api_delete_favorite(favorite_id: int, user: str = Depends(require_auth_and_db)):
     FAVORITES.delete(user, favorite_id)
     return {"ok": True}
-
 
 
 # sFlow reports interfaces as SNMP ifIndex integers. Dell OS9 encodes them
@@ -3906,28 +2615,6 @@ def _name_flow_ends(rows):
     return rows
 
 
-
-
-def _occ_payload(occ):
-    """The outward-facing shape of an occurrence: what a webhook receiver
-    or a phone needs, and nothing internal."""
-    if not occ:
-        return None
-    labels = occ.get("labels") or {}
-    if isinstance(labels, str):
-        try:
-            labels = json.loads(labels)
-        except Exception:
-            labels = {}
-    return {"id": occ.get("id"), "alertname": occ.get("alertname"), "severity": occ.get("severity"),
-            "summary": occ.get("summary"), "device": labels.get("device") or labels.get("instance"),
-            "signature": occ.get("signature"), "started_at": str(occ.get("started_at") or ""),
-            "paged_at": str(occ.get("paged_at")) if occ.get("paged_at") else None,
-            "resolved_at": str(occ.get("resolved_at")) if occ.get("resolved_at") else None,
-            "detected_via": occ.get("detected_via"), "signal_at": occ.get("signal_at"),
-            "labels": labels}
-
-
 def _flow_store(source):
     """The store for one vantage point, or a 400 for anything else.
 
@@ -4089,7 +2776,6 @@ def api_sflow_port(
     }
 
 
-
 @app.get("/api/sflow/host/{host}")
 def api_sflow_host(
     host: str,
@@ -4114,126 +2800,6 @@ def api_sflow_host(
             host, agent_ip=agent, start=start_dt, end=end_dt,
             limit=max(1, min(int(limit), 200)))),
     }
-
-
-@app.get("/api/alert-rules")
-def api_list_alert_rules(user: str = Depends(require_auth_and_db)):
-    return ALERT_RULES.list()
-
-
-class AlertRuleUpdateRequest(BaseModel):
-    severity: Optional[str] = None
-    enabled: Optional[bool] = None
-    # How long the condition must hold before Prometheus counts this rule
-    # as firing - the "pending" confirmation window (see Prometheus's
-    # `for:`). Always a real value for every rule (0 is valid: fire
-    # instantly, no confirmation window), unlike page_delay_seconds below -
-    # no separate "use the default" flag needed here.
-    for_seconds: Optional[int] = None
-    # How long this rule's alarms are held before paging (paging.py),
-    # overriding the app-wide PAGE_DELAY_SECONDS. Distinguishing "not
-    # touched" from "explicitly reset to the app default" needs its own
-    # flag - page_delay_seconds=None on the wire is ambiguous between the
-    # two, and Optional's usual "omitted" meaning collides with the field
-    # existing to hold NULL as a real, chosen value.
-    page_delay_seconds: Optional[int] = None
-    use_default_page_delay: bool = False
-
-
-@app.put("/api/alert-rules/{name}")
-def api_update_alert_rule(name: str, req: AlertRuleUpdateRequest, user: str = Depends(require_admin)):
-    try:
-        updated = ALERT_RULES.update(
-            name,
-            severity=req.severity,
-            enabled=req.enabled,
-            for_seconds=req.for_seconds,
-            page_delay_seconds=req.page_delay_seconds,
-            clear_page_delay=req.use_default_page_delay,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if updated is None:
-        raise HTTPException(status_code=404, detail="unknown rule")
-
-    try:
-        alert_rules.write_and_reload(ALERT_RULES.list(), ALERT_RULES_FILE, PROMETHEUS_RELOAD_URL)
-    except Exception as e:
-        # The DB write already committed - the rule change is real and
-        # will apply next time anything reloads Prometheus - but the user
-        # needs to know live reload itself didn't happen, not get a
-        # falsely reassuring 200.
-        raise HTTPException(status_code=502, detail=f"Rule saved, but Prometheus reload failed: {e}")
-
-    log.info("user=%s updated alert rule %s: severity=%s enabled=%s for_seconds=%s page_delay_seconds=%s",
-              user, name, req.severity, req.enabled, req.for_seconds, updated.get("page_delay_seconds"))
-    AUDIT.record(user, "alert_rule.update", name, {
-        "severity": req.severity, "enabled": req.enabled, "for_seconds": req.for_seconds,
-        "page_delay_seconds": updated.get("page_delay_seconds"),
-    })
-    return updated
-
-
-@app.get("/api/interface-alerts")
-def api_list_interface_alerts(device_id: str, user: str = Depends(require_auth_and_db)):
-    """Every port this device can address (device.valid_values_for("port")
-    - same list the Console's param dropdowns use), merged with any saved
-    alert config and current live state, so the UI can show a full port
-    list with sane "not configured yet" defaults rather than only the
-    ports someone already opted in."""
-    device = DEVICES_BY_ID.get(device_id)
-    if device is None:
-        raise HTTPException(status_code=404, detail="unknown device")
-    configs_by_port = {c["port"]: c for c in INTERFACE_ALERT_RULES.list(device_id=device_id)}
-    ports = device.valid_values_for("port")
-    result = []
-    for port in ports:
-        cfg = configs_by_port.get(port)
-        result.append({
-            "device_id": device_id,
-            "port": port,
-            "enabled": cfg["enabled"] if cfg else False,
-            "mode": cfg["mode"] if cfg else "immediate",
-            "delay_seconds": cfg["delay_seconds"] if cfg else 60,
-            "severity": cfg["severity"] if cfg else "warning",
-            "current_state": _port_state_for(device_id, port),
-        })
-    return result
-
-
-class InterfaceAlertUpdateRequest(BaseModel):
-    # Real port names (e.g. "Te 1/47") contain a "/" - a path segment
-    # can't safely carry that (confirmed live: even URL-encoded as %2F,
-    # FastAPI's default {port} path converter doesn't match it and
-    # returns a 404), so `port` travels in the body instead of the URL,
-    # unlike every other single-resource PUT/DELETE in this app.
-    port: str
-    enabled: bool
-    mode: str = "immediate"
-    delay_seconds: int = 60
-    severity: str = "warning"
-
-
-@app.put("/api/interface-alerts/{device_id}")
-def api_update_interface_alert(device_id: str, req: InterfaceAlertUpdateRequest, user: str = Depends(require_admin)):
-    device = DEVICES_BY_ID.get(device_id)
-    if device is None:
-        raise HTTPException(status_code=404, detail="unknown device")
-    if req.port not in device.valid_values_for("port"):
-        raise HTTPException(status_code=400, detail="unknown port for this device")
-    try:
-        updated = INTERFACE_ALERT_RULES.upsert(
-            device_id, req.port, req.enabled, req.mode, req.delay_seconds, severity=req.severity
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    log.info("user=%s set interface alert %s/%s: enabled=%s mode=%s delay=%ds",
-              user, device_id, req.port, req.enabled, req.mode, req.delay_seconds)
-    AUDIT.record(user, "interface_alert.update", f"{device_id}/{req.port}", {
-        "enabled": req.enabled, "mode": req.mode,
-        "delay_seconds": req.delay_seconds, "severity": req.severity,
-    })
-    return updated
 
 
 _LLDP_COMMAND = {"os9": "show lldp neighbors detail", "junos": "show lldp neighbors"}
@@ -4455,68 +3021,31 @@ def _topology_refresh_loop():
 threading.Thread(target=_topology_refresh_loop, daemon=True, name="topology-refresh").start()
 
 
-def _open_unacked_occurrences():
-    """Open occurrences that went to the pager and nobody has acknowledged,
-    in the shape push wants. `paged_at` is the gate: an occurrence that is
-    only pending, or still inside its paging hold, or NARG'd, has not
-    paged anyone and must not have phones repeating for it."""
-    rows = OCCURRENCES.list(limit=500, open_only=True)
-    ids = [r["id"] for r in rows]
-    acked = OCCURRENCES.acks_by_occurrence(ids) if ids else {}
-    out = []
-    for r in rows:
-        if acked.get(r["id"]) or not r.get("paged_at"):
-            continue
-        p = _occ_payload(r) or {}
-        p["started_at"] = str(r.get("started_at") or "")
-        out.append(p)
-    return out
-
-
-def _push_repeat_loop():
-    """A pager repeats. Every 30s, re-page devices whose interval has
-    elapsed for any alarm still open and unacknowledged - and page any
-    device that has not been paged for it yet. The event bus handles the
-    first page and the ack broadcast; this handles everything between."""
-    while True:
-        time.sleep(30)
-        if PUSH_NOTIFIER is None or OCCURRENCES is None or PUSH_SUBS is None:
-            continue
-        try:
-            # Belt and braces for the ledger: alarm.resolved clears it, but
-            # a resolve that happened while the process was down (or any
-            # future close path that forgets) must not leave rows behind.
-            PUSH_SUBS.prune_pages(OCCURRENCES.open_ids())
-            PUSH_NOTIFIER.repeat_due(_open_unacked_occurrences())
-        except Exception:
-            log.exception("push repeat pass failed")
-
-
-threading.Thread(target=_push_repeat_loop, daemon=True, name="push-repeater").start()
-
-
 # --- the syslog fast path -----------------------------------------------
 # Vector's switchboard_fast sink (syslog/vector.yaml) POSTs each parsed
 # event here the moment it arrives. Not a session route: the sink
 # authenticates with SYSLOG_INGEST_TOKEN. The work runs on a worker
 # thread so a slow Alertmanager forward never stalls the event loop.
 
+
+# --- the syslog fast path: Vector -> here ---------------------------------------
+
 def _ingest_syslog_sync(body, content_type):
     try:
-        events = fastpath.parse_events(body, content_type)
+        lines = fastpath.parse_events(body, content_type)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"unreadable events: {e}")
-    FAST_PATH.record(events, datetime.now(timezone.utc))
-    acted = _handle_syslog_events(events)
-    return {"accepted": len(events), "acted": acted}
+    FAST_PATH.record(lines, datetime.now(timezone.utc))
+    acted = _handle_syslog_events(lines)
+    return {"accepted": len(lines), "acted": acted}
 
 
-@app.post("/api/ingest/syslog", tags=["ingest"], summary="Syslog fast path: events straight from Vector")
+@app.post("/api/ingest/syslog", tags=["ingest"], summary="Syslog fast path: lines straight from Vector")
 async def api_ingest_syslog(request: Request):
-    """Receives interpreted syslog events from Vector's `http` sink (a JSON
+    """Receives interpreted syslog lines from Vector's `http` sink (a JSON
     array per batch; a single object or NDJSON also work) and evaluates
-    them immediately: interface down/up, fan/PSU alarms, syslog rules.
-    Authenticate with `Authorization: Bearer <SYSLOG_INGEST_TOKEN>`."""
+    them immediately. Authenticate with `Authorization: Bearer
+    <SYSLOG_INGEST_TOKEN>`."""
     if not SYSLOG_INGEST_TOKEN:
         raise HTTPException(status_code=503, detail="fast path not configured: set SYSLOG_INGEST_TOKEN")
     auth = request.headers.get("authorization", "")
@@ -4530,15 +3059,131 @@ async def api_ingest_syslog(request: Request):
     return await run_in_threadpool(_ingest_syslog_sync, body, request.headers.get("content-type", ""))
 
 
-@app.get("/api/alerting/fast-path", tags=["alerting"], summary="Syslog fast-path status")
+# --- events ---------------------------------------------------------------------
+
+def _require_events():
+    if EVENTS is None:
+        raise HTTPException(status_code=503, detail="database not configured")
+    return EVENTS
+
+
+@app.get("/api/events", tags=["events"], summary="Events, newest first")
+def api_list_events(open_only: int = 0, severity: Optional[str] = None, device_id: Optional[str] = None,
+                    kind: Optional[str] = None, group: Optional[str] = None, q: Optional[str] = None,
+                    since_seconds: Optional[int] = None, before_id: Optional[int] = None, limit: int = 200,
+                    user: str = Depends(require_auth_and_db)):
+    """`severity` may be a comma list. `open_only=1` for what is live now.
+    Page older history with `before_id` (the smallest id you have)."""
+    store = _require_events()
+    sev = [x.strip() for x in severity.split(",") if x.strip()] if severity else None
+    since = (datetime.now(timezone.utc) - timedelta(seconds=int(since_seconds))).isoformat() if since_seconds else None
+    return {"events": store.list(open_only=bool(open_only), severity=sev, device_id=device_id or None, kind=kind or None,
+                                 group=group or None, q=q or None, since=since, before_id=before_id, limit=limit),
+            "summary": store.summary()}
+
+
+@app.get("/api/events/summary", tags=["events"], summary="Open and recent counts by severity")
+def api_events_summary(user: str = Depends(require_auth_and_db)):
+    return _require_events().summary()
+
+
+@app.get("/api/events/catalog", tags=["events"], summary="Every event kind and the site's severity for it")
+def api_events_catalog(user: str = Depends(require_auth_and_db)):
+    if EVENT_SETTINGS is None:
+        raise HTTPException(status_code=503, detail="database not configured")
+    descriptions = {
+        "port": "What the switch says about its ports. Per-port overrides on the Ports tab.",
+        "env": "Fans, power supplies and temperature - from syslog, and from show environment on the SSH poll.",
+        "compute": "CPU, memory and memory errors - the SSH poll's CPU/memory readings, and what the device logs.",
+        "device": "The device as a whole: reachability, restarts, configuration changes, silence.",
+        "protocol": "Spanning tree and routing protocol events from syslog.",
+        "syslog": "Your own rules (next tab) raise these; severity is set on each rule.",
+        "switchboard": "Switchboard's own signals.",
+    }
+    return {"groups": [{"key": k, "name": n, "description": descriptions.get(k, "")} for k, n in event_catalog.GROUPS],
+            "kinds": EVENT_SETTINGS.all()}
+
+
+class EventKindUpdateRequest(BaseModel):
+    severity: Optional[str] = None
+    params: Optional[dict] = None
+
+
+@app.put("/api/events/catalog/{kind}", tags=["events"], summary="Set a kind's severity or thresholds")
+def api_update_event_kind(kind: str, req: EventKindUpdateRequest, user: str = Depends(require_operator)):
+    if EVENT_SETTINGS is None:
+        raise HTTPException(status_code=503, detail="database not configured")
+    try:
+        entry = EVENT_SETTINGS.set(kind, severity=req.severity, params=req.params)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    AUDIT.record(user, "event_kind.updated", kind, {"severity": entry["severity"], "params": entry["params"]})
+    return entry
+
+
+@app.delete("/api/events/catalog/{kind}", tags=["events"], summary="Back to the catalogue default")
+def api_reset_event_kind(kind: str, user: str = Depends(require_operator)):
+    if EVENT_SETTINGS is None:
+        raise HTTPException(status_code=503, detail="database not configured")
+    try:
+        entry = EVENT_SETTINGS.reset(kind)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    AUDIT.record(user, "event_kind.reset", kind, None)
+    return entry
+
+
+@app.get("/api/events/ports/{device_id}", tags=["events"], summary="Per-port link-down severity")
+def api_port_settings(device_id: str, user: str = Depends(require_auth_and_db)):
+    if PORT_SETTINGS is None:
+        raise HTTPException(status_code=503, detail="database not configured")
+    if device_id not in DEVICES_BY_ID:
+        raise HTTPException(status_code=404, detail="unknown device")
+    overrides = PORT_SETTINGS.list(device_id)
+    status = STATUS.get(device_id, include_interfaces=True) or {}
+    ports = []
+    seen = set()
+    for iface in status.get("interfaces") or []:
+        port = iface.get("port")
+        if not port:
+            continue
+        seen.add(port)
+        ports.append({"port": port, "port_state": iface.get("port_state"), "description": iface.get("description"),
+                      "severity": overrides.get(port)})
+    for port, sev in overrides.items():
+        if port not in seen:
+            ports.append({"port": port, "port_state": None, "description": None, "severity": sev})
+    return {"device_id": device_id, "default_severity": EVENT_SETTINGS.severity_for("port.link_down"), "ports": ports}
+
+
+class PortSeverityRequest(BaseModel):
+    severity: Optional[str] = None
+
+
+@app.put("/api/events/ports/{device_id}/{port:path}", tags=["events"], summary="Set one port's link-down severity")
+def api_set_port_severity(device_id: str, port: str, req: PortSeverityRequest, user: str = Depends(require_operator)):
+    if PORT_SETTINGS is None:
+        raise HTTPException(status_code=503, detail="database not configured")
+    if device_id not in DEVICES_BY_ID:
+        raise HTTPException(status_code=404, detail="unknown device")
+    try:
+        sev = PORT_SETTINGS.set(device_id, port, req.severity)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    AUDIT.record(user, "port_severity.updated", f"{device_id} {port}", {"severity": sev or "default"})
+    return {"device_id": device_id, "port": port, "severity": sev}
+
+
+@app.get("/api/events/fast-path", tags=["events"], summary="Syslog fast-path and SSH fallback status")
 def api_fast_path_status(user: str = Depends(require_auth_and_db)):
     snap = FAST_PATH.snapshot()
     snap.update({
         "configured": bool(SYSLOG_INGEST_TOKEN),
         "receiver": SYSLOG_RECEIVER,
-        "local_opens": getattr(ALERTMANAGER, "local_opens", 0),
-        "local_closes": getattr(ALERTMANAGER, "local_closes", 0),
-        "rule_alarms_active": SYSLOG_RULE_ENGINE.active(),
+        "syslog_transitions": SYSLOG_DETECTOR.acted if SYSLOG_DETECTOR else 0,
+        "ignored": SYSLOG_DETECTOR.ignored if SYSLOG_DETECTOR else 0,
+        "ssh_transitions": SSH_RECONCILER.acted if SSH_RECONCILER else 0,
+        "rule_events_open": EVENTS.open_events(kind_prefix="syslog.") if EVENTS else [],
         "stale_after_seconds": SYSLOG_STALE_AFTER_SECONDS,
     })
     return snap
@@ -4548,19 +3193,19 @@ class FastPathTestRequest(BaseModel):
     severity: str = "warning"
 
 
-@app.post("/api/alerting/fast-path/test", tags=["alerting"], summary="Send a syslog self-test and time it")
+@app.post("/api/events/fast-path/test", tags=["events"], summary="Send a syslog self-test and time it")
 def api_fast_path_test(req: FastPathTestRequest, user: str = Depends(require_operator)):
     """Sends one syslog line to the configured receiver (Vector) and times
-    it back: received by the ingest endpoint, opened as an alarm, paged to
-    phones. The alarm is the built-in self-test rule and resolves itself
-    after a minute. The numbers are the whole path a real switch message
-    takes, minus the switch."""
+    it back: received by the ingest endpoint, raised as an event, pushed
+    to phones. The severity you pick becomes the self-test kind's setting.
+    The event resolves itself after a minute."""
     if not SYSLOG_INGEST_TOKEN:
         raise HTTPException(status_code=400, detail="fast path not configured: set SYSLOG_INGEST_TOKEN in webui.env")
     if not SYSLOG_RECEIVER:
         raise HTTPException(status_code=400, detail="set the syslog receiver address (host:port) in Settings first")
-    if req.severity not in syslog_alerting.SEVERITIES:
-        raise HTTPException(status_code=400, detail=f"severity must be one of {', '.join(syslog_alerting.SEVERITIES)}")
+    if req.severity not in event_catalog.SEVERITIES:
+        raise HTTPException(status_code=400, detail=f"severity must be one of {', '.join(event_catalog.SEVERITIES)}")
+    store = _require_events()
     host, _, port = SYSLOG_RECEIVER.rpartition(":")
     if not host:
         host, port = SYSLOG_RECEIVER, "514"
@@ -4568,12 +3213,9 @@ def api_fast_path_test(req: FastPathTestRequest, user: str = Depends(require_ope
         port = int(port)
     except ValueError:
         raise HTTPException(status_code=400, detail="syslog receiver must be host:port")
-    rule = SYSLOG_RULES.ensure_selftest(req.severity)
-    _LIST_CACHE.pop("syslog_rules", None)
-    # A previous test still firing would make this one look instant.
-    SYSLOG_RULE_ENGINE.forget_rule(rule["id"], ALERTMANAGER)
-    labels = SYSLOG_RULE_ENGINE._labels(rule, "", "switchboard", "")
-    signature = alert_acks.fingerprint_for(labels)
+    EVENT_SETTINGS.set("switchboard.selftest", severity=req.severity)
+    signature = eventstore.signature_for("switchboard.selftest", "switchboard", "selftest")
+    store.resolve(signature, by="switchboard", detail="superseded by a new test")   # a lingering one would look instant
 
     import socket
     nonce = secrets.token_hex(4)
@@ -4589,46 +3231,82 @@ def api_fast_path_test(req: FastPathTestRequest, user: str = Depends(require_ope
     def ms_since(dt):
         return round((dt - sent_at).total_seconds() * 1000) if dt else None
 
-    received_at = occ = None
+    def _dt(v):
+        try:
+            d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    received_at = ev = None
     deadline = time.monotonic() + 8
     while time.monotonic() < deadline:
         received_at = received_at or FAST_PATH.selftest_received_at(nonce)
         if received_at:
-            cand = OCCURRENCES.open_for(signature)
-            if cand and cand.get("paged_at") and fastpath._iso_to_dt(cand["started_at"]) >= sent_at - timedelta(seconds=1):
-                occ = cand
+            cand = store.open_for(signature)
+            if cand and (cand.get("labels") or {}).get("nonce") == nonce:
+                ev = cand
                 break
         time.sleep(0.02)
-    paged_devices, first_push_at = 0, None
-    if occ and PUSH_SUBS is not None:
+    pushed, first_push = 0, None
+    if ev and PUSH_SUBS is not None:
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline:
-            pages = PUSH_SUBS.pages_for(occ["id"])
-            if pages:
-                paged_devices = len(pages)
-                first = min(p["first_paged_at"] for p in pages.values())
-                first_push_at = first if first.tzinfo else first.replace(tzinfo=timezone.utc)
-                break
-            time.sleep(0.05)
+            fresh = [_dt(r.get("last_used_at")) for r in PUSH_SUBS.list()]
+            fresh = [t for t in fresh if t and t >= sent_at]
+            if fresh:
+                pushed, first_push = len(fresh), min(fresh)
+                if len(fresh) == len(PUSH_SUBS.list()):
+                    break
+            time.sleep(0.1)
     result = {
-        "ok": occ is not None,
-        "sent_at": sent_at.isoformat(),
-        "receiver": f"{host}:{port}",
-        "received_ms": ms_since(received_at),
-        "alarm_ms": ms_since(fastpath._iso_to_dt(occ["paged_at"])) if occ else None,
-        "push_ms": ms_since(first_push_at),
-        "paged_devices": paged_devices,
-        "occurrence_id": occ["id"] if occ else None,
-        "severity": req.severity,
-        "by": user,
+        "ok": ev is not None, "sent_at": sent_at.isoformat(), "receiver": f"{host}:{port}",
+        "received_ms": ms_since(received_at), "event_ms": ms_since(_dt(ev["raised_at"])) if ev else None,
+        "push_ms": ms_since(first_push), "pushed_devices": pushed, "event_id": ev["id"] if ev else None,
+        "severity": req.severity, "by": user,
     }
-    if not occ:
+    if not ev:
         result["detail"] = ("the line never arrived on /api/ingest/syslog - check Vector's switchboard_fast sink and token"
-                            if received_at is None else "received, but no alarm opened - is the self-test rule enabled?")
+                            if received_at is None else "received, but no event was raised - is the self-test kind set to ignore?")
     FAST_PATH.last_test = result
-    AUDIT.record(user, "alerting.fast_path_test", "Switchboard fast-path self-test", result)
+    AUDIT.record(user, "events.fast_path_test", "Switchboard fast-path self-test", result)
     log.info("user=%s fast-path self-test: %s", user, result)
     return result
+
+
+class ResolveRequest(BaseModel):
+    note: Optional[str] = None
+
+
+@app.get("/api/events/{event_id}", tags=["events"], summary="One event")
+def api_get_event(event_id: int, user: str = Depends(require_auth_and_db)):
+    ev = _require_events().get(event_id)
+    if ev is None:
+        raise HTTPException(status_code=404, detail="no such event")
+    return ev
+
+
+@app.post("/api/events/{event_id}/resolve", tags=["events"], summary="Resolve an event by hand")
+def api_resolve_event(event_id: int, req: ResolveRequest, user: str = Depends(require_operator)):
+    """A correction, not an action: if the condition is still true the
+    device raises it again as a new event."""
+    store = _require_events()
+    ev = store.resolve_id(event_id, by=user, detail=(req.note or "").strip() or "resolved by hand")
+    if ev is None:
+        current = store.get(event_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="no such event")
+        return current
+    AUDIT.record(user, "event.resolved", ev["title"], {"note": req.note} if req.note else None)
+    log.info("user=%s resolved event %s (%s)", user, event_id, ev["title"])
+    return ev
+
+
+@app.get("/api/devices/{device_id}/events", tags=["events"], summary="A device's recent events")
+def api_device_events(device_id: str, limit: int = 50, user: str = Depends(require_auth_and_db)):
+    if device_id not in DEVICES_BY_ID:
+        raise HTTPException(status_code=404, detail="unknown device")
+    return _require_events().list(device_id=device_id, limit=limit)
 
 
 # --- syslog rules ----------------------------------------------------------
@@ -4657,12 +3335,12 @@ def _require_syslog_rules():
     return SYSLOG_RULES
 
 
-@app.get("/api/syslog-rules", tags=["alerting"], summary="List syslog rules")
+@app.get("/api/syslog-rules", tags=["events"], summary="List syslog rules")
 def api_list_syslog_rules(user: str = Depends(require_auth_and_db)):
-    return {"rules": _require_syslog_rules().list(), "active": SYSLOG_RULE_ENGINE.active()}
+    return {"rules": _require_syslog_rules().list(), "active": EVENTS.open_events(kind_prefix="syslog.") if EVENTS else []}
 
 
-@app.post("/api/syslog-rules", tags=["alerting"], summary="Create a syslog rule")
+@app.post("/api/syslog-rules", tags=["events"], summary="Create a syslog rule")
 def api_create_syslog_rule(req: SyslogRuleRequest, user: str = Depends(require_operator)):
     try:
         rule = _require_syslog_rules().create(req.model_dump())
@@ -4673,7 +3351,7 @@ def api_create_syslog_rule(req: SyslogRuleRequest, user: str = Depends(require_o
     return rule
 
 
-@app.put("/api/syslog-rules/{rule_id}", tags=["alerting"], summary="Update a syslog rule")
+@app.put("/api/syslog-rules/{rule_id}", tags=["events"], summary="Update a syslog rule")
 def api_update_syslog_rule(rule_id: int, req: SyslogRuleRequest, user: str = Depends(require_operator)):
     try:
         rule = _require_syslog_rules().update(rule_id, req.model_dump())
@@ -4682,23 +3360,22 @@ def api_update_syslog_rule(rule_id: int, req: SyslogRuleRequest, user: str = Dep
     if rule is None:
         raise HTTPException(status_code=404, detail="no such rule")
     _LIST_CACHE.pop("syslog_rules", None)
-    if not rule["enabled"]:
-        SYSLOG_RULE_ENGINE.forget_rule(rule_id, ALERTMANAGER)
+    if not rule["enabled"] and EVENTS is not None:
+        EVENTS.resolve_open(rule_id=rule_id, by="switchboard", detail="rule disabled")
     AUDIT.record(user, "syslog_rule.updated", rule["name"], {k: v for k, v in req.model_dump().items() if v is not None})
     return rule
 
 
-@app.delete("/api/syslog-rules/{rule_id}", tags=["alerting"], summary="Delete a syslog rule")
+@app.delete("/api/syslog-rules/{rule_id}", tags=["events"], summary="Delete a syslog rule")
 def api_delete_syslog_rule(rule_id: int, user: str = Depends(require_operator)):
     store = _require_syslog_rules()
     rule = store.get(rule_id)
     if rule is None:
         raise HTTPException(status_code=404, detail="no such rule")
-    if rule["builtin"]:
-        raise HTTPException(status_code=400, detail="the self-test rule is built in; disable it instead")
     store.delete(rule_id)
     _LIST_CACHE.pop("syslog_rules", None)
-    SYSLOG_RULE_ENGINE.forget_rule(rule_id, ALERTMANAGER)
+    if EVENTS is not None:
+        EVENTS.resolve_open(rule_id=rule_id, by="switchboard", detail="rule deleted")
     AUDIT.record(user, "syslog_rule.deleted", rule["name"], None)
     return {"ok": True}
 
@@ -4706,7 +3383,7 @@ def api_delete_syslog_rule(rule_id: int, user: str = Depends(require_operator)):
 _DELL_SHAPE = re.compile(r"%(?P<facility>[A-Z0-9]+)-(?P<severity_num>\d)-(?P<mnemonic>[A-Z0-9_-]+):")
 
 
-@app.post("/api/syslog-rules/match", tags=["alerting"], summary="Which rules would a line fire or clear?")
+@app.post("/api/syslog-rules/match", tags=["events"], summary="Which rules would a line fire or clear?")
 def api_match_syslog_rules(req: SyslogRuleMatchRequest, user: str = Depends(require_auth_and_db)):
     """Dry run for the rule editor: paste a real log line and see what it
     would do. A Dell-shaped line has its facility/mnemonic parsed the way
@@ -4827,7 +3504,7 @@ def api_revoke_token(token_id: int, user: str = Depends(require_admin)):
 
 # ------------------------------------------------------------ events + webhooks
 
-@app.get("/api/events", tags=["webhooks"], summary="Event catalogue")
+@app.get("/api/webhooks/events", tags=["webhooks"], summary="Bus event names a webhook can subscribe to")
 def api_list_events(user: str = Depends(require_auth)):
     return [{"name": k, "description": v} for k, v in events.EVENTS.items()]
 
@@ -4893,16 +3570,12 @@ class PushSubscribeRequest(BaseModel):
     min_severity: str = "warning"
     notify_resolved: bool = True
     label: Optional[str] = None
-    repeat_minutes: int = 5
-    max_repeats: int = 12
 
 
 class PushPrefsRequest(BaseModel):
     endpoint: str
     min_severity: str = "warning"
     notify_resolved: bool = True
-    repeat_minutes: int = 5
-    max_repeats: int = 12
 
 
 class PushEndpointRequest(BaseModel):
@@ -4944,7 +3617,7 @@ def api_push_prefs(req: PushPrefsRequest, request: Request, user: str = Depends(
     if req.endpoint not in mine and not auth.role_meets(_role_of(request), "admin"):
         raise HTTPException(status_code=403, detail="not your subscription")
     try:
-        row = PUSH_SUBS.update_prefs(req.endpoint, req.min_severity, req.notify_resolved, req.repeat_minutes, req.max_repeats)
+        row = PUSH_SUBS.update_prefs(req.endpoint, req.min_severity, req.notify_resolved)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if row is None:

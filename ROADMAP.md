@@ -1,5 +1,12 @@
 # MONISTACK Roadmap
 
+> **2026-09-16: alerting became event-driven.** Alertmanager, the Prometheus
+> alert rules, the Rules/Interfaces/Alarms pages, acknowledgements, paging
+> holds and Grafana were removed. Events (info/warning/critical, resolved)
+> come from syslog first and the SSH poll as the fallback - see
+> webui/README.md "Events". Sections below that mention alarms,
+> Alertmanager or Grafana describe the previous design.
+
 Path from "working single-switch monitoring stack" to something a DC team
 relies on daily.
 

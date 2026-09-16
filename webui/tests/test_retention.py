@@ -1,17 +1,12 @@
 """Tests for retention.py.
 
 Run against a real Postgres in a throwaway schema, because what matters
-here is the SQL: an `ON DELETE CASCADE` that must not fire, a `LIKE`
-predicate that has to partition a table exactly, and an `auto_saved` flag
-that separates deliberate keeps from automatic ones. A fake DB would
+here is the SQL: a `LIKE` predicate that has to partition a table exactly,
+and an `auto_saved` flag that separates deliberate keeps from automatic ones. A fake DB would
 happily "pass" all three while the real database did something else.
 
-The cascade case is the one worth being careful about: `alarm_acks` and
-`alarm_comments` cascade from `alert_occurrences`, so a naive age-based
-delete silently destroys acknowledgements and incident discussion. That
-isn't hypothetical - a manual cleanup of ~20,800 junk occurrences had to
-exclude those rows explicitly or it would have taken 8 comments and 2 acks
-with it.
+Events: only resolved ones age out - an open event is live state
+however old.
 """
 import os
 import sys
@@ -36,24 +31,10 @@ CREATE TABLE metric_samples (
     id BIGSERIAL PRIMARY KEY, device_id TEXT, metric TEXT, port TEXT,
     value DOUBLE PRECISION, recorded_at TIMESTAMPTZ NOT NULL
 );
-CREATE TABLE alert_history (
-    id BIGSERIAL PRIMARY KEY, alertname TEXT, status TEXT, severity TEXT,
-    summary TEXT, labels TEXT, received_at TEXT NOT NULL
-);
-CREATE TABLE alert_occurrences (
-    id BIGSERIAL PRIMARY KEY, signature TEXT NOT NULL, alertname TEXT NOT NULL,
-    severity TEXT, summary TEXT, labels TEXT NOT NULL,
-    started_at TEXT NOT NULL, resolved_at TEXT
-);
-CREATE TABLE alarm_comments (
-    id BIGSERIAL PRIMARY KEY,
-    occurrence_id BIGINT REFERENCES alert_occurrences(id) ON DELETE CASCADE,
-    author TEXT, body TEXT, created_at TEXT
-);
-CREATE TABLE alarm_acks (
-    id BIGSERIAL PRIMARY KEY,
-    occurrence_id BIGINT REFERENCES alert_occurrences(id) ON DELETE CASCADE,
-    actor TEXT, created_at TEXT
+CREATE TABLE events (
+    id BIGSERIAL PRIMARY KEY, signature TEXT NOT NULL, kind TEXT NOT NULL, severity TEXT NOT NULL,
+    device TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, source TEXT NOT NULL,
+    raised_at TIMESTAMPTZ NOT NULL DEFAULT now(), resolved_at TIMESTAMPTZ
 );
 CREATE TABLE audit_log (
     id BIGSERIAL PRIMARY KEY, ts TEXT NOT NULL, actor TEXT, action TEXT,
@@ -125,53 +106,29 @@ def _count(db, table):
 
 # --- the cascade hazard ----------------------------------------------
 
-def test_an_old_occurrence_carrying_a_comment_is_never_deleted(db):
-    """The rule that protects human records. Deleting this row would
-    cascade the comment away with it."""
-    db.execute("INSERT INTO alert_occurrences (id, signature, alertname, labels, started_at, resolved_at) "
-               "VALUES (1,'sig','A','{}',%s,%s)", (_iso(400), _iso(399)))
-    db.execute("INSERT INTO alarm_comments (occurrence_id, author, body, created_at) "
-               "VALUES (1,'alice','worth keeping',%s)", (_iso(399),))
+def _event(db, resolved_days_ago=None, raised_days_ago=400):
+    db.execute("INSERT INTO events (signature, kind, severity, device, title, source, raised_at, resolved_at) "
+               "VALUES ('sig', 'port.link_down', 'warning', 'S4048', 't', 'syslog', %s, %s)",
+               (_iso(raised_days_ago), _iso(resolved_days_ago) if resolved_days_ago is not None else None))
 
+
+def test_an_old_resolved_event_is_pruned(db):
+    _event(db, resolved_days_ago=399)
     retention.prune_all(db)
-
-    assert _count(db, "alert_occurrences") == 1
-    assert _count(db, "alarm_comments") == 1
+    assert _count(db, "events") == 0
 
 
-def test_an_old_occurrence_carrying_an_ack_is_never_deleted(db):
-    db.execute("INSERT INTO alert_occurrences (id, signature, alertname, labels, started_at, resolved_at) "
-               "VALUES (2,'sig2','A','{}',%s,%s)", (_iso(400), _iso(399)))
-    db.execute("INSERT INTO alarm_acks (occurrence_id, actor, created_at) VALUES (2,'bob',%s)", (_iso(399),))
-
+def test_a_recently_resolved_event_stays(db):
+    _event(db, resolved_days_ago=1)
     retention.prune_all(db)
-
-    assert _count(db, "alert_occurrences") == 1
-    assert _count(db, "alarm_acks") == 1
+    assert _count(db, "events") == 1
 
 
-def test_an_old_plain_occurrence_is_pruned(db):
-    """The other half - without this the policy would never delete
-    anything and the table still grows forever."""
-    db.execute("INSERT INTO alert_occurrences (signature, alertname, labels, started_at, resolved_at) "
-               "VALUES ('sig3','A','{}',%s,%s)", (_iso(400), _iso(399)))
-
+def test_a_still_open_event_is_never_pruned_however_old(db):
+    _event(db, resolved_days_ago=None, raised_days_ago=900)
     retention.prune_all(db)
+    assert _count(db, "events") == 1
 
-    assert _count(db, "alert_occurrences") == 0
-
-
-def test_a_still_open_occurrence_is_never_pruned_however_old(db):
-    """An unresolved alarm is live, not history - age is irrelevant."""
-    db.execute("INSERT INTO alert_occurrences (signature, alertname, labels, started_at, resolved_at) "
-               "VALUES ('sig4','A','{}',%s,NULL)", (_iso(999),))
-
-    retention.prune_all(db)
-
-    assert _count(db, "alert_occurrences") == 1
-
-
-# --- deliberate keeps outlive automatic ones -------------------------
 
 def test_only_auto_saved_results_age_out(db):
     """A result someone clicked Save on is a deliberate keep and must
@@ -247,14 +204,13 @@ def test_dry_run_deletes_nothing_but_reports_what_would_go(db):
 
 
 def test_recent_rows_are_untouched(db):
-    for table, col in (("audit_log", "ts"), ("command_history", "ts"), ("alert_history", "received_at")):
+    for table, col in (("audit_log", "ts"), ("command_history", "ts")):
         db.execute(f"INSERT INTO {table} ({col}) VALUES (%s)", (_iso(1),))
 
     retention.prune_all(db)
 
     assert _count(db, "audit_log") == 1
     assert _count(db, "command_history") == 1
-    assert _count(db, "alert_history") == 1
 
 
 def test_one_failing_policy_does_not_stop_the_others(db):
