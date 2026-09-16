@@ -16,6 +16,14 @@ Rules of the fallback, learned the hard way in the alarm era:
 - Fans/PSUs are few and named, so their state is reconciled directly.
 - Reachability: consecutive failed polls raise; the next good poll resolves.
 - CPU/memory: thresholds from the catalogue, held for N polls.
+- Optics are only judged on a link that is **up**. Measured live on the
+  S4048: 8 of its 12 DOM optics sit at -40 dBm with Rx-LOS and low-power
+  alarms set, every one of them on an unused or shut port. That is dark
+  fibre, not a fault, and alarming on it would have produced 8 immediate
+  criticals. A live link reading low is the signal worth having.
+- Error counters are cumulative, so only a *rise* is a fault: a port that
+  logged errors once a year ago and never again is fine. A counter going
+  backwards is a device reboot, not a negative error rate.
 """
 import logging
 from datetime import datetime, timezone
@@ -43,6 +51,9 @@ class SshReconciler:
         self._fail_passes = {}       # device_id -> consecutive passes with last_error
         self._cpu_passes = {}        # device_id -> consecutive polls over threshold
         self._mem_passes = {}
+        self._seen_optics_at = {}    # device_id -> last transceivers_polled considered
+        self._counters = {}          # (device_id, port) -> last error/discard counters
+        self._optic_present = {}     # (device_id, port) -> was a transceiver in it
         self.acted = 0
 
     def reconcile(self, device_id, device, status):
@@ -50,19 +61,31 @@ class SshReconciler:
         if status is None:
             return 0
         acted = self._reachability(device_id, device, status)
+        interfaces = status.get("interfaces") or []
         polled_at = status.get("last_polled")
-        if not polled_at or self._seen_polled_at.get(device_id) == polled_at:
-            self.acted += acted
-            return acted
-        self._seen_polled_at[device_id] = polled_at
-        polled_dt = _dt(polled_at)
-        acted += self._ports(device_id, device, status.get("interfaces") or [], polled_dt)
-        acted += self._environment(device_id, device, status.get("env") or {}, polled_dt)
-        acted += self._compute(device_id, device, status)
+        if polled_at and self._seen_polled_at.get(device_id) != polled_at:
+            self._seen_polled_at[device_id] = polled_at
+            polled_dt = _dt(polled_at)
+            acted += self._ports(device_id, device, interfaces, polled_dt)
+            acted += self._environment(device_id, device, status.get("env") or {}, polled_dt)
+            acted += self._compute(device_id, device, status)
+            acted += self._errors(device_id, device, interfaces)
+        # Optics ride the poller's slow cycle (every ~5 min), so they have
+        # their own freshness stamp - checking them on the fast tick would
+        # re-count the same reading every 15 seconds.
+        optics_at = status.get("transceivers_polled")
+        if optics_at and self._seen_optics_at.get(device_id) != optics_at:
+            self._seen_optics_at[device_id] = optics_at
+            acted += self._optics(device_id, device, interfaces)
         self.acted += acted
         return acted
 
     # --- helpers ---------------------------------------------------------------
+
+    def _port_ignored(self, device_id, port):
+        """A port someone marked `ignore` is uninteresting entirely - its
+        optics and its error counters too, not only its link state."""
+        return self.ports.severity_for(device_id, port, None) == "ignore"
 
     def _raise(self, kind, device_id, device, subject, title, detail=None, severity=None):
         sev = severity or self.settings.severity_for(kind)
@@ -147,6 +170,104 @@ class SshReconciler:
         for (kind, subject), state in faulted.items():
             name = "Power supply fault" if kind == "env.psu" else "Fan fault"
             acted += self._raise(kind, device_id, device, subject, f"{name}: {subject} on {device}", detail=f"show environment reports {state}")
+        return acted
+
+    # --- optics and error counters -------------------------------------------
+
+    def _optics(self, device_id, device, interfaces):
+        acted = 0
+        ceiling = float(self.settings.params_for("optic.temperature").get("ceiling_c", 70))
+        floor_dbm = float(self.settings.params_for("optic.rx_power_low").get("floor_dbm", -12))
+        for iface in interfaces:
+            port = iface.get("port")
+            t = iface.get("transceiver") or {}
+            if not port or self._port_ignored(device_id, port):
+                continue
+
+            # A module that was there and is not any more, whatever the link is doing.
+            was = self._optic_present.get((device_id, port))
+            now = bool(t.get("present"))
+            self._optic_present[(device_id, port)] = now
+            if was and not now:
+                acted += self._raise("optic.removed", device_id, device, port,
+                                     f"Transceiver removed: {port} on {device}", detail="the SSH poll no longer sees a module")
+            elif now and not was:
+                acted += self._resolve_now("optic.removed", device_id, port, "a transceiver is in the port again")
+
+            # Everything below is a reading, and a reading only means
+            # something on a link that is carrying light.
+            if not (now and t.get("dom_supported")) or iface.get("port_state") != "up":
+                continue
+            rx, tx, temp = t.get("rx_power_dbm"), t.get("tx_power_dbm"), t.get("temperature_c")
+
+            low = t.get("rx_power_low_alarm_flag") or (rx is not None and rx <= floor_dbm)
+            acted += self._set("optic.rx_power_low", low, device_id, device, port,
+                               f"Low receive power: {port} on {device}" + (f" at {rx} dBm" if rx is not None else ""),
+                               "the module's low alarm" if t.get("rx_power_low_alarm_flag") else f"{rx} dBm, floor {floor_dbm} dBm",
+                               "receive power is back within limits")
+            acted += self._set("optic.rx_power_high", bool(t.get("rx_power_high_alarm_flag")), device_id, device, port,
+                               f"High receive power: {port} on {device}" + (f" at {rx} dBm" if rx is not None else ""),
+                               "the module's high alarm", "receive power is back within limits")
+            fault = t.get("tx_fault_state") or t.get("tx_power_low_alarm_flag")
+            acted += self._set("optic.tx_fault", bool(fault), device_id, device, port,
+                               f"Transmit fault: {port} on {device}",
+                               "Tx fault" if t.get("tx_fault_state") else f"transmit power low ({tx} dBm)",
+                               "the module no longer reports a transmit fault")
+            hot = t.get("temperature_high_alarm_flag") or (temp is not None and temp >= ceiling)
+            acted += self._set("optic.temperature", bool(hot), device_id, device, port,
+                               f"Optic temperature: {port} on {device}" + (f" at {temp} C" if temp is not None else ""),
+                               "the module's temperature alarm" if t.get("temperature_high_alarm_flag") else f"{temp} C, ceiling {ceiling} C",
+                               "the optic has cooled")
+        return acted
+
+    def _set(self, kind, faulted, device_id, device, subject, title, detail, cleared_detail):
+        """Raise while the condition holds, resolve the moment it stops."""
+        if faulted:
+            return self._raise(kind, device_id, device, subject, title, detail=detail)
+        return self._resolve_now(kind, device_id, subject, cleared_detail)
+
+    def _resolve_now(self, kind, device_id, subject, detail):
+        open_ev = self.store.open_kind(kind, device_id, subject)
+        if open_ev is None:
+            return 0
+        return 1 if self.store.resolve(open_ev["signature"], by="ssh", detail=detail) else 0
+
+    COUNTERS = (
+        ("port.input_errors", "input_errors", "Input errors"),
+        ("port.output_errors", "output_errors", "Output errors"),
+        ("port.discards", ("input_discards", "output_discards"), "Discards"),
+    )
+
+    def _errors(self, device_id, device, interfaces):
+        acted = 0
+        for iface in interfaces:
+            port = iface.get("port")
+            if not port or self._port_ignored(device_id, port):
+                continue
+            key = (device_id, port)
+            previous = self._counters.get(key, {})
+            current = {}
+            for kind, fields, label in self.COUNTERS:
+                fields = (fields,) if isinstance(fields, str) else fields
+                values = [iface.get(f) for f in fields]
+                if any(v is None for v in values):
+                    continue   # Junos reports no counters; nothing to compare
+                total = sum(int(v) for v in values)
+                current[kind] = total
+                if kind not in previous or iface.get("port_state") != "up":
+                    continue
+                delta = total - previous[kind]
+                if delta < 0:
+                    continue   # counters reset: the device restarted
+                threshold = max(1, int(self.settings.params_for(kind).get("per_poll", 10)))
+                if delta >= threshold:
+                    acted += self._raise(kind, device_id, device, port,
+                                         f"{label} rising: {port} on {device} (+{delta})",
+                                         detail=f"+{delta} since the last poll, {total} in total")
+                elif delta == 0:
+                    acted += self._resolve_now(kind, device_id, port, f"no further increase ({total} in total)")
+            if current:
+                self._counters[key] = {**previous, **current}
         return acted
 
     def _compute(self, device_id, device, status):

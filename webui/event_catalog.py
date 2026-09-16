@@ -23,6 +23,7 @@ SEVERITIES = ("info", "warning", "critical")
 CHOICES = SEVERITIES + ("ignore",)
 GROUPS = [
     ("port", "Ports"),
+    ("optic", "Optics"),
     ("env", "Environment"),
     ("compute", "Compute"),
     ("device", "Device"),
@@ -45,6 +46,45 @@ CATALOG = [
     {"kind": "port.flapping", "group": "port", "name": "Link flapping", "default": "warning",
      "description": "An interface went down at least 3 times within 5 minutes.",
      "sources": ["syslog"], "resolves": "after 10 minutes without another flap", "ttl_seconds": 600},
+    {"kind": "port.input_errors", "group": "port", "name": "Input errors rising", "default": "warning",
+     "description": "CRC, runt, giant and overrun errors are climbing on a live port - the classic bad cable, dirty "
+                    "connector or failing optic. Counters only; a port that logged errors once and stopped is not a fault.",
+     "sources": ["ssh"], "resolves": "when a poll shows no further increase", "ttl_seconds": None,
+     "params": {"per_poll": 10}},
+    {"kind": "port.output_errors", "group": "port", "name": "Output errors rising", "default": "warning",
+     "description": "Collisions and output errors climbing on a live port - usually a duplex mismatch or a failing link partner.",
+     "sources": ["ssh"], "resolves": "when a poll shows no further increase", "ttl_seconds": None,
+     "params": {"per_poll": 10}},
+    {"kind": "port.discards", "group": "port", "name": "Discards rising", "default": "info",
+     "description": "Frames dropped on a live port. Usually congestion rather than a fault, which is why this starts at info.",
+     "sources": ["ssh"], "resolves": "when a poll shows no further increase", "ttl_seconds": None,
+     "params": {"per_poll": 1000}},
+    {"kind": "optic.rx_power_low", "group": "optic", "name": "Low receive power (light loss)", "default": "critical",
+     "description": "A live link's optic is receiving too little light - the module's own low alarm, or below the floor set "
+                    "here. A dirty or bent fibre, a failing far-end laser, or too much attenuation. Only checked while the "
+                    "link is up: an unused port with an optic in it reads -40 dBm and that is not a fault.",
+     "sources": ["ssh"], "resolves": "when the reading recovers", "ttl_seconds": None,
+     "params": {"floor_dbm": -12}},
+    {"kind": "optic.rx_power_high", "group": "optic", "name": "High receive power", "default": "warning",
+     "description": "A live link's receiver is being overdriven - too short a fibre for the optic, or the wrong module type. "
+                    "It damages receivers over time.",
+     "sources": ["ssh"], "resolves": "when the reading recovers", "ttl_seconds": None},
+    {"kind": "optic.tx_fault", "group": "optic", "name": "Transmit fault", "default": "critical",
+     "description": "The module reports a transmit fault, or its transmit power has fallen below its own low alarm, on a live "
+                    "link. The laser is failing.",
+     "sources": ["ssh"], "resolves": "when the module stops reporting it", "ttl_seconds": None},
+    {"kind": "optic.temperature", "group": "optic", "name": "Optic temperature", "default": "warning",
+     "description": "The transceiver's own temperature alarm, or above the ceiling set here. Hot optics fail and drift.",
+     "sources": ["ssh"], "resolves": "when it cools", "ttl_seconds": None,
+     "params": {"ceiling_c": 70}},
+    {"kind": "optic.removed", "group": "optic", "name": "Transceiver removed", "default": "warning",
+     "description": "A transceiver that was in the port is gone - from the SSH poll, and from the switch's own "
+                    "'Optics SFP+ removed' log line.",
+     "sources": ["syslog", "ssh"], "resolves": "when a transceiver is back in the port", "ttl_seconds": None},
+    {"kind": "optic.unsupported", "group": "optic", "name": "Non-qualified optic", "default": "warning",
+     "description": "The switch reports the installed optic as non-qualified. It may work, may be flaky, and is the first "
+                    "thing to suspect when a link is unreliable.",
+     "sources": ["syslog"], "resolves": "after 24 hours, or when the optic is replaced", "ttl_seconds": 86400},
     {"kind": "env.psu", "group": "env", "name": "Power supply fault", "default": "critical",
      "description": "A PSU reported down, removed or in alarm.",
      "sources": ["syslog", "ssh"], "resolves": "when it reports up again", "ttl_seconds": None},
@@ -164,7 +204,8 @@ class EventSettings:
                 v = int(v)
             except (TypeError, ValueError):
                 raise ValueError(f"{k} must be a whole number")
-            if v < 0 or v > 100000:
+            # dBm floors are negative, so only the magnitude is bounded.
+            if not -100000 <= v <= 100000:
                 raise ValueError(f"{k} is out of range")
             new_params[k] = v
         self.db.execute(

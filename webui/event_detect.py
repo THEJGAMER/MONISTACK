@@ -91,6 +91,16 @@ _CLI_ECHO = re.compile(r"(?i)UI_CMDLINE|UI_CHILD_START|UI_DBASE|UI_COMMIT_PROGRE
 # link went down, which is already reported as the link event - counting
 # it as a lost adjacency turned one unplug into two critical events.
 _LLDP = re.compile(r"(?i)\bLLDP")
+# Dell OS9's optic messages, both captured live on this fleet:
+#   %IFAGT-5-REMOVED_OPTICS_PLUS: Optics SFP+ removed in slot 1 port 47
+#   %IFAGT-5-UNSUP_OPTICS: Non-qualified optics in slot 1 port 47
+# The insert wording is the documented counterpart and has not been seen
+# here yet, so it is matched generically (inserted/installed) rather than
+# pinned to one mnemonic.
+_OPTIC_OUT = re.compile(r"(?i)REMOVED_OPTICS|optics?\b[^.]*\bremoved")
+_OPTIC_IN = re.compile(r"(?i)INSERTED_OPTICS|INSTALLED_OPTICS|optics?\b[^.]*\b(inserted|installed)")
+_OPTIC_UNSUP = re.compile(r"(?i)UNSUP_OPTICS|non-?qualified optics")
+_SLOT_PORT = re.compile(r"(?i)slot\s+(\d+)\s+port\s+(\d+)")
 # Dell OS9's LACP membership lines. The mnemonics are exact; the
 # port-channel number is pulled from the text for the event's detail.
 _LAG_OUT = re.compile(r"(?i)PORT[-_]UNGROUPED|exited\s+port-channel")
@@ -180,6 +190,18 @@ class SyslogDetector:
             else:
                 acted += self._resolve("port.link_down", device_id, device, port, e, source)
             return acted
+
+        # optics the switch tells us about itself
+        if _OPTIC_OUT.search(msg) or _OPTIC_IN.search(msg) or _OPTIC_UNSUP.search(msg):
+            slot = _SLOT_PORT.search(msg)
+            subject = e.get("interface") or (f"slot {slot.group(1)} port {slot.group(2)}" if slot else "optic")
+            if _OPTIC_UNSUP.search(msg):
+                return self._raise("optic.unsupported", device_id, device, subject,
+                                   f"Non-qualified optic: {subject} on {device}", e, source)
+            if _OPTIC_IN.search(msg):
+                return self._resolve("optic.removed", device_id, device, subject, e, source)
+            return self._raise("optic.removed", device_id, device, subject,
+                               f"Transceiver removed: {subject} on {device}", e, source)
 
         # environment: fans, PSUs, temperature
         if category == "hardware" or e.get("alarm_active") is not None:

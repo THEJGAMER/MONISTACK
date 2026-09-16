@@ -180,6 +180,27 @@ def test_compute_device_and_protocol_patterns():
     assert store.log[-1] == ("resolve", "protocol.neighbor_lost", "10.0.0.1", "syslog")
 
 
+# --- optics, from the S4048's own captured lines -------------------------
+
+def test_optic_removed_and_non_qualified_are_their_own_events():
+    """Both lines captured live from this S4048."""
+    store, d = _detector()
+    dell = dict(device_host="S4048", event_category="interface", facility="IFAGT")
+    d.process([_line("%IFAGT-5-REMOVED_OPTICS_PLUS: Optics SFP+ removed in slot 1 port 47", 1, mnemonic="REMOVED_OPTICS_PLUS", **dell)], _dev)
+    assert store.log[-1] == ("raise", "optic.removed", "slot 1 port 47", "warning")
+
+    d.process([_line("%IFAGT-5-UNSUP_OPTICS: Non-qualified optics in slot 1 port 47", 2, mnemonic="UNSUP_OPTICS", **dell)], _dev)
+    assert store.log[-1] == ("raise", "optic.unsupported", "slot 1 port 47", "warning")
+
+
+def test_putting_an_optic_back_resolves_the_removal():
+    store, d = _detector()
+    dell = dict(device_host="S4048", event_category="interface", facility="IFAGT")
+    d.process([_line("%IFAGT-5-REMOVED_OPTICS_PLUS: Optics SFP+ removed in slot 1 port 47", 1, mnemonic="REMOVED_OPTICS_PLUS", **dell)], _dev)
+    d.process([_line("%IFAGT-5-INSERTED_OPTICS_PLUS: Optics SFP+ inserted in slot 1 port 47", 2, mnemonic="INSERTED_OPTICS_PLUS", **dell)], _dev)
+    assert store.log[-1] == ("resolve", "optic.removed", "slot 1 port 47", "syslog")
+
+
 def test_a_command_someone_typed_is_never_a_fault():
     """Junos echoes every CLI line to syslog. Confirmed live: `show lldp
     neighbors` came through as a line the neighbour patterns matched, so

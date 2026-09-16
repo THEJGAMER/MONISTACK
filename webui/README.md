@@ -377,9 +377,10 @@ and that line *is* the signal.
    (`syslog/vector.yaml`) POSTs every interpreted line to
    `/api/ingest/syslog` as it arrives (50 ms batch timeout, bearer token
    `SYSLOG_INGEST_TOKEN`) and `event_detect.SyslogDetector` evaluates it on
-   arrival: link down/up on **any** port, LAG membership, fan/PSU faults,
-   temperature, memory errors, restarts, config changes, STP topology
-   changes, routing neighbours, and the user's own syslog rules. Measured
+   arrival: link down/up on **any** port, LAG membership, optics removed or
+   non-qualified, fan/PSU faults, temperature, memory errors, restarts,
+   config changes, STP topology changes, routing neighbours, and the
+   user's own syslog rules. Measured
    live: a line is an event about 70 ms after it reaches the receiver.
 
    Two things the detectors deliberately ignore, both found by unplugging
@@ -409,10 +410,42 @@ and that line *is* the signal.
    first sight. A resolve from the poll must postdate the event it would
    close (a stale snapshot must not close a fresh outage). Fans and PSUs
    are reconciled directly; consecutive failed polls raise
-   `device.unreachable`; CPU and memory thresholds hold for N polls.
+   `device.unreachable`; CPU and memory thresholds hold for N polls; and
+   optics and interface error counters are read here because syslog never
+   carries them (see below).
 4. **Timers** close what nothing else can (a topology change after 5 min,
    a self-test after 60 s, a rule after its auto-resolve), and a device
    whose syslog goes quiet raises `device.syslog_silent`.
+
+**Optics and error counters.** Both come from the SSH poll, because
+neither is in syslog. The optical checks read the module's own alarm
+flags - its thresholds are better than any I would invent - plus a
+configurable floor for the case the flags miss: a link fading long before
+the module complains. Low receive power (light loss), high receive power
+(an overdriven receiver), transmit fault, optic temperature, a
+transceiver removed, and a non-qualified optic. The switch's own
+`REMOVED_OPTICS_PLUS` and `UNSUP_OPTICS` log lines feed the last two
+through the fast path as well.
+
+The rule that makes this usable: **a reading only means something on a
+link that is up**. Measured on this S4048 - 8 of its 12 optics with
+diagnostics sit at -40 dBm with Rx-LOS and low-power alarms set, every
+one on an unused or shut port. That is dark fibre, and alarming on it
+would have produced 8 instant criticals and taught everyone to ignore the
+list. The 4 live links read -1.6 to -3.3 dBm and are silent.
+
+Error counters (CRC, runts, giants, overruns; collisions; discards) are
+cumulative, so only a **rise** is a fault - a port that logged errors once
+a year ago is healthy. A counter going backwards is a reboot, not a
+negative error rate, and a device that reports no counters at all (the
+EX3300) is left alone rather than treated as zero. A port marked `ignore`
+on the Ports tab is ignored for its optics and counters too, not only its
+link state.
+
+Verified end to end on the real optics rather than in a fixture: raising
+the light floor to -1 dBm made all four live links raise
+`optic.rx_power_low` with their measured values, and restoring it
+resolved all four.
 
 **The catalogue** (`event_catalog.py`, Events → Catalogue) lists every
 kind with a default severity, and a site sets its own per kind - `info`,
