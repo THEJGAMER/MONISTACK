@@ -116,14 +116,36 @@ the destination is chosen — see the architecture discussion for options.
 
 ## Redeploying after an edit
 
+**Use the installer.** Three values in this file are placeholders that it
+substitutes per site - the Loki endpoint, the device timezone, and the
+Switchboard ingest URL and token:
+
 ```
-scp vector.yaml root@192.168.0.144:/etc/vector/vector.candidate.yaml
-ssh root@192.168.0.144 'vector validate /etc/vector/vector.candidate.yaml'
-# if that's clean:
-ssh root@192.168.0.144 'cp /etc/vector/vector.yaml /etc/vector/vector.yaml.bak-$(date +%Y%m%d%H%M%S) && \
-  mv /etc/vector/vector.candidate.yaml /etc/vector/vector.yaml && \
-  systemctl restart vector && systemctl is-active vector'
+# on the receiver, with the repo checked out there
+cd /root/MONISTACK && git pull
+SB_LOKI_ENDPOINT=http://192.168.0.145:3100 \
+SB_DEVICE_TZ=Australia/Sydney \
+SB_INGEST_URL=http://192.168.0.147:8080/api/ingest/syslog \
+SB_INGEST_TOKEN=$(ssh root@<switchboard-host> 'grep ^SYSLOG_INGEST_TOKEN= /etc/switchboard/webui.env | cut -d= -f2') \
+  sudo packaging/install-stack.sh --install syslog -y
 ```
+
+It validates before touching the running config, keeps a dated backup,
+and POSTs a test event to Switchboard so a wrong URL or token fails
+there rather than silently later.
+
+**Do not `scp` this file onto the receiver.** It looks like it works -
+`vector validate` passes, the service starts, Loki keeps filling - but it
+replaces the substituted values with the placeholders, so Vector posts
+the fast path to a host that is not there. It logs "Connection refused",
+drops each batch, and detection quietly falls back to the Loki poll,
+seconds slower. That is exactly how it failed on 2026-09-16, and the only
+outward sign was the Settings health panel's "Syslog fast path" row going
+red and events arriving with `source: loki` instead of `syslog`.
+
+If you must deploy by hand, re-apply all three substitutions afterwards
+and check `curl -s .../api/events/fast-path` shows a recent
+`last_received_at`.
 
 Dated backups of prior configs are on the LXC:
 `/etc/vector/vector.yaml.bak-20260728222754` (pre-interpreter),
