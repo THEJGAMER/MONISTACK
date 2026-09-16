@@ -146,7 +146,7 @@ class SshReconciler:
                 first_sight = prev is None
                 if prev == "up" or (first_sight and self.ports.has_override(device_id, port)):
                     acted += self._raise("port.link_down", device_id, device, port, f"Link down: {port} on {device}",
-                                         detail="seen by the SSH poll" + (" (down at first poll)" if first_sight else ""), severity=sev)
+                                         detail="The SSH poll found it down" + (", on the first look at this port" if first_sight else ""), severity=sev)
             elif state == "up":
                 acted += self._resolve_if_stale_safe("port.link_down", device_id, device, port, polled_dt, "SSH poll shows the port up")
         return acted
@@ -169,7 +169,7 @@ class SshReconciler:
                 acted += self._resolve_if_stale_safe("env.psu", device_id, device, subject, polled_dt, "SSH poll shows it up")
         for (kind, subject), state in faulted.items():
             name = "Power supply fault" if kind == "env.psu" else "Fan fault"
-            acted += self._raise(kind, device_id, device, subject, f"{name}: {subject} on {device}", detail=f"show environment reports {state}")
+            acted += self._raise(kind, device_id, device, subject, f"{name}: {subject} on {device}", detail=f"show environment reports it {state}")
         return acted
 
     # --- optics and error counters -------------------------------------------
@@ -200,23 +200,27 @@ class SshReconciler:
                 continue
             rx, tx, temp = t.get("rx_power_dbm"), t.get("tx_power_dbm"), t.get("temperature_c")
 
+            rx_txt = f" at {rx:.1f} dBm" if rx is not None else ""
             low = t.get("rx_power_low_alarm_flag") or (rx is not None and rx <= floor_dbm)
             acted += self._set("optic.rx_power_low", low, device_id, device, port,
-                               f"Low receive power: {port} on {device}" + (f" at {rx} dBm" if rx is not None else ""),
-                               "the module's low alarm" if t.get("rx_power_low_alarm_flag") else f"{rx} dBm, floor {floor_dbm} dBm",
+                               f"Low receive power: {port} on {device}{rx_txt}",
+                               "The module raised its own low-power alarm" if t.get("rx_power_low_alarm_flag")
+                               else f"Receiving {rx:.1f} dBm, against a floor of {floor_dbm:.0f} dBm",
                                "receive power is back within limits")
             acted += self._set("optic.rx_power_high", bool(t.get("rx_power_high_alarm_flag")), device_id, device, port,
-                               f"High receive power: {port} on {device}" + (f" at {rx} dBm" if rx is not None else ""),
-                               "the module's high alarm", "receive power is back within limits")
+                               f"High receive power: {port} on {device}{rx_txt}",
+                               "The module raised its own high-power alarm", "receive power is back within limits")
             fault = t.get("tx_fault_state") or t.get("tx_power_low_alarm_flag")
             acted += self._set("optic.tx_fault", bool(fault), device_id, device, port,
                                f"Transmit fault: {port} on {device}",
-                               "Tx fault" if t.get("tx_fault_state") else f"transmit power low ({tx} dBm)",
+                               "The module reports a transmit fault" if t.get("tx_fault_state")
+                               else f"Transmit power has fallen to {tx:.1f} dBm",
                                "the module no longer reports a transmit fault")
             hot = t.get("temperature_high_alarm_flag") or (temp is not None and temp >= ceiling)
             acted += self._set("optic.temperature", bool(hot), device_id, device, port,
-                               f"Optic temperature: {port} on {device}" + (f" at {temp} C" if temp is not None else ""),
-                               "the module's temperature alarm" if t.get("temperature_high_alarm_flag") else f"{temp} C, ceiling {ceiling} C",
+                               f"Optic temperature: {port} on {device}" + (f" at {temp:.0f} C" if temp is not None else ""),
+                               "The module raised its own temperature alarm" if t.get("temperature_high_alarm_flag")
+                               else f"Running at {temp:.0f} C, against a ceiling of {ceiling:.0f} C",
                                "the optic has cooled")
         return acted
 
@@ -263,7 +267,7 @@ class SshReconciler:
                 if delta >= threshold:
                     acted += self._raise(kind, device_id, device, port,
                                          f"{label} rising: {port} on {device} (+{delta})",
-                                         detail=f"+{delta} since the last poll, {total} in total")
+                                         detail=f"{delta} more since the last poll, {total} in total")
                 elif delta == 0:
                     acted += self._resolve_now(kind, device_id, port, f"no further increase ({total} in total)")
             if current:
@@ -280,7 +284,7 @@ class SshReconciler:
                 self._cpu_passes[device_id] = n
                 if n >= max(1, int(p.get("polls", 3))):
                     acted += self._raise("compute.cpu_high", device_id, device, "cpu", f"High CPU on {device}: {float(cpu):.0f}%",
-                                         detail=f"{float(cpu):.0f}% for {n} polls (threshold {p.get('raise_percent', 90)}%)")
+                                         detail=f"At {float(cpu):.0f}% for {n} consecutive polls, against a threshold of {p.get('raise_percent', 90)}%")
             else:
                 self._cpu_passes[device_id] = 0
                 if float(cpu) <= float(p.get("clear_percent", 80)):
@@ -296,7 +300,7 @@ class SshReconciler:
                 self._mem_passes[device_id] = n
                 if n >= max(1, int(p.get("polls", 2))):
                     acted += self._raise("compute.memory_high", device_id, device, "memory", f"High memory on {device}: {pct:.0f}%",
-                                         detail=f"{pct:.0f}% used for {n} polls (threshold {p.get('raise_percent', 90)}%)")
+                                         detail=f"{pct:.0f}% in use for {n} consecutive polls, against a threshold of {p.get('raise_percent', 90)}%")
             else:
                 self._mem_passes[device_id] = 0
                 if pct <= float(p.get("clear_percent", 85)):

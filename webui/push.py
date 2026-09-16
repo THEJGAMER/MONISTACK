@@ -180,6 +180,98 @@ class PushSubscriptionStore:
         return d
 
 
+# --- saying it in words -------------------------------------------------
+# What a phone showed before this: a title shouting "CRITICAL:" ahead of
+# a colon-heavy line, and a body containing the raw log, e.g.
+#   mib2d[1344]: SNMP_TRAP_LINK_DOWN: ifIndex 603, ifAdminStatus up(1),
+#   ifOperStatus down(2), ifName xe-0/1/3
+# You cannot read that on a lock screen, and by the time you have, you
+# have opened the app anyway - where the raw line is, and belongs.
+
+_SEVERITY_WORD = {"critical": "Critical", "warning": "Warning", "info": "For information", "ok": "Resolved"}
+
+# Whether an event's `detail` is something a device said or something
+# Switchboard wrote. The syslog paths carry the raw line; everything else
+# carries a sentence the detectors composed ("95% for 3 polls, threshold
+# 90%"), which is worth putting in front of someone.
+_DEVICE_SAID = {"syslog", "loki"}
+
+
+# The title already names the device, so these do not repeat it.
+def _how_we_know(source):
+    if source in _DEVICE_SAID:
+        return "The device reported it."
+    if source == "ssh":
+        return "Found by the SSH poll."
+    if source == "switchboard":
+        return "Noticed by Switchboard."
+    return f"Raised by {source}." if source else ""
+
+
+def _how_it_cleared(by):
+    if by in _DEVICE_SAID:
+        return "The device reported it back to normal."
+    if by == "ssh":
+        return "The SSH poll saw it recover."
+    if by == "timer":
+        return "It stopped being reported."
+    if by in ("switchboard", None, ""):
+        return "Cleared by Switchboard."
+    return f"Resolved by {by}."
+
+
+def _as_sentence(text):
+    text = (text or "").strip()
+    if not text:
+        return ""
+    return text if text[-1] in ".!?" else text + "."
+
+
+def _lasted(raised_at, resolved_at):
+    """'Lasted 3 minutes.' - the one thing a resolve should always say."""
+    start_, end_ = _as_dt(raised_at), _as_dt(resolved_at)
+    if start_ is None or end_ is None:
+        return ""
+    seconds = max(0, (end_ - start_).total_seconds())
+    if seconds < 60:
+        n, unit = round(seconds), "second"
+    elif seconds < 5400:
+        n, unit = round(seconds / 60), "minute"
+    elif seconds < 172800:
+        n, unit = round(seconds / 3600), "hour"
+    else:
+        n, unit = round(seconds / 86400), "day"
+    return f"Lasted {n} {unit}{'s' if n != 1 else ''}."
+
+
+def _as_dt(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _ordinal(n):
+    if 10 <= n % 100 <= 20:
+        return f"{n}th"
+    suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _return_note(reopen_count):
+    n = int(reopen_count or 0)
+    if not n:
+        return ""
+    return f"Back for the {_ordinal(n + 1)} time."
+
+
+def _sentences(*parts):
+    return " ".join(p.strip() for p in parts if p and p.strip())
+
+
 def payload_for(event, envelope):
     """What the notification says. None when this bus event is not one."""
     ev = envelope.get("event_data") or {}
@@ -188,16 +280,25 @@ def payload_for(event, envelope):
     sev = (ev.get("severity") or "warning").lower()
     tag = f"switchboard-event-{ev.get('id')}"
     url = f"/#/events/{ev.get('id')}" if ev.get("id") else "/#/events"
+    title = ev.get("title") or ev.get("kind_name") or "Event"
+
     if event == "event.raised":
-        reopens = int(ev.get("reopen_count") or 0)
-        again = f"back after {reopens} return{'s' if reopens > 1 else ''}: " if reopens else ""
-        return {"title": f"{sev.upper()}: {ev.get('title') or ev.get('kind_name') or 'Event'}",
-                "body": again + (ev.get("detail") or "")[:200], "severity": sev, "tag": tag, "url": url,
+        # The raw log line stays in the app. Out here it is the severity,
+        # where the news came from, and - only when Switchboard wrote it -
+        # the reading behind it.
+        detail = (ev.get("detail") or "").strip() if ev.get("source") not in _DEVICE_SAID else ""
+        return {"title": title,
+                "body": _sentences(_SEVERITY_WORD.get(sev, sev.title()) + ".",
+                                   _how_we_know(ev.get("source")),
+                                   _as_sentence(detail) if len(detail) <= 120 else "",
+                                   _return_note(ev.get("reopen_count"))),
+                "severity": sev, "tag": tag, "url": url,
                 "event_id": ev.get("id"), "actions": [{"action": "open", "title": "Open"}]}
+
     if event == "event.resolved":
-        by = ev.get("resolved_by") or "switchboard"
-        return {"title": f"Resolved: {ev.get('title') or ev.get('kind_name') or 'Event'}",
-                "body": f"Resolved by {by}" + (f": {ev.get('resolve_detail')}" if ev.get("resolve_detail") else ""),
+        return {"title": f"Cleared: {title}",
+                "body": _sentences(_lasted(ev.get("raised_at"), ev.get("resolved_at")),
+                                   _how_it_cleared(ev.get("resolved_by"))),
                 "severity": "ok", "quiet": True, "tag": tag, "url": url, "event_id": ev.get("id"),
                 "actions": [{"action": "open", "title": "Open"}]}
     return None

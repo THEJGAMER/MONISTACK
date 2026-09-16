@@ -109,7 +109,12 @@ export default function App() {
   useEffect(() => {
     return listenForPages((payload) => {
       if (payload.quiet) return;
-      pushFlash(payload.severity === "critical" ? "error" : "warning", `${payload.title || "event"}`);
+      // The same words the phone gets, so an open tab and a lock screen
+      // never describe the same event differently.
+      pushFlash(
+        payload.severity === "critical" ? "error" : payload.severity === "info" ? "info" : "warning",
+        [payload.title, payload.body].filter(Boolean).join(" — ")
+      );
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

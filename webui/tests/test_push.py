@@ -42,16 +42,19 @@ def _env(event, **ev):
 
 
 def test_a_raised_event_is_a_notification():
+    """The wording itself lives in test_notification_text.py; this is
+    about the routing - which event becomes a notification, and where it
+    points."""
     p = push.payload_for("event.raised", _env("event.raised"))
-    assert p["title"] == "CRITICAL: Link down: Te 1/47 on S4048"
     assert p["url"] == "/#/events/7" and p["tag"] == "switchboard-event-7"
+    assert p["severity"] == "critical"
     assert [a["action"] for a in p["actions"]] == ["open"], "no acknowledge: actioning is the ticketing system's"
 
 
 def test_a_resolved_event_replaces_it_quietly():
     p = push.payload_for("event.resolved", _env("event.resolved", resolved_by="ssh", resolve_detail="port up"))
-    assert p["title"].startswith("Resolved: Link down") and p["severity"] == "ok" and p["quiet"] is True
-    assert p["tag"] == "switchboard-event-7" and p["body"] == "Resolved by ssh: port up"
+    assert p["severity"] == "ok" and p["quiet"] is True
+    assert p["tag"] == "switchboard-event-7", "same tag, so it replaces the raise rather than stacking"
 
 
 def test_other_bus_events_are_not_notifications():

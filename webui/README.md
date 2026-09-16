@@ -283,6 +283,33 @@ account (and, for every user, on Settings) and can be removed.
 There is no acknowledge and no repeat-until-acked: actioning an event is
 the ticketing system's job, and it gets the same events over webhooks.
 
+**What it says.** A notification used to put the raw log line in the
+body - `mib2d[1344]: SNMP_TRAP_LINK_DOWN: ifIndex 603, ifAdminStatus
+up(1), ifOperStatus down(2), ifName xe-0/1/3` - behind a title shouting
+`CRITICAL:`. You cannot read that on a lock screen, and by the time you
+have, you have opened the app, where the raw line is and belongs. Now:
+
+```
+Link down: Te 1/44 on S4048
+Critical. The device reported it.
+
+Cleared: Link down: Te 1/44 on S4048
+Lasted 4 seconds. The device reported it back to normal.
+```
+
+The severity is a word, not a shout. How we know is said in English -
+"The device reported it", "Found by the SSH poll", "Noticed by
+Switchboard" - and so is how it ended: "The SSH poll saw it recover", "It
+stopped being reported", "Resolved by jacob@example.com". Every resolve
+says how long it lasted, in whatever unit suits it. A fault that keeps
+coming back says which time this is ("Back for the 3rd time"). The device
+is not repeated in the body, because the title already names it.
+
+The one detail still shown is the one Switchboard wrote itself - "At 95%
+for 3 consecutive polls, against a threshold of 90%" - told apart from a
+device's raw line by the event's source. An open tab shows exactly the
+same words as the phone.
+
 It needs HTTPS (push is a secure-context API) and, on iOS, a home-screen
 install. The VAPID key pair is generated once into `data/push_vapid.json`
 (0600); losing it invalidates every subscription, so back it up with the
