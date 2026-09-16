@@ -130,11 +130,8 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
   const [statusWithInterfaces, setStatusWithInterfaces] = useState(null);
   const [profileId, setProfileId] = useState("generic-48");
   const [statusRefreshing, setStatusRefreshing] = useState(false);
-  const [alarmHistory, setAlarmHistory] = useState([]);
-  const [alarmHistoryLoading, setAlarmHistoryLoading] = useState(false);
-  // How far back the Alarm History tab looks. 7 days was the silent
-  // default; now it is a visible choice, since each step up is a wider
-  // Loki query and the tab re-fetches it on its own timer.
+  const [deviceEvents, setDeviceEvents] = useState([]);
+  const [deviceEventsLoading, setDeviceEventsLoading] = useState(false);
   const [boardItems, setBoardItems] = useState(loadBoardLayout);
   const [history, setHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -277,14 +274,14 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
     refreshSyslog(selected.id, syslogCategory, nextLimit);
   }
 
-  async function refreshAlarmHistory(deviceId) {
-    setAlarmHistoryLoading(true);
+  async function refreshDeviceEvents(deviceId) {
+    setDeviceEventsLoading(true);
     try {
-      setAlarmHistory(await getDeviceEvents(deviceId, 100));
+      setDeviceEvents(await getDeviceEvents(deviceId, 100));
     } catch (e) {
       pushFlash("error", `Could not load events: ${e.message}`);
     } finally {
-      setAlarmHistoryLoading(false);
+      setDeviceEventsLoading(false);
     }
   }
 
@@ -298,7 +295,7 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
       setStatusWithInterfaces(null);
       setRecentResults([]);
       setSyslogEvents([]);
-      setAlarmHistory([]);
+      setDeviceEvents([]);
       return;
     }
     setSyslogLimit(200);
@@ -315,17 +312,15 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, syslogCategory]);
 
-  // Alarm history on its own, much slower, timer. It used to ride the
-  // 20-second tick above, which meant a 7-day Loki query every 20s for as
-  // long as a Console tab was open - on Loki's side that one tab was 337
-  // sub-queries per tick into a queue of 100, and the measured result was
-  // 112 errors/min (2026-09-15). Hardware alarms are paged live by the
-  // syslog poller anyway, so this table being five minutes behind costs
-  // nothing; the Refresh button is there for "now".
+  // This device's events, on their own 30s timer. It reads Postgres, not
+  // Loki: the panel it replaced ran a 7-day Loki query every 20s for as
+  // long as a Console tab was open - 337 sub-queries per tick into a
+  // queue of 100, a measured 112 errors/min (2026-09-15). The Events page
+  // is the full view; this is the device's own slice.
   useEffect(() => {
     if (!selected) return undefined;
-    refreshAlarmHistory(selected.id);
-    const t = setInterval(() => refreshAlarmHistory(selected.id), 30 * 1000);
+    refreshDeviceEvents(selected.id);
+    const t = setInterval(() => refreshDeviceEvents(selected.id), 30 * 1000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected]);
@@ -344,7 +339,7 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
     return syslogEvents.filter((e) => (e.detail || e.message || "").toLowerCase().includes(q));
   }, [syslogEvents, syslogFilterText]);
   const { pageItems: syslogPage, paginationProps: syslogPagination } = useClientPagination(filteredSyslog, 8);
-  const { pageItems: alarmHistoryPage, paginationProps: alarmHistoryPagination } = useClientPagination(alarmHistory, 8);
+  const { pageItems: deviceEventsPage, paginationProps: deviceEventsPagination } = useClientPagination(deviceEvents, 8);
 
   // The shared run path. Split out of handleRun so the Favourites and
   // History lists can re-run something by id without duplicating the
@@ -967,7 +962,7 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
                 ) : (
                   <SpaceBetween size="m">
                     <SpaceBetween size="xs" direction="horizontal" alignItems="center">
-                      <Button iconName="refresh" loading={alarmHistoryLoading} onClick={() => refreshAlarmHistory(selected.id)}>
+                      <Button iconName="refresh" loading={deviceEventsLoading} onClick={() => refreshDeviceEvents(selected.id)}>
                         Refresh
                       </Button>
                       <Box color="text-status-inactive" fontSize="body-s">
@@ -976,9 +971,9 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
                     </SpaceBetween>
                     <Table
                       variant="embedded"
-                      loading={alarmHistoryLoading}
-                      items={alarmHistoryPage}
-                      pagination={<Pagination {...alarmHistoryPagination} />}
+                      loading={deviceEventsLoading}
+                      items={deviceEventsPage}
+                      pagination={<Pagination {...deviceEventsPagination} />}
                       wrapLines
                       columnDefinitions={[
                         { id: "time", header: "Raised", cell: (e) => formatTime(e.raised_at) },
@@ -1181,13 +1176,17 @@ export default function ConsolePage({ devices, commandTree, pushFlash, preselect
                 i18nStrings={boardI18nStrings}
                 empty={<Box textAlign="center">No panels.</Box>}
                 renderItem={(item) => {
+                  // A board id with no panel behind it must cost one panel,
+                  // not the page. Confirmed live: renaming the Alarm History
+                  // panel to Events left boardConfig.js pointing at the old
+                  // id, and reading `.label` of undefined here blanked the
+                  // whole app - the Console is the landing page, so every
+                  // route went white.
                   const panel = panels.find((p) => p.id === item.id);
+                  const label = panel ? panel.label : item.data?.title || item.id;
                   return (
-                    <BoardItem
-                      header={<Header variant="h2">{panel.label}</Header>}
-                      i18nStrings={boardItemI18nStrings(panel.label)}
-                    >
-                      {panel.content}
+                    <BoardItem header={<Header variant="h2">{label}</Header>} i18nStrings={boardItemI18nStrings(label)}>
+                      {panel ? panel.content : <Box color="text-status-inactive">This panel is no longer available. Reset the layout to remove it.</Box>}
                     </BoardItem>
                   );
                 }}

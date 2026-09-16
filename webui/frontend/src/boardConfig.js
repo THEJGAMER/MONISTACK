@@ -11,7 +11,7 @@ export const BOARD_ITEM_IDS = [
   "output",
   "recent",
   "syslog",
-  "alarmHistory",
+  "events",
   "frontpanel",
   "switchStatus",
 ];
@@ -23,7 +23,7 @@ export const BOARD_ITEM_TITLES = {
   output: "Output",
   recent: "Recent results",
   syslog: "Syslog",
-  alarmHistory: "Alarm History",
+  events: "Events",
   frontpanel: "Front Panel",
   switchStatus: "Switch Status",
 };
@@ -41,7 +41,7 @@ export const DEFAULT_BOARD_ITEMS = [
   { id: "output", columnSpan: 3, rowSpan: 4, columnOffset: { 4: 1 } },
   { id: "recent", columnSpan: 3, rowSpan: 4, columnOffset: { 4: 1 } },
   { id: "syslog", columnSpan: 3, rowSpan: 4, columnOffset: { 4: 1 } },
-  { id: "alarmHistory", columnSpan: 3, rowSpan: 4, columnOffset: { 4: 1 } },
+  { id: "events", columnSpan: 3, rowSpan: 4, columnOffset: { 4: 1 } },
   { id: "frontpanel", columnSpan: 3, rowSpan: 4, columnOffset: { 4: 1 } },
   { id: "switchStatus", columnSpan: 3, rowSpan: 5, columnOffset: { 4: 1 } },
 ].map((item) => ({
