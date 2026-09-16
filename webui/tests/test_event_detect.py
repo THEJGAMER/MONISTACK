@@ -215,6 +215,21 @@ def test_a_command_someone_typed_is_never_a_fault():
     assert store.log == []
 
 
+def test_a_firewalls_packet_log_is_never_a_fault():
+    """OPNsense logs one line per matched packet - two thirds of what it
+    sends - as bare CSV full of addresses and the word "block". It is
+    data about other people's traffic, not about the device."""
+    store, d = _detector()
+    packets = [
+        _line("94,,,ad6b,vtnet1,match,block,in,4,0x0,,62,13171,0,DF,6,tcp,60,192.168.3.104,3.0.149.98,53124,443,0,S",
+              1, appname="filterlog", facility="local0", device_host="OPNsense"),
+        _line("13,,,02f4,vtnet0,match,pass,out,4,0x0,,125,15376,0,DF,17,udp,1278,1.1.1.1,8.8.8.8,53991,443,1258",
+              2, appname="filterlog", facility="local0", device_host="OPNsense"),
+    ]
+    assert d.process(packets, _dev) == 0
+    assert store.log == []
+
+
 def test_an_lldp_neighbour_going_away_is_not_a_routing_adjacency():
     """It goes away because the link went down, which is already the link
     event - counting it too made one unplug two critical events."""

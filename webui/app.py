@@ -801,22 +801,26 @@ def _check_syslog_silence():
     minutes = int(EVENT_SETTINGS.params_for("device.syslog_silent").get("minutes", 30))
     threshold = minutes * 60
     now = datetime.now(timezone.utc)
-    if (now - _STARTED_AT).total_seconds() < threshold:
-        return
+    # Just after a restart we cannot tell a quiet device from one we have
+    # simply not heard from yet, so nothing is *raised* during the first
+    # window. Resolving is not gated by it: confirmed live, OPNsense
+    # started sending and its open event sat there regardless, because an
+    # early return skipped the resolve along with the raise.
+    warming = (now - _STARTED_AT).total_seconds() < threshold
+    subject = "syslog"
     for d in list(DEVICES):
         last = FAST_PATH.last_by_host.get(d.host) or FAST_PATH.last_by_host.get(d.name)
-        subject = "syslog"
-        if last is None or (now - last).total_seconds() > threshold:
-            sev = EVENT_SETTINGS.severity_for("device.syslog_silent")
-            if sev == "ignore":
-                continue
-            EVENTS.raise_event("device.syslog_silent", sev, d.id, d.name, subject,
-                               f"No syslog from {d.name} for {minutes} min",
-                               detail=("never since start" if last is None else f"last line {last.isoformat()}"), source="switchboard")
-        else:
+        if last is not None and (now - last).total_seconds() <= threshold:
             open_ev = EVENTS.open_kind("device.syslog_silent", d.id, subject)
             if open_ev:
                 EVENTS.resolve(open_ev["signature"], by="syslog", detail="a line arrived")
+            continue
+        sev = EVENT_SETTINGS.severity_for("device.syslog_silent")
+        if warming or sev == "ignore":
+            continue
+        EVENTS.raise_event("device.syslog_silent", sev, d.id, d.name, subject,
+                           f"No syslog from {d.name} for {minutes} min",
+                           detail=("never since start" if last is None else f"last line {last.isoformat()}"), source="switchboard")
 
 
 threading.Thread(target=_event_timers_loop, daemon=True, name="event-timers").start()

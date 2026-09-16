@@ -87,6 +87,12 @@ _IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 # signals (link_event, the alarm_* fields) are never set on these, so
 # nothing real is lost by skipping the text detectors entirely.
 _CLI_ECHO = re.compile(r"(?i)UI_CMDLINE|UI_CHILD_START|UI_DBASE|UI_COMMIT_PROGRESS|command '")
+# A firewall's packet log is data about other people's traffic, not about
+# the device. OPNsense sends one line per matched packet - two thirds of
+# everything it logs here - as bare CSV containing arbitrary addresses and
+# words like "block". Running the fault patterns over it is pure risk for
+# no possible signal, so it stops before them.
+_PACKET_LOG = re.compile(r"(?i)^filterlog$|^pflog")
 # LLDP is not a routing protocol. An LLDP neighbour disappears because a
 # link went down, which is already reported as the link event - counting
 # it as a lost adjacency turned one unplug into two critical events.
@@ -219,8 +225,9 @@ class SyslogDetector:
                 return self._resolve("env.temperature", device_id, device, "temperature", e, source)
 
         # Everything below matches on free text, so a line that merely
-        # quotes what someone typed stops here.
-        if _CLI_ECHO.search(msg):
+        # quotes what someone typed, or reports someone else's packet,
+        # stops here.
+        if _CLI_ECHO.search(msg) or _PACKET_LOG.search(str(e.get("appname") or "")):
             return acted
 
         # compute

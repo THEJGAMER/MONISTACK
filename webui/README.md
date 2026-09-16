@@ -462,13 +462,21 @@ and that line *is* the signal.
    user's own syslog rules. Measured
    live: a line is an event about 70 ms after it reaches the receiver.
 
-   Two things the detectors deliberately ignore, both found by unplugging
-   a real port. Junos echoes every CLI line to syslog (`UI_CMDLINE_READ_LINE:
-   User 'root', command 'show lldp neighbors '`), so the free-text patterns
-   never run on a line that quotes what a person typed - otherwise `show
-   interfaces | match down` raises faults. And LLDP neighbour changes are
-   not routing adjacency changes: an LLDP neighbour disappears because a
-   link went down, which is already the link event.
+   Three things the detectors deliberately ignore. Junos echoes every CLI
+   line to syslog (`UI_CMDLINE_READ_LINE: User 'root', command 'show lldp
+   neighbors '`), so the free-text patterns never run on a line that
+   quotes what a person typed - otherwise `show interfaces | match down`
+   raises faults. LLDP neighbour changes are not routing adjacency
+   changes: an LLDP neighbour disappears because a link went down, which
+   is already the link event. And a firewall's packet log is data about
+   other people's traffic - OPNsense sends one CSV line per matched
+   packet, two thirds of everything it logs, full of arbitrary addresses
+   and the word "block" - so those stop before the fault patterns too.
+
+   A general-purpose OS logs far more than a switch does. Six hours of
+   real OPNsense output (unbound, devd, kea-dhcp, cron) was checked
+   against every pattern before this shipped: nothing matched, which is
+   the result to want.
 
    **LAG members are the case worth knowing about.** Confirmed live on the
    S4048: unplugging Te 1/41, a member of port-channel 3, logged only
