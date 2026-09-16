@@ -79,6 +79,23 @@ _STP = re.compile(r"(?i)topology\s*change")
 _NEIGH_FIRE = re.compile(r"(?i)\b(bgp|ospf|neighbou?r|adjacency)\b.*\b(down|lost|deleted|expired|dead)\b")
 _NEIGH_CLEAR = re.compile(r"(?i)\b(bgp|ospf|neighbou?r|adjacency)\b.*\b(up|established|full)\b")
 _IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+# Lines that carry text a *person* typed, not something the device
+# observed. Confirmed live: Junos logs every CLI line as
+# `mgd[49252]: UI_CMDLINE_READ_LINE: User 'root', command 'show lldp
+# neighbors '`, so running the free-text fault patterns over it means
+# typing `show interfaces | match down` raises a fault. Structured
+# signals (link_event, the alarm_* fields) are never set on these, so
+# nothing real is lost by skipping the text detectors entirely.
+_CLI_ECHO = re.compile(r"(?i)UI_CMDLINE|UI_CHILD_START|UI_DBASE|UI_COMMIT_PROGRESS|command '")
+# LLDP is not a routing protocol. An LLDP neighbour disappears because a
+# link went down, which is already reported as the link event - counting
+# it as a lost adjacency turned one unplug into two critical events.
+_LLDP = re.compile(r"(?i)\bLLDP")
+# Dell OS9's LACP membership lines. The mnemonics are exact; the
+# port-channel number is pulled from the text for the event's detail.
+_LAG_OUT = re.compile(r"(?i)PORT[-_]UNGROUPED|exited\s+port-channel")
+_LAG_IN = re.compile(r"(?i)PORT[-_]GROUPED|joined\s+port-channel")
+_LAG_NUM = re.compile(r"(?i)port-channel\s+(\d+)")
 _JUNOS_UNIT = re.compile(r"\.\d+$")
 
 
@@ -138,6 +155,19 @@ class SyslogDetector:
         category = e.get("event_category") or "other"
         acted = 0
 
+        # LAG membership. Deliberately checked before link state and
+        # returned on: a member leaving its bundle is its own fact, and on
+        # this hardware it is frequently the *only* thing logged - the
+        # SSH poll is what then reports the link itself, seconds later.
+        if e.get("interface") and (_LAG_OUT.search(msg) or _LAG_IN.search(msg)):
+            port = str(e["interface"])
+            chan = _LAG_NUM.search(msg)
+            subject = f"{port} in port-channel {chan.group(1)}" if chan else port
+            if _LAG_IN.search(msg):
+                return self._resolve("port.lag_member_lost", device_id, device, subject, e, source)
+            return self._raise("port.lag_member_lost", device_id, device, subject,
+                               f"LAG member left: {subject} on {device}", e, source)
+
         # links: what the device says about its ports
         if e.get("link_event") and e.get("interface") and e.get("link_state") in ("up", "down"):
             port = str(e["interface"])
@@ -166,6 +196,11 @@ class SyslogDetector:
             if _TEMP_CLEAR.search(detail):
                 return self._resolve("env.temperature", device_id, device, "temperature", e, source)
 
+        # Everything below matches on free text, so a line that merely
+        # quotes what someone typed stops here.
+        if _CLI_ECHO.search(msg):
+            return acted
+
         # compute
         if _MEM_ERR.search(detail):
             return self._raise("compute.memory_error", device_id, device, "memory", f"Memory error on {device}: {detail[:80]}", e, source)
@@ -183,13 +218,16 @@ class SyslogDetector:
         # protocol
         if _STP.search(detail) and (category == "spanning-tree" or (e.get("facility") or "").upper() == "STP"):
             acted += self._raise("protocol.stp_topology_change", device_id, device, "stp", f"STP topology change on {device}", e, source)
-        if category in ("routing", "other") and _NEIGH_FIRE.search(detail):
+        routing = category in ("routing", "other") and not _LLDP.search(msg) and not _LLDP.search(str(e.get("facility") or ""))
+        if routing and _NEIGH_FIRE.search(detail):
             ip = _IPV4.search(detail)
-            subject = ip.group(0) if ip else "neighbour"
+            # A bare "neighbour" subject would collapse two different
+            # neighbours into one event, so fall back to the interface.
+            subject = ip.group(0) if ip else (e.get("interface") or "neighbour")
             acted += self._raise("protocol.neighbor_lost", device_id, device, subject, f"Routing neighbour lost on {device}: {subject}", e, source)
-        elif category in ("routing", "other") and _NEIGH_CLEAR.search(detail):
+        elif routing and _NEIGH_CLEAR.search(detail):
             ip = _IPV4.search(detail)
-            acted += self._resolve("protocol.neighbor_lost", device_id, device, ip.group(0) if ip else "neighbour", e, source)
+            acted += self._resolve("protocol.neighbor_lost", device_id, device, ip.group(0) if ip else (e.get("interface") or "neighbour"), e, source)
 
         # self-test
         if (e.get("mnemonic") or "").upper() == "SWITCHBOARD_SELFTEST":

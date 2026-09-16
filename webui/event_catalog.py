@@ -38,6 +38,10 @@ CATALOG = [
     {"kind": "port.link_down", "group": "port", "name": "Link down", "default": "warning",
      "description": "A physical interface lost link. Severity per port on the Ports tab; a port set to ignore never raises.",
      "sources": ["syslog", "ssh"], "resolves": "when the link comes back (syslog up, or the SSH poll sees it up)", "ttl_seconds": None},
+    {"kind": "port.lag_member_lost", "group": "port", "name": "LAG member left", "default": "warning",
+     "description": "An interface dropped out of its port-channel. On a LAG member this is often the only thing the switch logs - "
+                    "confirmed live on the S4048: unplugging Te 1/41 produced LACP PORT-UNGROUPED and no link-state line at all.",
+     "sources": ["syslog"], "resolves": "when it rejoins the port-channel", "ttl_seconds": None},
     {"kind": "port.flapping", "group": "port", "name": "Link flapping", "default": "warning",
      "description": "An interface went down at least 3 times within 5 minutes.",
      "sources": ["syslog"], "resolves": "after 10 minutes without another flap", "ttl_seconds": 600},

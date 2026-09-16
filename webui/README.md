@@ -377,10 +377,26 @@ and that line *is* the signal.
    (`syslog/vector.yaml`) POSTs every interpreted line to
    `/api/ingest/syslog` as it arrives (50 ms batch timeout, bearer token
    `SYSLOG_INGEST_TOKEN`) and `event_detect.SyslogDetector` evaluates it on
-   arrival: link down/up on **any** port, fan/PSU faults, temperature,
-   memory errors, restarts, config changes, STP topology changes, routing
-   neighbours, and the user's own syslog rules. Measured live: a line is
-   an event about 70 ms after it reaches the receiver.
+   arrival: link down/up on **any** port, LAG membership, fan/PSU faults,
+   temperature, memory errors, restarts, config changes, STP topology
+   changes, routing neighbours, and the user's own syslog rules. Measured
+   live: a line is an event about 70 ms after it reaches the receiver.
+
+   Two things the detectors deliberately ignore, both found by unplugging
+   a real port. Junos echoes every CLI line to syslog (`UI_CMDLINE_READ_LINE:
+   User 'root', command 'show lldp neighbors '`), so the free-text patterns
+   never run on a line that quotes what a person typed - otherwise `show
+   interfaces | match down` raises faults. And LLDP neighbour changes are
+   not routing adjacency changes: an LLDP neighbour disappears because a
+   link went down, which is already the link event.
+
+   **LAG members are the case worth knowing about.** Confirmed live on the
+   S4048: unplugging Te 1/41, a member of port-channel 3, logged only
+   `%LACP-5-PORT-UNGROUPED` - no `OSTATE_DN`, no link-state line at all
+   (the same port logs `OSTATE_UP` when it comes back, so the switch is
+   asymmetric here). That line raises `port.lag_member_lost` on its own,
+   and `PORT-GROUPED` resolves it; the link itself is then the SSH poll's
+   to report, seconds later. One line, one event.
 2. **The Loki poll**, engaged only while the fast path has been silent for
    30 s. Same detector, same timestamp cursor, so the two paths are one
    stream.

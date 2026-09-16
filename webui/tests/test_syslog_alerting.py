@@ -120,10 +120,29 @@ def test_defaults_are_seeded_once_and_all_off(store):
 
 
 def test_a_deleted_default_stays_deleted(store):
+    """Seeding is first-run only: a table that has ever had rows is the
+    site's, not ours."""
     store.seed_defaults()
-    stp = next(r for r in store.list() if r["key"] == "stp-topology-change")
-    assert store.delete(stp["id"]) is True
-    assert store.seed_defaults() == 0 and all(r["key"] != "stp-topology-change" for r in store.list())
+    store.create({"name": "a rule of my own", "pattern": "x"})
+    shipped = next(r for r in store.list() if r["key"])
+    assert store.delete(shipped["id"]) is True
+
+    assert store.seed_defaults() == 0
+    assert [r["name"] for r in store.list()] == ["a rule of my own"]
+
+
+def test_rules_that_duplicate_a_catalogue_kind_are_removed_not_reseeded(store):
+    """Three shipped defaults duplicated catalogue kinds, so enabling one
+    gave two events for the same line (seen live on the EX3300). Seeding
+    now clears them wherever they already exist."""
+    import event_catalog
+    for key in ("stp-topology-change", "routing-neighbour-lost", "config-committed", "selftest"):
+        store.create({"name": key, "pattern": "x"}, key=key)
+    store.seed_defaults()
+
+    assert [r["key"] for r in store.list()] == ["duplicate-ip"]
+    names = {c["name"] for c in event_catalog.CATALOG}
+    assert {"Spanning-tree topology change", "Routing neighbour lost", "Configuration changed"} <= names
 
 
 def test_rules_are_validated(store):

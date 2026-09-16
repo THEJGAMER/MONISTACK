@@ -103,6 +103,37 @@ def test_the_same_line_from_two_paths_is_one_transition():
     assert d.cursor_ns == 5
 
 
+# --- LAG membership: the real S4048 lines from the 19:51 unplug ----------
+
+UNGROUP = "CP %LACP-5-PORT-UNGROUPED: PortChannel-003-Ungrouped: Interface Te 1/41 exited port-channel 3."
+GROUP = "CP %LACP-5-PORT-GROUPED: PortChannel-003-Grouped: Interface Te 1/41 joined port-channel 3."
+
+
+def test_a_lag_member_leaving_is_an_event_and_rejoining_resolves_it():
+    """Confirmed live: unplugging Te 1/41 (a port-channel 3 member) made
+    the S4048 log *only* this - no OSTATE_DN, no link-state line at all -
+    so without this the syslog path saw nothing and the port's outage
+    waited on the SSH poll."""
+    store, d = _detector()
+    dell = dict(device_host="S4048", event_category="interface", facility="LACP", mnemonic="PORT-UNGROUPED", interface="Te 1/41")
+    assert d.process([_line(UNGROUP, 1, **dell)], _dev) == 1
+    assert store.log[-1] == ("raise", "port.lag_member_lost", "Te 1/41 in port-channel 3", "warning")
+
+    dell["mnemonic"] = "PORT-GROUPED"
+    assert d.process([_line(GROUP, 2, **dell)], _dev) == 1
+    assert store.log[-1] == ("resolve", "port.lag_member_lost", "Te 1/41 in port-channel 3", "syslog")
+
+
+def test_a_lag_line_is_not_also_a_link_down():
+    """One unplug, one syslog event. The link itself is the SSH poll's to
+    report - two events from one line would be the duplication this whole
+    design is meant to avoid."""
+    store, d = _detector()
+    d.process([_line(UNGROUP, 1, device_host="S4048", event_category="interface", facility="LACP",
+                     mnemonic="PORT-UNGROUPED", interface="Te 1/41")], _dev)
+    assert [k for _, k, _, _ in store.log] == ["port.lag_member_lost"]
+
+
 def test_three_downs_in_five_minutes_is_flapping():
     store, d = _detector()
     for i in range(3):
@@ -147,6 +178,37 @@ def test_compute_device_and_protocol_patterns():
     assert ("device.config_changed", "config") in kinds and ("protocol.stp_topology_change", "stp") in kinds
     assert store.log[-2] == ("raise", "protocol.neighbor_lost", "10.0.0.1", "critical")
     assert store.log[-1] == ("resolve", "protocol.neighbor_lost", "10.0.0.1", "syslog")
+
+
+def test_a_command_someone_typed_is_never_a_fault():
+    """Junos echoes every CLI line to syslog. Confirmed live: `show lldp
+    neighbors` came through as a line the neighbour patterns matched, so
+    typing a command with the wrong word in it raised critical events."""
+    store, d = _detector()
+    typed = [
+        _line("mgd[49252]: UI_CMDLINE_READ_LINE: User 'root', command 'show lldp neighbors '", 1, facility="MGD", mnemonic="UI_CMDLINE_READ_LINE"),
+        _line("mgd[49252]: UI_CMDLINE_READ_LINE: User 'root', command 'show interfaces | match down '", 2, facility="MGD", mnemonic="UI_CMDLINE_READ_LINE"),
+        _line("mgd[49252]: UI_CMDLINE_READ_LINE: User 'root', command 'show system memory ecc error '", 3, facility="MGD", mnemonic="UI_CMDLINE_READ_LINE"),
+    ]
+    assert d.process(typed, _dev) == 0
+    assert store.log == []
+
+
+def test_an_lldp_neighbour_going_away_is_not_a_routing_adjacency():
+    """It goes away because the link went down, which is already the link
+    event - counting it too made one unplug two critical events."""
+    store, d = _detector()
+    d.process([_line("lldpd[1370]: LLDP_NEIGHBOR_DOWN: A neighbor is down on interface xe-0/1/3", 1,
+                     facility="LLDPD", mnemonic="LLDP_NEIGHBOR_DOWN", event_category="other")], _dev)
+    assert store.log == []
+
+
+def test_two_routing_neighbours_on_different_ports_are_two_events():
+    store, d = _detector()
+    base = dict(device_host="S4048", event_category="routing")
+    d.process([_line("%OSPF-5-ADJCHG: adjacency down on interface", 1, interface="Te 1/1", **base),
+               _line("%OSPF-5-ADJCHG: adjacency down on interface", 2, interface="Te 1/2", **base)], _dev)
+    assert [s for _, _, s, _ in store.log] == ["Te 1/1", "Te 1/2"]
 
 
 def test_user_rules_raise_with_their_own_severity_and_clear():

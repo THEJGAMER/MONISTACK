@@ -30,15 +30,8 @@ MAX_AUTO_RESOLVE = 86400
 # pattern before it does. (The catalogue in event_catalog.py already
 # covers the common kinds; rules are for a site's own lines.)
 DEFAULT_RULES = [
-    {"key": "stp-topology-change", "name": "Spanning-tree topology change", "enabled": False, "severity": "warning",
-     "facility": "STP", "pattern": r"(?i)topology\s*change", "auto_resolve_seconds": 300},
-    {"key": "routing-neighbour-lost", "name": "Routing neighbour lost", "enabled": False, "severity": "critical",
-     "pattern": r"(?i)\b(bgp|ospf|neighbou?r|adjacency)\b.*\b(down|lost|deleted|expired|dead)\b",
-     "clear_pattern": r"(?i)\b(bgp|ospf|neighbou?r|adjacency)\b.*\b(up|established|full)\b"},
     {"key": "duplicate-ip", "name": "Duplicate IP address", "enabled": False, "severity": "warning",
      "pattern": r"(?i)duplicate\s+(ip|address)", "auto_resolve_seconds": 900},
-    {"key": "config-committed", "name": "Configuration changed", "enabled": False, "severity": "info",
-     "pattern": r"(?i)(UI_COMMIT_COMPLETED|CONFIG_I|configured from|copy running-config)", "auto_resolve_seconds": 60},
 ]
 
 
@@ -138,10 +131,15 @@ class SyslogRuleStore:
         """First run only (an empty table): the site starts with something
         to look at. Deleting a default later is respected - nothing is
         re-seeded into a table that has ever had rows."""
-        # The self-test used to be a seeded rule; it is a catalogue kind now
-        # (switchboard.selftest). A site that still carries the old row would
-        # raise the test twice, so it goes - the only default ever removed.
-        self.db.execute("DELETE FROM syslog_alert_rules WHERE key = 'selftest'")
+        # Rules that must not exist: the self-test is a catalogue kind now
+        # (switchboard.selftest), and three shipped defaults duplicated catalogue kinds outright
+        # (protocol.stp_topology_change, protocol.neighbor_lost,
+        # device.config_changed), so enabling one produced two events for
+        # the same line - seen live on the EX3300. The catalogue covers
+        # them; these do not come back. Same for the self-test, which is a
+        # catalogue kind now rather than a rule.
+        self.db.execute("DELETE FROM syslog_alert_rules WHERE key IN "
+                        "('selftest', 'stp-topology-change', 'routing-neighbour-lost', 'config-committed')")
         if self.db.query_one("SELECT 1 FROM syslog_alert_rules LIMIT 1"):
             return 0
         n = 0
