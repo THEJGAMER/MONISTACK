@@ -362,6 +362,40 @@ in Saved Results / Recent results shows "Auto" vs "Manual" (the manual
 `POST /api/results` endpoint still exists, e.g. for scripted use, and rows
 it creates are flagged "Manual").
 
+## The topology Map
+
+The diagram this replaced drew every discovered host as a row of text
+inside an SVG card. On this fleet that meant one column of forty MAC
+addresses running off the bottom of the page, device labels clipped by
+the circles they sat in, and nothing clickable. Eighty-four of its
+eighty-seven edges were hosts learned from a MAC table: an access list,
+drawn as a diagram.
+
+So the two halves are separated by what they actually are.
+
+- **The fabric** is the only part that is genuinely a graph, and it is
+  small - two devices and two links here - so it gets the drawing, at a
+  size you can read. One lane per trunk, stacked, with the label sitting
+  in a gap in its own line. A trunk is grouped per device pair **and per
+  bundle**: grouping by pair alone labelled this fleet's management link
+  as part of the LAG beside it.
+- **Everything hanging off a port is a list**, so it is Cloudscape: port
+  chips that wrap and carry their host count, a filter that dims what
+  does not match, and a details panel that fills in when you select a
+  device, a link or a port - LAG members with their own state and
+  throughput, or the hosts on a port with how each was discovered.
+
+Nothing is drawn that you cannot click, and nothing is drawn that a table
+would say better - the Links & hosts tab remains for that.
+
+**On colour**: only the status colours are taken from the design tokens
+as values, because they read on a light or a dark page alike. Surfaces,
+borders and text are drawn in `currentColor` and inherit from the
+Cloudscape container around them. The tokens for those resolve to a
+`var()` whose custom property this build never emits, so they fall back
+to their light value - which is why the old map, and this one until it
+was looked at in dark mode, drew white cards on a dark page.
+
 ## Insights: what is worth knowing, as opposed to what broke
 
 Events answer "what is wrong right now". The **Insights** page answers the

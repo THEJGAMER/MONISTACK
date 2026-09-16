@@ -16,46 +16,13 @@ import Pagination from "@cloudscape-design/components/pagination";
 import Tabs from "@cloudscape-design/components/tabs";
 import {
   colorChartsStatusPositive, colorChartsStatusHigh, colorChartsStatusNeutral,
-  colorTextBodyDefault, colorTextBodySecondary, colorBorderDividerDefault,
-  colorBackgroundContainerContent, colorBackgroundLayoutMain, colorBorderItemFocused,
-  colorBackgroundStatusInfo, colorBackgroundStatusError, colorBorderStatusError,
   fontFamilyMonospace,
 } from "@cloudscape-design/design-tokens";
 import { getTopology, saveTopologyBaseline, acceptTopologyDrift, clearTopologyBaseline } from "./api.js";
+import TopologyMap from "./TopologyMap.jsx";
 
 const PORT_PAGE_SIZE = 15;
 
-// Classic hierarchical "network diagram" layout (the kind you'd draw in
-// Visio/draw.io for a small LAN): devices in a row at the top connected
-// by straight trunk lines, with each device's own neighbors in a grid
-// underneath it, joined by right-angle ("elbow") connectors instead of
-// spokes radiating from a circle. Grid + orthogonal routing reads as
-// "network topology diagram" at a glance in a way a radial layout doesn't,
-// and it's far more space-efficient for a device with a lot of neighbors -
-// a grid grows in rows, not circumference.
-const MIN_LANE_WIDTH = 260;
-const LANE_GAP = 60;
-const DEVICE_Y = 66;
-const DEVICE_NODE_R = 40;
-const ROW_GAP_AFTER_DEVICE = 56;
-// External neighbors render as one card per *local port*, not one shape
-// per discovered host - a port with several hosts on it (a hub behind an
-// unmanaged switch, a dual-homed NIC with two LLDP chassis IDs on one
-// wire) is one thing to look at, not several loose chips/dots that can
-// overlap or read as unrelated when they're all actually on the same
-// port. Card height is variable (driven by how many hosts are on that
-// port) and packed into a small masonry grid under each device.
-const PORT_CARD_W = 230;
-const PORT_CARD_GAP_X = 18;
-const PORT_CARD_GAP_Y = 14;
-const PORT_CARD_COLS = 2;
-const PORT_HEADER_H = 20;
-// Every host row shows both its IP address and its MAC address (two lines)
-// whenever both are known, not just whichever one is more "recognizable" -
-// the user needs the MAC too (to cross-reference the switch's own
-// mac-address-table output), not just an IP.
-const PORT_ROW_H = 28;
-const PORT_PADDING = 6;
 const AUTO_REFRESH_MS = 30_000;
 
 // Cloudscape design tokens, not hex: these resolve to CSS variables, so
@@ -65,53 +32,6 @@ const AUTO_REFRESH_MS = 30_000;
 const COLOR_UP = colorChartsStatusPositive;
 const COLOR_DOWN = colorChartsStatusHigh;
 const COLOR_UNKNOWN = colorChartsStatusNeutral;
-const COLOR_DEVICE_STROKE = colorBorderItemFocused;
-const COLOR_DEVICE_FILL = colorBackgroundStatusInfo;
-const COLOR_DEVICE_ERROR_STROKE = colorBorderStatusError;
-const COLOR_DEVICE_ERROR_FILL = colorBackgroundStatusError;
-const COLOR_TEXT = colorTextBodyDefault;
-const COLOR_TEXT_SECONDARY = colorTextBodySecondary;
-const COLOR_CARD_FILL = colorBackgroundContainerContent;
-const COLOR_CARD_HEADER = colorBackgroundLayoutMain;
-const COLOR_DIVIDER = colorBorderDividerDefault;
-
-// Right-angle "elbow" connector (drop - step - drop), same convention as
-// an org-chart/tree diagram: down from the parent, across at the
-// midpoint, down into the top of the child.
-function elbowPath(fromX, fromY, toX, toY) {
-  const midY = fromY + (toY - fromY) / 2;
-  return `M ${fromX} ${fromY} L ${fromX} ${midY} L ${toX} ${midY} L ${toX} ${toY}`;
-}
-
-// A port card's connector routes through a shared vertical "gutter"
-// between the card columns (rather than a straight elbow to each card),
-// so the line for a card further down a column never has to pass over -
-// and visually strike through - the text of a card stacked above it in
-// the same column.
-function portConnectorPath(fromX, fromY, toX, toY, corridorX) {
-  const stubY = fromY + 14;
-  return `M ${fromX} ${fromY} L ${fromX} ${stubY} L ${corridorX} ${stubY} L ${corridorX} ${toY} L ${toX} ${toY}`;
-}
-
-// Packs each device's port cards into a small masonry grid (greedy:
-// each new card goes into whichever column is currently shortest) since
-// card height varies with how many hosts are on that port - a fixed grid
-// would either waste space or clip a busy port's card.
-function layoutPortCards(groups, cols, cardW, gapX, gapY, laneCenterX, startY) {
-  const totalW = cols * cardW + (cols - 1) * gapX;
-  const leftX = laneCenterX - totalW / 2;
-  const colHeights = new Array(cols).fill(startY);
-  const positions = {};
-  groups.forEach((g) => {
-    let col = 0;
-    for (let i = 1; i < cols; i++) if (colHeights[i] < colHeights[col]) col = i;
-    const rowCount = Math.max(1, g.lldp.length + g.mac.length);
-    const height = PORT_HEADER_H + rowCount * PORT_ROW_H + PORT_PADDING * 2;
-    positions[g.port] = { x: leftX + col * (cardW + gapX), y: colHeights[col], width: cardW, height };
-    colHeights[col] += height + gapY;
-  });
-  return { positions, bottom: Math.max(...colHeights) };
-}
 
 // Every internal edge names a Mbps rate only for OS9 (Junos has no
 // per-interface rate data - see status_poller.py's _poll_once_junos) -
@@ -181,7 +101,6 @@ function sigKey(sig) {
 export default function TopologyPage({ pushFlash, onOpenConsole, onAddDevice }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [hovered, setHovered] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [showMacTableHosts, setShowMacTableHosts] = useState(true);
   const [confirmAction, setConfirmAction] = useState(null); // "relearn" | "forget" | null
@@ -241,68 +160,12 @@ export default function TopologyPage({ pushFlash, onOpenConsole, onAddDevice }) 
     return () => clearInterval(id);
   }, [autoRefresh, load]);
 
-  const layout = useMemo(() => {
-    if (!data) return null;
-    const { nodes, edges } = data;
-    const nodeById = Object.fromEntries(nodes.map((n) => [n.id, n]));
-
-    // Group every external edge (LLDP-backed or MAC-table-only) by its
-    // local port - the diagram's basic unit is "what's on this port", not
-    // one shape per discovered host (see layoutPortCards above).
-    const portGroupsByDevice = {};
-    for (const e of edges) {
-      if (e.kind !== "external") continue;
-      const perDevice = (portGroupsByDevice[e.device_id] ||= {});
-      const g = (perDevice[e.port] ||= { port: e.port, memberPorts: e.member_ports, lldp: [], mac: [] });
-      if (isLldpBacked(e)) g.lldp.push(e);
-      else g.mac.push(e);
-    }
-
-    // Each device's port-card grid is laid out in its own 0-based space
-    // first (its lane width depends on how many card columns it actually
-    // needs), then lanes are placed left-to-right by their own width - a
-    // device with many neighbors gets a wider lane instead of everyone
-    // being squeezed into one fixed-width slot.
-    const perDeviceLayout = {};
-    nodes.forEach((n) => {
-      const allGroups = Object.values(portGroupsByDevice[n.id] || {}).sort((a, b) => a.port.localeCompare(b.port));
-      const groups = allGroups.filter((g) => g.lldp.length > 0 || (showMacTableHosts && g.mac.length > 0));
-      const cols = Math.max(1, Math.min(PORT_CARD_COLS, groups.length));
-      const laneContentWidth = cols * PORT_CARD_W + (cols - 1) * PORT_CARD_GAP_X;
-      const laneWidth = Math.max(MIN_LANE_WIDTH, laneContentWidth + 40);
-      const { positions, bottom } = layoutPortCards(
-        groups, cols, PORT_CARD_W, PORT_CARD_GAP_X, PORT_CARD_GAP_Y, laneWidth / 2, DEVICE_Y + ROW_GAP_AFTER_DEVICE
-      );
-      perDeviceLayout[n.id] = { groups, positions, bottom, laneWidth };
-    });
-
-    const width = nodes.reduce((sum, n) => sum + perDeviceLayout[n.id].laneWidth, 0) + LANE_GAP * Math.max(0, nodes.length - 1);
-
-    // Devices sit in a single row, each centered in its own (variable-
-    // width) lane, joined by straight trunk lines - the classic network-
-    // diagram convention, not a circle.
-    const positions = {};
-    let cursorX = 0;
-    nodes.forEach((n) => {
-      const laneWidth = perDeviceLayout[n.id].laneWidth;
-      positions[n.id] = { x: cursorX + laneWidth / 2, y: DEVICE_Y };
-      cursorX += laneWidth + LANE_GAP;
-    });
-
-    const portPositions = {};
-    let maxContentBottom = DEVICE_Y + DEVICE_NODE_R;
-    nodes.forEach((n) => {
-      const laneLeftX = positions[n.id].x - perDeviceLayout[n.id].laneWidth / 2;
-      Object.entries(perDeviceLayout[n.id].positions).forEach(([port, pos]) => {
-        portPositions[`${n.id}:${port}`] = { ...pos, x: pos.x + laneLeftX };
-      });
-      maxContentBottom = Math.max(maxContentBottom, perDeviceLayout[n.id].bottom);
-    });
-
-    const height = maxContentBottom + 30;
-
-    return { nodeById, positions, portPositions, portGroupsByDevice: perDeviceLayout, height, width };
-  }, [data, showMacTableHosts]);
+  // The map owns its own geometry now (TopologyMap.jsx); all this tab
+  // still needs is a way to turn a device id into its name.
+  const layout = useMemo(
+    () => ({ nodeById: Object.fromEntries((data?.nodes || []).map((n) => [n.id, n])) }),
+    [data]
+  );
 
   async function handleRelearn() {
     setBusyAction(true);
@@ -558,7 +421,7 @@ export default function TopologyPage({ pushFlash, onOpenConsole, onAddDevice }) 
         <Box color="text-body-secondary" fontSize="body-s">
           Crawled {data.age_seconds < 5 ? "just now" : `${data.age_seconds}s ago`}
           {data.refreshing ? " - refreshing…" : ""}; re-crawled every {data.refresh_seconds || 60}s in the background.
-          {" "}Refresh on the Diagram tab forces a live crawl now.
+          {" "}Refresh on the Map tab forces a live crawl now.
         </Box>
       ) : null}
       {/* Tables first: a Cloudscape table with filter and pagination is
@@ -623,253 +486,36 @@ export default function TopologyPage({ pushFlash, onOpenConsole, onAddDevice }) 
             />
           </Container>
           ) },
-          { id: "diagram", label: "Diagram", content: (
-          <Container
-            header={
-              <Header
-                variant="h2"
-                description={
-                  data?.fetched_at
-                    ? `Crawled ${data.age_seconds < 5 ? "just now" : `${data.age_seconds}s ago`}${data.refreshing ? " - refreshing…" : ""}; re-crawled every ${data.refresh_seconds || 60}s in the background. Refresh forces a live crawl now.`
-                    : "Waiting for the first crawl…"
-                }
-                actions={
-                  <SpaceBetween direction="horizontal" size="s">
-                    <Toggle checked={showMacTableHosts} onChange={({ detail }) => setShowMacTableHosts(detail.checked)}>
-                      MAC-table hosts ({macTableHostCount})
-                    </Toggle>
-                    <Toggle checked={autoRefresh} onChange={({ detail }) => setAutoRefresh(detail.checked)}>
-                      Auto-refresh (30s)
-                    </Toggle>
-                    <Button iconName="refresh" onClick={() => load(true)} loading={loading}>
-                      Refresh
-                    </Button>
-                  </SpaceBetween>
-                }
-              >
-                Fleet topology
-              </Header>
-            }
-          >
-            <SpaceBetween size="s">
-              <SpaceBetween direction="horizontal" size="l">
-                <Box fontSize="body-s" color="text-body-secondary">
-                  <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
-                    <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UP} strokeWidth="3" />
-                  </svg>
-                  Link up
-                </Box>
-                <Box fontSize="body-s" color="text-body-secondary">
-                  <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
-                    <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_DOWN} strokeWidth="3" />
-                  </svg>
-                  Link down
-                </Box>
-                <Box fontSize="body-s" color="text-body-secondary">
-                  <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
-                    <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UNKNOWN} strokeWidth="3" />
-                  </svg>
-                  State unknown
-                </Box>
-                <Box fontSize="body-s" color="text-body-secondary">
-                  <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
-                    <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UNKNOWN} strokeWidth="2" strokeDasharray="4 3" />
-                  </svg>
-                  LLDP neighbor (click to add)
-                </Box>
-                <Box fontSize="body-s" color="text-body-secondary">
-                  <svg width="20" height="12" style={{ verticalAlign: "middle", marginRight: 4 }}>
-                    <line x1="0" y1="6" x2="20" y2="6" stroke={COLOR_UNKNOWN} strokeWidth="1" strokeDasharray="1 3" />
-                  </svg>
-                  MAC-table only (lower confidence, doesn't speak LLDP)
-                </Box>
-              </SpaceBetween>
-
-              <svg viewBox={`0 0 ${layout.width} ${layout.height}`} style={{ width: "100%", height: "auto" }}>
-                {internalEdges.map((e) => {
-                  const a = layout.positions[e.a.device_id];
-                  const b = layout.positions[e.b.device_id];
-                  if (!a || !b) return null;
-                  const info = edgeStatusInfo([e.a.state, e.b.state]);
-                  const key = `${e.a.device_id}:${e.a.port}-${e.b.device_id}:${e.b.port}`;
-
-                  const pairKey = [e.a.device_id, e.b.device_id].sort().join("|");
-                  const group = pairGroups[pairKey];
-                  const idxInGroup = group.indexOf(e);
-                  const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-                  const dx = b.x - a.x;
-                  const dy = b.y - a.y;
-                  const len = Math.hypot(dx, dy) || 1;
-                  // Perpendicular unit vector, scaled by how far this edge sits
-                  // from the middle of its group (e.g. 3 edges -> offsets of
-                  // -28, 0, +28), so a single edge stays a straight line.
-                  const spacing = 28;
-                  const offset = (idxInGroup - (group.length - 1) / 2) * spacing;
-                  const ctrl = { x: mid.x + (-dy / len) * offset, y: mid.y + (dx / len) * offset };
-                  const path = group.length > 1
-                    ? `M ${a.x} ${a.y} Q ${ctrl.x} ${ctrl.y} ${b.x} ${b.y}`
-                    : `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
-                  // Label placed at the curve's midpoint (same formula as the
-                  // control point, halved) so each parallel link's ports are
-                  // readable directly on the diagram, not just on hover.
-                  const labelPos = { x: mid.x + (-dy / len) * offset * 0.5, y: mid.y + (dx / len) * offset * 0.5 };
-
-                  return (
-                    <g key={key}>
-                      <path
-                        d={path} fill="none"
-                        stroke={info.color} strokeWidth={hovered === key ? 5 : 3}
-                        style={{ cursor: "pointer", transition: "stroke-width 0.1s" }}
-                        onMouseEnter={() => setHovered(key)}
-                        onMouseLeave={() => setHovered(null)}
-                      >
-                        <title>
-                          {layout.nodeById[e.a.device_id]?.name} ({e.a.port}) ⟷ {layout.nodeById[e.b.device_id]?.name} ({e.b.port})
-                          {"\n"}state: {info.text}
-                          {formatMbps(e.a.state?.input_mbps) ? `\n${e.a.port} in: ${formatMbps(e.a.state.input_mbps)}` : ""}
-                          {formatMbps(e.a.state?.output_mbps) ? `\n${e.a.port} out: ${formatMbps(e.a.state.output_mbps)}` : ""}
-                        </title>
-                      </path>
-                      {hovered === key && (
-                        <g style={{ pointerEvents: "none" }}>
-                          <rect
-                            x={labelPos.x - 62} y={labelPos.y - 11} width="124" height="22" rx="4"
-                            fill="white" stroke={info.color} strokeWidth="1"
-                          />
-                          <text x={labelPos.x} y={labelPos.y + 4} textAnchor="middle" fontSize="11" fill={COLOR_TEXT}>
-                            {e.a.port} ⟷ {e.b.port}
-                          </text>
-                        </g>
-                      )}
-                    </g>
-                  );
-                })}
-
-                {nodes.flatMap((n) => {
-                  const a = layout.positions[n.id];
-                  const { groups, laneWidth } = layout.portGroupsByDevice[n.id] || { groups: [] };
-                  const cols = Math.max(1, Math.min(PORT_CARD_COLS, groups.length));
-                  const laneLeftX = a ? a.x - laneWidth / 2 : 0;
-                  const corridorX = cols > 1
-                    ? laneLeftX + PORT_CARD_W + PORT_CARD_GAP_X / 2
-                    : laneLeftX + PORT_CARD_W + 10;
-                  return groups.map((g) => {
-                    const card = layout.portPositions[`${n.id}:${g.port}`];
-                    if (!a || !card) return null;
-                    const rows = [
-                      ...g.lldp.map((e) => ({ e, kind: "lldp" })),
-                      ...g.mac.map((e) => ({ e, kind: "mac" })),
-                    ];
-                    return (
-                      <g key={`${n.id}:${g.port}`}>
-                        <path
-                          d={portConnectorPath(a.x, a.y + DEVICE_NODE_R, card.x + card.width / 2, card.y, corridorX)}
-                          fill="none" stroke={COLOR_UNKNOWN} strokeWidth="1.5"
-                          strokeDasharray={g.lldp.length > 0 ? "4 3" : "1 3"}
-                        />
-                        <foreignObject x={card.x} y={card.y} width={card.width} height={card.height}>
-                          <div
-                            xmlns="http://www.w3.org/1999/xhtml"
-                            style={{
-                              fontFamily: "inherit",
-                              background: COLOR_CARD_FILL,
-                              border: `1.5px solid ${COLOR_UNKNOWN}`,
-                              borderRadius: 8,
-                              height: card.height - 2,
-                              boxSizing: "border-box",
-                              overflow: "hidden",
-                            }}
-                          >
-                            <div
-                              style={{
-                                fontSize: 11, fontWeight: "bold", color: COLOR_TEXT, padding: "3px 8px",
-                                borderBottom: `1px solid ${COLOR_DIVIDER}`, background: COLOR_CARD_HEADER, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                              }}
-                              title={`${n.name} — ${g.port}${g.memberPorts?.length > 1 ? ` (${g.memberPorts.join(", ")})` : ""}`}
-                            >
-                              {g.port}
-                              {g.memberPorts?.length > 1 ? ` (${g.memberPorts.length} members)` : ""}
-                            </div>
-                            {rows.map(({ e, kind }) => {
-                              const ip = e.remote_ip;
-                              const mac = externalMac(e);
-                              const sub = externalSubline(e);
-                              const alsoKnownAs = e.also_known_as?.length ? ` — also seen as: ${e.also_known_as.join(", ")}` : "";
-                              const corroborated = kind === "lldp" && e.discovered_via.includes("mac-table") ? " (confirmed via MAC table)" : "";
-                              const notice = kind === "mac" ? " — MAC table only, no LLDP" : "";
-                              return (
-                                <div
-                                  key={externalKey(e)}
-                                  onClick={() => onAddDevice?.({ name: ip || e.remote_label, host: ip || "" })}
-                                  title={`${ip || "no IP"} / ${mac}${sub ? ` (${sub})` : ""}${alsoKnownAs}${corroborated}${notice}\nClick to add as a device`}
-                                  style={{
-                                    display: "flex", alignItems: "center", gap: 5, padding: "1px 8px",
-                                    height: PORT_ROW_H, cursor: onAddDevice ? "pointer" : "default",
-                                    fontFamily: fontFamilyMonospace,
-                                  }}
-                                >
-                                  <span
-                                    style={{
-                                      flex: "none", width: 6, height: 6, borderRadius: "50%",
-                                      background: kind === "lldp" ? COLOR_DEVICE_STROKE : COLOR_UNKNOWN,
-                                    }}
-                                  />
-                                  <span style={{ display: "flex", flexDirection: "column", overflow: "hidden", lineHeight: 1.25 }}>
-                                    <span
-                                      style={{
-                                        fontSize: 11, fontWeight: kind === "lldp" ? 600 : 400, color: COLOR_TEXT,
-                                        whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                                      }}
-                                    >
-                                      {ip || "no IP"}
-                                    </span>
-                                    <span
-                                      style={{
-                                        fontSize: 9, color: COLOR_TEXT_SECONDARY,
-                                        whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                                      }}
-                                    >
-                                      {mac}
-                                    </span>
-                                  </span>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </foreignObject>
-                      </g>
-                    );
-                  });
-                })}
-
-                {nodes.map((n) => {
-                  const p = layout.positions[n.id];
-                  if (!p) return null;
-                  return (
-                    <g key={n.id} style={{ cursor: onOpenConsole ? "pointer" : "default" }} onClick={() => onOpenConsole?.(n.id)}>
-                      <circle
-                        cx={p.x} cy={p.y} r={DEVICE_NODE_R}
-                        fill={n.lldp_error ? COLOR_DEVICE_ERROR_FILL : COLOR_DEVICE_FILL}
-                        stroke={n.lldp_error ? COLOR_DEVICE_ERROR_STROKE : COLOR_DEVICE_STROKE}
-                        strokeWidth="2.5"
-                      >
-                        <title>Open {n.name} in the Console</title>
-                      </circle>
-                      <text x={p.x} y={p.y - 10} textAnchor="middle" fontSize="13" fontWeight="bold" fill={COLOR_TEXT}>
-                        {n.name.length > 20 ? `${n.name.slice(0, 18)}…` : n.name}
-                      </text>
-                      <text x={p.x} y={p.y + 6} textAnchor="middle" fontSize="11" fill={COLOR_TEXT_SECONDARY} fontFamily={fontFamilyMonospace}>
-                        {n.host}
-                      </text>
-                      <text x={p.x} y={p.y + 20} textAnchor="middle" fontSize="9" fill={COLOR_TEXT_SECONDARY}>
-                        {n.platform}
-                      </text>
-                    </g>
-                  );
-                })}
-              </svg>
-            </SpaceBetween>
-          </Container>
+          { id: "diagram", label: "Map", content: (
+          <SpaceBetween size="s">
+            <Header
+              variant="h3"
+              description={
+                data?.fetched_at
+                  ? `Crawled ${data.age_seconds < 5 ? "just now" : `${data.age_seconds}s ago`}${data.refreshing ? " - refreshing…" : ""}; re-crawled every ${data.refresh_seconds || 60}s in the background.`
+                  : "Waiting for the first crawl…"
+              }
+              actions={
+                <SpaceBetween direction="horizontal" size="s" alignItems="center">
+                  <Toggle checked={showMacTableHosts} onChange={({ detail }) => setShowMacTableHosts(detail.checked)}>
+                    MAC-table hosts ({macTableHostCount})
+                  </Toggle>
+                  <Toggle checked={autoRefresh} onChange={({ detail }) => setAutoRefresh(detail.checked)}>
+                    Auto-refresh
+                  </Toggle>
+                  <Button iconName="refresh" onClick={() => load(true)} loading={loading}>
+                    Refresh
+                  </Button>
+                </SpaceBetween>
+              }
+            />
+            <TopologyMap
+              data={data}
+              showMacTableHosts={showMacTableHosts}
+              onOpenConsole={onOpenConsole}
+              onAddDevice={onAddDevice}
+            />
+          </SpaceBetween>
           ) },
         ]}
       />
