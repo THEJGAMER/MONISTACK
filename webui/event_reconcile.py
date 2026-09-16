@@ -72,11 +72,16 @@ class SshReconciler:
         return 1 if created else 0
 
     def _resolve_if_stale_safe(self, kind, device_id, device, subject, polled_dt, detail):
-        """Resolve only when the poll is newer than the event it would close."""
+        """Resolve only when the poll is newer than the event it would close.
+
+        Against `reopened_at` when there is one, not `raised_at`: a
+        re-opened episode keeps its original raise time (that is the point
+        of re-opening), so comparing against it would let a poll taken
+        before the fault came back close it again."""
         open_ev = self.store.open_kind(kind, device_id, subject)
         if open_ev is None:
             return 0
-        raised = _dt(open_ev["raised_at"])
+        raised = _dt(open_ev.get("reopened_at") or open_ev["raised_at"])
         if polled_dt is not None and raised is not None and polled_dt <= raised:
             return 0
         return 1 if self.store.resolve(open_ev["signature"], by="ssh", detail=detail) else 0

@@ -421,6 +421,22 @@ kind with a default severity, and a site sets its own per kind - `info`,
 per-port severity on the Ports tab. Groups: Ports, Environment, Compute,
 Device, Protocol, Syslog rules, Switchboard.
 
+**De-duplication and re-opens.** A fault that comes back within
+`EVENT_REOPEN_WITHIN_SECONDS` (default 15 minutes) re-opens its own row
+instead of starting another one: `raised_at` stays at the first
+occurrence so "lasted" spans the whole episode, `reopen_count` says how
+many times it returned, and `reopened_at` when it last did. Verified
+live: unplugging Te 1/41 five times added **zero** new rows - one event,
+count 6, came back 5 times. A return is still news (the phone hears
+"back after 3 returns"); a repeat while it is already open is not, and
+only bumps the count. Beyond the window it is a new episode, because this
+morning's outage and this afternoon's are two different things. The order
+inside `raise_event` is the whole of it: bump what is open, else re-open
+what just closed, else insert - inserting first would make every flap a
+row. One consequence worth knowing: the SSH poll's "don't let a stale
+snapshot close a live fault" guard reads `reopened_at` rather than
+`raised_at`, or a poll taken before the fault returned would close it.
+
 **The store** (`eventstore.py`): one row per episode - raised once, bumped
 (`count`, `last_seen_at`) while the device keeps reporting it, resolved
 once, with `source` (syslog, loki, ssh, switchboard, timer, or a person),

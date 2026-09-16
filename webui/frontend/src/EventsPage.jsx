@@ -73,6 +73,18 @@ function StateCell({ ev }) {
   return <StatusIndicator type={severityType(ev.severity)}>open {duration(ev.raised_at)}</StatusIndicator>;
 }
 
+// One episode that keeps returning is one row, not a pile of them - so
+// how often it came back is the number worth showing.
+function ReportsCell({ ev }) {
+  if (!ev.reopen_count) return ev.count;
+  return (
+    <SpaceBetween direction="horizontal" size="xxs">
+      <Box>{ev.count}</Box>
+      <Badge color="severity-medium">came back {ev.reopen_count}x</Badge>
+    </SpaceBetween>
+  );
+}
+
 // --- the stream ------------------------------------------------------------
 
 function EventDetail({ eventId, onClose, pushFlash, onResolved }) {
@@ -140,6 +152,12 @@ function EventDetail({ eventId, onClose, pushFlash, onResolved }) {
               { label: "Detected by", value: SOURCE_LABELS[ev.source] || ev.source },
               { label: "Raised", value: fmt(ev.raised_at) },
               { label: "Last reported", value: `${fmt(ev.last_seen_at)} (${ev.count} time${ev.count === 1 ? "" : "s"})` },
+              {
+                label: "Came back",
+                value: ev.reopen_count
+                  ? `${ev.reopen_count} time${ev.reopen_count === 1 ? "" : "s"}, last ${fmt(ev.reopened_at)}`
+                  : "not since it was raised",
+              },
               { label: "Device time", value: ev.signal_at ? fmt(ev.signal_at) : "-" },
               { label: "Resolved", value: ev.resolved_at ? `${fmt(ev.resolved_at)} by ${ev.resolved_by}` : "not yet" },
               { label: "Lasted", value: duration(ev.raised_at, ev.resolved_at) },
@@ -241,7 +259,7 @@ function StreamTab({ devices, pushFlash, eventId, onNavigate }) {
           <Header
             variant="h2"
             counter={`(${events.length})`}
-            description="Open events first. Every row is one episode: raised once, counted while the device keeps reporting it, resolved once - by the device, the SSH poll, a timer, or you."
+            description="Open events first. Every row is one episode: raised once, counted while the device keeps reporting it, resolved once - by the device, the SSH poll, a timer, or you. A fault that returns soon after clearing re-opens its own row rather than starting a new one."
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <Toggle checked={openOnly} onChange={({ detail }) => setOpenOnly(detail.checked)}>
@@ -292,7 +310,7 @@ function StreamTab({ devices, pushFlash, eventId, onNavigate }) {
           },
           { id: "state", header: "State", width: 170, cell: (e) => <StateCell ev={e} /> },
           { id: "src", header: "Via", width: 120, cell: (e) => SOURCE_LABELS[e.source] || e.source },
-          { id: "count", header: "Reports", width: 90, cell: (e) => e.count },
+          { id: "count", header: "Reports", width: 150, cell: (e) => <ReportsCell ev={e} /> },
         ]}
       />
       {selected && (

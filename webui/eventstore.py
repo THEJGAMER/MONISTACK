@@ -1,7 +1,10 @@
 """Events: what happened, how bad, and whether it is over.
 
 One row per episode: raised once, bumped (count, last_seen_at) while the
-same thing keeps being reported, resolved once. A partial unique index
+same thing keeps being reported, resolved once - and *re-opened* rather
+than duplicated when the same fault returns soon after it cleared. A port
+unplugged five times in a minute is one event that reopened four times,
+not five rows to read through. A partial unique index
 keeps one open row per signature (kind + device + subject) so the syslog
 path and the SSH fallback converge on the same event instead of two.
 Hooks fire exactly once per transition, decided by the SQL (INSERT ...
@@ -16,11 +19,20 @@ webhooks (`event.raised` / `event.resolved`) and the API.
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 import event_catalog
 
 log = logging.getLogger("webui.events.store")
+
+
+# How soon a returning fault counts as the same episode. Long enough to
+# absorb a flap (the thing that produces piles of near-identical rows),
+# short enough that this morning's outage and this afternoon's are two
+# events. The flapping kinds exist to say "this keeps happening"; this
+# just stops it filling the list.
+REOPEN_WITHIN_SECONDS = int(os.environ.get("EVENT_REOPEN_WITHIN_SECONDS", "900"))
 
 
 def signature_for(kind, device_key, subject):
@@ -69,34 +81,81 @@ class EventStore:
             "source": row["source"], "signal_at": row["signal_at"],
             "raised_at": _iso(row["raised_at"]), "last_seen_at": _iso(row["last_seen_at"]), "count": row["count"],
             "resolved_at": _iso(row["resolved_at"]), "resolved_by": row["resolved_by"], "resolve_detail": row["resolve_detail"],
+            "reopen_count": row["reopen_count"] if "reopen_count" in row else 0,
+            "reopened_at": _iso(row["reopened_at"]) if "reopened_at" in row else None,
         }
 
     # --- transitions ------------------------------------------------------
 
+    def _bump(self, signature, detail):
+        """Same thing reported again while it is open: count it, quietly."""
+        row = self.db.query_one(
+            """UPDATE events SET count = count + 1, last_seen_at = now(), detail = COALESCE(%s, detail)
+               WHERE signature = %s AND resolved_at IS NULL RETURNING *""",
+            (detail, signature),
+        )
+        return self._to_dict(row)
+
     def raise_event(self, kind, severity, device_id, device, subject, title, detail=None, labels=None,
-                    source="syslog", signal_at=None):
-        """Open an event, or bump the open one. Returns (event, created)."""
+                    source="syslog", signal_at=None, reopen_within=None):
+        """Open an event, bump the open one, or re-open the episode that
+        just closed. Returns (event, is_news) - is_news is True when
+        something happened worth telling anyone about (a new episode or a
+        return), False when it is the same thing being reported again.
+
+        Order matters and is the whole of the de-duplication: bump what is
+        open, else re-open what closed recently, else start a new episode.
+        Inserting first would make every flap a new row."""
         if severity not in event_catalog.SEVERITIES:
             raise ValueError(f"severity must be one of {event_catalog.SEVERITIES}")
         signature = signature_for(kind, device_id or device, subject)
+        detail = (detail or "")[:4000] or None
+        window = REOPEN_WITHIN_SECONDS if reopen_within is None else reopen_within
+
+        row = self._bump(signature, detail)
+        if row is not None:
+            return row, False
+
+        if window > 0:
+            # The NOT EXISTS guard keeps this from colliding with the
+            # partial unique index if something opened in between; the
+            # index is still the authority, so a lost race falls through
+            # to a bump rather than erroring.
+            try:
+                row = self.db.query_one(
+                    """UPDATE events SET resolved_at = NULL, resolved_by = NULL, resolve_detail = NULL,
+                              reopen_count = reopen_count + 1, reopened_at = now(), count = count + 1,
+                              last_seen_at = now(), severity = %s, source = %s, signal_at = %s,
+                              title = %s, detail = COALESCE(%s, detail)
+                       WHERE id = (SELECT id FROM events
+                                    WHERE signature = %s AND resolved_at IS NOT NULL
+                                      AND resolved_at > now() - (%s || ' seconds')::interval
+                                      AND NOT EXISTS (SELECT 1 FROM events WHERE signature = %s AND resolved_at IS NULL)
+                                    ORDER BY id DESC LIMIT 1)
+                       RETURNING *""",
+                    (severity, source, signal_at, title, detail, signature, str(int(window)), signature),
+                )
+            except Exception:
+                log.warning("re-open lost a race for %s; treating as a fresh report", signature, exc_info=True)
+                row = None
+            if row is not None:
+                event = self._to_dict(row)
+                self._hook(self.on_raised, event)
+                return event, True
+
         row = self.db.query_one(
             """INSERT INTO events (signature, kind, severity, device_id, device, subject, title, detail, labels, source, signal_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (signature) WHERE resolved_at IS NULL DO NOTHING
                RETURNING *""",
             (signature, kind, severity, device_id or None, device or "unknown", subject or "", title,
-             (detail or "")[:4000] or None, json.dumps(labels or {}), source, signal_at),
+             detail, json.dumps(labels or {}), source, signal_at),
         )
         if row is not None:
             event = self._to_dict(row)
             self._hook(self.on_raised, event)
             return event, True
-        row = self.db.query_one(
-            """UPDATE events SET count = count + 1, last_seen_at = now(), detail = COALESCE(%s, detail)
-               WHERE signature = %s AND resolved_at IS NULL RETURNING *""",
-            ((detail or "")[:4000] or None, signature),
-        )
-        return self._to_dict(row), False
+        return self._bump(signature, detail), False
 
     def resolve(self, signature, by="syslog", detail=None):
         row = self.db.query_one(

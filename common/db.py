@@ -119,6 +119,16 @@ CREATE TABLE IF NOT EXISTS events (
     resolve_detail TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_one_open ON events(signature) WHERE resolved_at IS NULL;
+-- Re-opening (see eventstore.raise_event): the same fault coming back
+-- shortly after it cleared is the same episode, not a new one - a port
+-- unplugged five times is one event that reopened four times, not five
+-- rows. `raised_at` stays at the first occurrence so "lasted" spans the
+-- whole episode; `reopened_at` is the latest return.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS reopen_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS reopened_at TIMESTAMPTZ;
+-- Finding the episode to reopen is a lookup by signature over resolved
+-- rows; without this it is a scan of the whole history on every raise.
+CREATE INDEX IF NOT EXISTS idx_events_signature_resolved ON events(signature, resolved_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_raised ON events(raised_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id, raised_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, raised_at DESC);

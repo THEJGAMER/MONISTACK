@@ -25,7 +25,8 @@ CREATE TABLE events (
     device_id TEXT, device TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, detail TEXT,
     labels TEXT NOT NULL DEFAULT '{}', source TEXT NOT NULL, signal_at TEXT,
     raised_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(), count INTEGER NOT NULL DEFAULT 1,
-    resolved_at TIMESTAMPTZ, resolved_by TEXT, resolve_detail TEXT);
+    resolved_at TIMESTAMPTZ, resolved_by TEXT, resolve_detail TEXT,
+    reopen_count INTEGER NOT NULL DEFAULT 0, reopened_at TIMESTAMPTZ);
 CREATE UNIQUE INDEX idx_events_one_open ON events(signature) WHERE resolved_at IS NULL;
 CREATE TABLE event_settings (kind TEXT PRIMARY KEY, severity TEXT NOT NULL, params TEXT NOT NULL DEFAULT '{}', updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE port_settings (device_id TEXT NOT NULL, port TEXT NOT NULL, severity TEXT NOT NULL, PRIMARY KEY (device_id, port));
@@ -90,11 +91,68 @@ def test_raise_once_bump_while_it_persists_resolve_once(store):
     assert got == [("raised", ev["id"]), ("resolved", ev["id"])]
 
 
-def test_a_new_episode_after_resolve_is_a_new_event(store):
+# --- de-duplication: one episode, however often it comes and goes ---------
+
+def test_a_fault_that_returns_reopens_its_own_row(store):
+    """A port unplugged five times is one event that came back four
+    times, not five rows. Confirmed live: one test session of unplugging
+    produced a separate row per replug."""
+    got = []
+    store.on_raised = lambda e: got.append(("raised", e["reopen_count"]))
+    store.on_resolved = lambda e: got.append(("resolved", e["reopen_count"]))
+    first, created = _raise(store)
+    assert created
+
+    for _ in range(4):
+        store.resolve(first["signature"], by="syslog")
+        again, is_news = _raise(store)
+        assert is_news, "a return is news - the phone should hear about it"
+
+    assert again["id"] == first["id"], "same row"
+    assert again["reopen_count"] == 4 and again["reopened_at"]
+    assert again["raised_at"] == first["raised_at"], "raised_at stays at the first occurrence"
+    assert again["count"] == 5 and again["resolved_at"] is None
+    assert len(store.list()) == 1
+    assert got.count(("raised", 0)) == 1 and [c for k, c in got if k == "raised"] == [0, 1, 2, 3, 4]
+
+
+def test_a_return_long_after_it_cleared_is_a_new_episode(store):
     a, _ = _raise(store)
     store.resolve(a["signature"])
+    store.db.execute("UPDATE events SET resolved_at = now() - interval '2 hours' WHERE id = %s", (a["id"],))
+
     b, created = _raise(store)
-    assert created and b["id"] != a["id"] and b["signature"] == a["signature"]
+
+    assert created and b["id"] != a["id"] and b["reopen_count"] == 0
+    assert len(store.list()) == 2, "this morning's outage and this afternoon's are two events"
+
+
+def test_the_reopen_window_is_per_call_overridable(store):
+    a, _ = _raise(store)
+    store.resolve(a["signature"])
+    b, _ = _raise(store, reopen_within=0)
+    assert b["id"] != a["id"], "window 0 turns re-opening off"
+
+
+def test_reopening_refreshes_what_the_new_report_says(store):
+    a, _ = _raise(store, severity="warning", detail="first")
+    store.resolve(a["signature"], by="ssh", detail="cleared")
+    b, _ = _raise(store, severity="critical", detail="worse now")
+
+    assert b["id"] == a["id"]
+    assert (b["severity"], b["detail"]) == ("critical", "worse now")
+    assert b["resolved_by"] is None and b["resolve_detail"] is None, "the old resolution is not left hanging on an open event"
+
+
+def test_a_repeat_while_open_is_not_news_and_does_not_count_as_a_return(store):
+    got = []
+    store.on_raised = lambda e: got.append(e["id"])
+    a, _ = _raise(store)
+    b, is_news = _raise(store, detail="same thing again")
+
+    assert not is_news and b["id"] == a["id"]
+    assert b["count"] == 2 and b["reopen_count"] == 0
+    assert got == [a["id"]], "one notification, not one per report"
 
 
 def test_signature_is_kind_device_subject(store):

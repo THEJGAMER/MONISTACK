@@ -30,6 +30,7 @@ class _StoreR(_Store):
     def raise_event(self, *a, **kw):
         ev, created = super().raise_event(*a, **kw)
         ev.setdefault("raised_at", datetime.now(timezone.utc).isoformat())
+        ev.setdefault("reopened_at", None)
         return ev, created
 
     def open_kind(self, kind, device_id, subject):
@@ -75,6 +76,19 @@ def test_the_poll_resolves_only_when_newer_than_the_event():
     assert ("resolve", "port.link_down", "Te 1/47", "ssh") not in store.log, "a stale snapshot must not close a fresh event"
     r.reconcile("s4048", "S4048", _status(_t(+5), ports=[("Te 1/47", "up")]))
     assert store.log[-1] == ("resolve", "port.link_down", "Te 1/47", "ssh")
+
+
+def test_a_poll_older_than_the_fault_coming_back_does_not_close_it():
+    """A re-opened episode keeps its first raise time, so the guard has to
+    read reopened_at or a stale snapshot silently un-reports a live fault."""
+    store, r = _r()
+    ev, _ = store.raise_event("port.link_down", "warning", "s4048", "S4048", "Te 1/47", "t")
+    ev["raised_at"] = _t(-600)
+    ev["reopened_at"] = _t(0)
+
+    r.reconcile("s4048", "S4048", _status(_t(-30), ports=[("Te 1/47", "up")]))
+
+    assert ("resolve", "port.link_down", "Te 1/47", "ssh") not in store.log
 
 
 def test_the_same_snapshot_is_not_reconciled_twice():

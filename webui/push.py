@@ -189,8 +189,10 @@ def payload_for(event, envelope):
     tag = f"switchboard-event-{ev.get('id')}"
     url = f"/#/events/{ev.get('id')}" if ev.get("id") else "/#/events"
     if event == "event.raised":
+        reopens = int(ev.get("reopen_count") or 0)
+        again = f"back after {reopens} return{'s' if reopens > 1 else ''}: " if reopens else ""
         return {"title": f"{sev.upper()}: {ev.get('title') or ev.get('kind_name') or 'Event'}",
-                "body": (ev.get("detail") or "")[:200], "severity": sev, "tag": tag, "url": url,
+                "body": again + (ev.get("detail") or "")[:200], "severity": sev, "tag": tag, "url": url,
                 "event_id": ev.get("id"), "actions": [{"action": "open", "title": "Open"}]}
     if event == "event.resolved":
         by = ev.get("resolved_by") or "switchboard"
