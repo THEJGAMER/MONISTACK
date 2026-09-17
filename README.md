@@ -118,6 +118,69 @@ label was.
 - `s4048_transceiver_present{device_id,port}`, `_temperature_celsius`, `_voltage_volts`,
   `_tx_bias_ma`, `_tx_power_dbm`, `_rx_power_dbm`, `_alarm{device_id,port,flag}`
 
+## Console bastion
+
+A real terminal on a device, in the browser, at **Bastion** in the side
+navigation. It exists because eventually something goes wrong that no
+allowlist anticipated, and the alternative - handing out the switch's
+enable password - is worse than the thing it is meant to avoid.
+
+It authenticates with the credentials Switchboard already holds, so
+access to a switch is granted and revoked in Keycloak and nobody ever
+learns the device's own password.
+
+**Two modes, and your role decides which you may choose:**
+
+| Role | May open | What that means |
+|---|---|---|
+| `admin` | full **or** read-only | full is a raw pipe: keystrokes, tab completion, configuration mode, everything the device allows |
+| `operator` | read-only | free text, but only read-only commands are forwarded |
+| `viewer` | nothing | free text to a live device is not a read-only-user capability |
+
+**How read-only is enforced - twice, independently.** `webui/bastion_policy.py`
+refuses anything whose first word is not a verb it recognises as
+read-only for that platform, checks each pipe stage against its own
+allowlist (`| save` on OS9 and `| tee`/`| append`/`| request` on Junos all
+write), and treats a shell as a shell (OPNsense lands in real FreeBSD, so
+whole-command patterns and no metacharacters, because `ifconfig; rm -rf /`
+starts with `ifconfig`). *Separately*, a read-only session on Dell OS9
+never sends `enable` - it sits in user EXEC, where the device itself
+rejects configuration. One of those has to be right; both have to be
+wrong to do damage.
+
+**Text reaches the device only as whole, checked lines.** A read-only
+session's keystrokes never leave the browser - the page echoes them
+locally, submits a finished line, and the server sends it prefixed with
+Ctrl-U so anything sitting in the device's input buffer is wiped first.
+There is no way to assemble a command one character at a time past the
+check. `?` still works: it sends the partial line and a question mark,
+with no newline, and clears the buffer afterwards.
+
+**Everything is recorded, and there is no flag to turn it off.** Every
+submitted line and every byte the device printed lands in
+`bastion_chunks` with timestamps, so a session replays afterwards at the
+speed it happened (Session recordings tab). Recordings are kept 365 days,
+the same as the audit log, which is what they are. An operator sees their
+own; an admin sees everyone's. Commands and refusals also go to
+`audit_log` as `bastion.command` / `bastion.refused`.
+
+**Knobs:**
+
+| Env var | Default | What it does |
+|---|---|---|
+| `BASTION_ENABLED` | `1` | `0` turns the whole thing off; the routes 404 and the page says so |
+| `BASTION_MAX_SESSIONS_PER_DEVICE` | `2` | not a preference - Dell OS9 has a handful of vty slots and the status poller already holds one |
+| `BASTION_MAX_SESSIONS` | `8` | fleet-wide |
+| `BASTION_IDLE_TIMEOUT_SECONDS` | `900` | an abandoned tab must not hold an SSH slot |
+| `BASTION_MAX_SESSION_SECONDS` | `14400` | hard ceiling regardless of activity |
+| `BASTION_MAX_RECORD_BYTES` | `8000000` | past this the transcript says where it was cut rather than becoming unloadable |
+| `BASTION_ALLOWED_ORIGINS` | *(empty)* | extra origins for the WebSocket handshake; by default only the host the app is served from |
+
+The terminal is a WebSocket, which needs a WebSocket implementation
+bolted onto uvicorn - `websockets` is in `webui/requirements.txt` for
+exactly that. Without it uvicorn logs "Unsupported upgrade request" and
+answers the handshake with a 404.
+
 ## Data retention
 
 Every growing table is pruned by `webui/retention.py`, once at startup and
@@ -129,10 +192,10 @@ absurd number).
 |---|---|---|---|
 | `metric_samples` (iface_*) | `RETAIN_IFACE_SAMPLES_DAYS` | 30 | ~94% of all samples - ~105 ports x 4 series, most ports unused |
 | `metric_samples` (other) | `RETAIN_METRIC_SAMPLES_DAYS` | 180 | optics/PSU: low volume, high value over long periods |
-| `alert_history` | `RETAIN_ALERT_HISTORY_DAYS` | 90 | raw webhook log; `alert_occurrences` is the durable record |
-| `alert_occurrences` | `RETAIN_OCCURRENCES_DAYS` | 180 | resolved only, never one carrying acks/comments/audit entries |
+| `events` | `RETAIN_EVENTS_DAYS` | 180 | resolved only - an open event is live state whatever its age |
 | `results` (auto-saved) | `RETAIN_AUTOSAVED_RESULTS_DAYS` | 90 | explicitly saved results are **never** pruned |
 | `command_history` | `RETAIN_COMMAND_HISTORY_DAYS` | 90 | per-user working list; `audit_log` keeps the durable record |
+| `bastion_sessions` | `RETAIN_BASTION_DAYS` | 365 | console recordings *are* audit; cascades to `bastion_chunks` |
 | `audit_log` | `RETAIN_AUDIT_LOG_DAYS` | 365 | longest by design - an audit trail that deletes itself is worth little |
 
 Two rules the policies are built around, both about not destroying things
@@ -140,10 +203,8 @@ a person deliberately created:
 
 1. **Deliberate keeps outlive automatic ones.** A result you clicked Save
    on is not the same as the auto-saved copy of every command ever run.
-2. **Never cascade over human records.** `alarm_acks`/`alarm_comments`
-   cascade from `alert_occurrences`, so an age-only delete would silently
-   destroy acknowledgements and incident discussion. The occurrence policy
-   excludes any row carrying them.
+2. **Resolved only.** An open event is live state, whatever its age; only
+   resolved events age out.
 
 `metric_samples` is split because one class of series dominates it -
 measured at 1.91M of 2.03M rows on a real 3-device fleet. A single window
@@ -156,8 +217,11 @@ trend you want months of.
 - The switch's `admin` account lands in unprivileged EXEC (`>`); the
   exporter escalates with `enable` using the same password
   (`SWITCH_ENABLE_PASS` env var can override if it's ever set differently).
-- The account only has read (`show`) commands run against it — nothing in
-  this stack issues config-mode commands.
+- Nothing in this stack issues a config-mode command *on its own*: the
+  pollers, the Console and the scheduler only ever run commands written
+  down in `webui/commands.py`. The one exception is a person at the
+  Console bastion in full-access mode, where the whole point is that they
+  are typing it themselves - and every keystroke of that is recorded.
 - The temp password used to set this up was shared in plaintext in chat;
   worth rotating it on the switch once you're done validating the stack.
 

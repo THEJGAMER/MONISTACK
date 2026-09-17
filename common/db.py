@@ -453,6 +453,60 @@ CREATE TABLE IF NOT EXISTS sflow_ifindex (
     PRIMARY KEY (device_id, ifindex)
 );
 
+
+-- The console bastion: a real interactive SSH session to a device, opened
+-- through Switchboard so that nobody needs the device's own credentials.
+--
+-- Everything typed and everything printed is recorded, and the recording is
+-- the point: an interactive session is the one place in this app where a
+-- person can do something the allowlisted console cannot express, so it is
+-- also the one place where "what exactly happened" has to be answerable
+-- afterwards. `bastion_sessions` is the header, `bastion_chunks` the
+-- transcript.
+CREATE TABLE IF NOT EXISTS bastion_sessions (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    device_name TEXT,
+    host TEXT,
+    platform TEXT,
+    actor TEXT NOT NULL,
+    role TEXT NOT NULL,
+    -- 'full' (anything the device allows, including configuration) or
+    -- 'readonly' (free text, but only read-only commands are forwarded,
+    -- and on platforms that have the concept the session does not even
+    -- escalate to privileged mode). The role decides which modes are
+    -- offered; the person decides which of those they open.
+    mode TEXT NOT NULL,
+    client_ip TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    end_reason TEXT,
+    bytes_in BIGINT NOT NULL DEFAULT 0,
+    bytes_out BIGINT NOT NULL DEFAULT 0,
+    commands INTEGER NOT NULL DEFAULT 0,
+    refused INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_bastion_sessions_started ON bastion_sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bastion_sessions_actor ON bastion_sessions(actor, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bastion_sessions_device ON bastion_sessions(device_id, started_at DESC);
+
+-- One append-only slice of the transcript. `stream` is 'in' (a line the
+-- person submitted), 'out' (what the device printed) or 'note' (something
+-- Switchboard itself has to say - a refusal, a timeout, a disconnect).
+--
+-- ON DELETE CASCADE so retention only has to prune the header row; a
+-- transcript with no session is unreadable anyway.
+CREATE TABLE IF NOT EXISTS bastion_chunks (
+    id BIGSERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES bastion_sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    at TEXT NOT NULL,
+    stream TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bastion_chunks_session ON bastion_chunks(session_id, seq);
+
 """
 
 

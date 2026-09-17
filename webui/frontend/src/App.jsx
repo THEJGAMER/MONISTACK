@@ -19,6 +19,9 @@ import { AuthProvider, useHasRole } from "./AuthContext.jsx";
 // markdown/plotting bits (Topology/Trends) are the heaviest deps in the
 // bundle and most sessions only ever visit one or two of these pages.
 const ConsolePage = lazy(() => import("./ConsolePage.jsx"));
+// xterm is only ever needed by the bastion, and it is a big dependency -
+// lazily loaded so the other twelve pages never pay for a terminal.
+const BastionPage = lazy(() => import("./BastionPage.jsx"));
 const DevicesPage = lazy(() => import("./DevicesPage.jsx"));
 const ResultsPage = lazy(() => import("./ResultsPage.jsx"));
 const SettingsPage = lazy(() => import("./SettingsPage.jsx"));
@@ -206,6 +209,7 @@ export default function App() {
   const [section, routeParam] = activeHref.replace(/^#\/?/, "").split("/");
   const KNOWN_PAGES = [
     "devices",
+    "bastion",
     "results",
     "topology",
     "trends",
@@ -221,6 +225,7 @@ export default function App() {
   const page = KNOWN_PAGES.includes(section) ? section : "console";
   const pageTitles = {
     console: "Console",
+    bastion: "Console bastion",
     devices: "Devices",
     results: "Saved Results",
     topology: "Topology",
@@ -318,6 +323,7 @@ export default function App() {
             }}
             items={[
               { type: "link", text: "Console", href: "#/console" },
+              { type: "link", text: "Bastion", href: "#/bastion" },
               { type: "link", text: "Devices", href: "#/devices" },
               { type: "link", text: "Topology", href: "#/topology" },
               { type: "link", text: "Trends", href: "#/trends" },
@@ -373,6 +379,8 @@ export default function App() {
                 <SchedulesPage devices={devices} commandTree={commandTree} pushFlash={pushFlash} />
               ) : page === "compliance" ? (
                 <CompliancePage pushFlash={pushFlash} />
+              ) : page === "bastion" ? (
+                <BastionPage devices={devices} pushFlash={pushFlash} />
               ) : page === "insights" ? (
                 <InsightsPage pushFlash={pushFlash} />
               ) : page === "events" ? (

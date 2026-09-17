@@ -102,6 +102,17 @@ POLICIES = [
         "DELETE FROM command_history WHERE ts < %s",
         note="per-user working list; audit_log keeps the durable record of the same runs",
     ),
+    # Deliberately the same 365 days as audit_log, and for the same
+    # reason: a bastion recording *is* audit. It is the only record of
+    # what a person typed into a live device by hand, so it must not
+    # outlive or under-live the log entry that says they were there.
+    # bastion_chunks has ON DELETE CASCADE, so pruning the header takes
+    # the transcript with it.
+    Policy(
+        "bastion_sessions", "RETAIN_BASTION_DAYS", 365,
+        "DELETE FROM bastion_sessions WHERE started_at < %s",
+        note="session recordings - cascades to bastion_chunks; set RETAIN_BASTION_DAYS=0 to keep forever",
+    ),
     Policy(
         "audit_log", "RETAIN_AUDIT_LOG_DAYS", 365,
         "DELETE FROM audit_log WHERE ts < %s",

@@ -340,3 +340,20 @@ export const testFastPath = (severity) =>
 export const listWebhookEvents = () => api("/api/webhooks/events");
 
 export const getInsights = (refresh = false) => api(`/api/insights${refresh ? "?refresh=1" : ""}`, undefined, 60_000);
+
+// --- console bastion ----------------------------------------------------
+export const getBastionAccess = () => api("/api/bastion/access");
+export const listBastionSessions = (limit = 100, deviceId = null) =>
+  api(`/api/bastion/sessions?limit=${limit}${deviceId ? `&device_id=${encodeURIComponent(deviceId)}` : ""}`);
+export const getBastionSession = (id) => api(`/api/bastion/sessions/${encodeURIComponent(id)}`);
+export const closeBastionSession = (id) =>
+  api(`/api/bastion/sessions/${encodeURIComponent(id)}/close`, { method: "POST" });
+
+// The terminal itself is a WebSocket, not a fetch - this only builds its
+// address. Same-origin, so the session cookie rides along with the
+// handshake (the server checks Origin as well, see api_bastion_ws).
+export function bastionSocketUrl({ deviceId, mode, cols, rows }) {
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  const q = new URLSearchParams({ device: deviceId, mode, cols: String(cols), rows: String(rows) });
+  return `${scheme}://${window.location.host}/api/bastion/ws?${q.toString()}`;
+}

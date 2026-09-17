@@ -31,3 +31,9 @@ itsdangerous>=2.1,<3
 # service. Replaces nothing yet - Pushover/PagerDuty via Alertmanager
 # still work - but it is what lets a phone get paged without a third party.
 pywebpush>=2.0,<3
+# uvicorn speaks HTTP on its own but needs a WebSocket implementation
+# bolted on, and silently refuses the handshake without one (confirmed
+# live: "Unsupported upgrade request" and a 404 on /api/bastion/ws).
+# Required by the console bastion, which is a terminal and cannot be
+# polled over plain HTTP.
+websockets>=12,<16

@@ -13,6 +13,8 @@
     "@cloudscape-design/components": "^3.0.1382",
     "@cloudscape-design/design-tokens": "^3.0.113",
     "@cloudscape-design/global-styles": "^1.0.70",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

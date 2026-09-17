@@ -1,3 +1,4 @@
+import asyncio
 import concurrent.futures
 import csv
 import io
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 import psycopg2
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +29,8 @@ from starlette.middleware.sessions import SessionMiddleware
 
 import junos_parsers
 import audit
+import bastion as bastion_module
+import bastion_policy
 import auth
 import logging_setup
 import metrics
@@ -451,6 +454,7 @@ SFLOW = None
 NETFLOW = None
 SFLOW_IFINDEX = None
 AUDIT = None
+BASTION = None
 
 # The syslog fast path (fastpath.py): Vector POSTs events here as they
 # arrive; the token is what lets it. Blank = endpoint answers 503 and
@@ -914,6 +918,7 @@ def _load_database(dsn):
     global DB, STORE, RESULTS, TOPOLOGY_STORE, SCHEDULES
     global AUDIT, DEVICES, DEVICES_BY_ID, COMMAND_HISTORY, FAVORITES, SFLOW, SFLOW_IFINDEX, NETFLOW, API_TOKENS, WEBHOOKS, PUSH_SUBS
     global SYSLOG_RULES, EVENTS, EVENT_SETTINGS, PORT_SETTINGS, SYSLOG_DETECTOR, SSH_RECONCILER
+    global BASTION
     new_db = Database(dsn)
     new_store = DeviceStore(new_db)
     new_results = ResultsStore(new_db)
@@ -940,6 +945,11 @@ def _load_database(dsn):
     PORT_SETTINGS = event_catalog.PortSettings(new_db)
     SYSLOG_DETECTOR = event_detect.SyslogDetector(EVENTS, EVENT_SETTINGS, PORT_SETTINGS)
     SSH_RECONCILER = event_reconcile.SshReconciler(EVENTS, EVENT_SETTINGS, PORT_SETTINGS)
+    # Bastion sessions are in-memory, so any row still marked open in
+    # the database belongs to a process that no longer exists.
+    bastion_store = bastion_module.BastionStore(new_db)
+    bastion_store.close_orphans()
+    BASTION = bastion_module.BastionManager(bastion_store, audit=new_audit)
     _LIST_CACHE.clear()
     try:
         SYSLOG_RULES.seed_defaults()
@@ -3757,6 +3767,228 @@ def api_push_test(req: PushEndpointRequest, request: Request, user: str = Depend
     if result is None:
         raise HTTPException(status_code=404, detail="no such subscription")
     return result
+
+
+# --- console bastion ---------------------------------------------------
+#
+# A real terminal on a device, opened with Switchboard's stored
+# credentials so that nobody has to be given the device's own password,
+# and recorded end to end. See bastion.py for why each of those matters;
+# the routes here are only the door.
+#
+# The WebSocket carries a session cookie, which browsers attach to a
+# cross-site WebSocket handshake far more readily than to a cross-site
+# fetch - there is no preflight and no CORS check on the way in. The
+# Origin check below is therefore not decoration: it is the only thing
+# standing between this and a page on another site opening a switch
+# terminal in a logged-in person's browser.
+
+
+def _bastion_ready():
+    if not bastion_module.enabled():
+        raise HTTPException(status_code=404, detail="the console bastion is disabled on this deployment")
+    if BASTION is None:
+        raise HTTPException(status_code=503, detail="database unavailable - fix the connection on the Settings page")
+
+
+def _bastion_can_see(request, row_actor, user):
+    """Your own sessions, or anybody's if you are an admin. An operator
+    seeing every other operator's recorded keystrokes would make the
+    recording itself a reason not to use the bastion."""
+    return row_actor == user or auth.role_meets(_role_of(request), "admin")
+
+
+@app.get("/api/bastion/access", tags=["bastion"], summary="What this person may open, and where")
+def api_bastion_access(request: Request, user: str = Depends(require_auth_and_db)):
+    role = _role_of(request)
+    modes = bastion_policy.modes_for_role(role)
+    limits = bastion_module.LIMITS
+    return {
+        "enabled": bastion_module.enabled(),
+        "role": role,
+        "modes": modes,
+        "devices": [
+            {"id": d.id, "name": d.name, "platform": d.platform, "host": d.host}
+            for d in DEVICES
+        ],
+        "limits": {
+            "per_device": limits.per_device,
+            "total": limits.total,
+            "idle_seconds": limits.idle_seconds,
+            "max_seconds": limits.max_seconds,
+        },
+        "live": BASTION.live() if BASTION is not None else [],
+    }
+
+
+@app.get("/api/bastion/sessions", tags=["bastion"], summary="Recorded sessions")
+def api_bastion_sessions(request: Request, limit: int = 100, device_id: Optional[str] = None,
+                         user: str = Depends(require_operator)):
+    _bastion_ready()
+    mine_only = None if auth.role_meets(_role_of(request), "admin") else user
+    return BASTION.store.list(limit=limit, actor=mine_only, device_id=device_id)
+
+
+@app.get("/api/bastion/sessions/{session_id}", tags=["bastion"], summary="One session's full transcript")
+def api_bastion_session(session_id: str, request: Request, user: str = Depends(require_operator)):
+    _bastion_ready()
+    row = BASTION.store.get(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such session")
+    if not _bastion_can_see(request, row["actor"], user):
+        raise HTTPException(status_code=403, detail="that session is not yours")
+    return {"session": row, "chunks": BASTION.store.chunks(session_id)}
+
+
+@app.post("/api/bastion/sessions/{session_id}/close", tags=["bastion"], summary="End a live session (admin)")
+def api_bastion_close(session_id: str, user: str = Depends(require_admin)):
+    _bastion_ready()
+    if not BASTION.kill(session_id, user):
+        raise HTTPException(status_code=404, detail="that session is not open")
+    AUDIT.record(user, "bastion.killed", session_id)
+    return {"closed": True}
+
+
+def _ws_identity(websocket: WebSocket):
+    """The same checks require_auth makes, against the cookie the
+    WebSocket handshake carried. Written out rather than reusing the
+    dependency because a WebSocket has no Request and no bearer token -
+    and a role check that silently defaulted would be the whole story
+    here."""
+    try:
+        session = websocket.session
+    except Exception:
+        return None
+    if not session.get("username") or not session.get("role"):
+        return None
+    if _session_expired(session):
+        return None
+    if session.get("sid") and _is_sid_revoked(session["sid"]):
+        return None
+    return session["username"], session["role"]
+
+
+def _ws_origin_ok(websocket: WebSocket):
+    """A browser always sends Origin on a WebSocket handshake; a script
+    with a cookie jar generally does not. So a missing Origin is allowed
+    (it is not a cross-site browser request), and a present one must
+    match where this app is served from."""
+    origin = websocket.headers.get("origin")
+    if not origin:
+        return True
+    allowed = [o.strip().lower() for o in os.environ.get("BASTION_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    if origin.lower() in allowed:
+        return True
+    host = (websocket.headers.get("host") or "").lower()
+    return bool(host) and urlsplit(origin).netloc.lower() == host
+
+
+@app.websocket("/api/bastion/ws")
+async def api_bastion_ws(websocket: WebSocket):
+    # Everything before accept() closes with a code rather than an HTTP
+    # status: once a WebSocket handshake starts there is no 403 to send.
+    if not bastion_module.enabled() or BASTION is None:
+        await websocket.close(code=1011, reason="bastion unavailable")
+        return
+    if not _ws_origin_ok(websocket):
+        log.warning("bastion: refused a WebSocket from origin %r", websocket.headers.get("origin"))
+        await websocket.close(code=1008, reason="bad origin")
+        return
+    identity = _ws_identity(websocket)
+    if identity is None:
+        await websocket.close(code=1008, reason="not logged in")
+        return
+    user, role = identity
+
+    params = websocket.query_params
+    device = DEVICES_BY_ID.get(params.get("device") or "")
+    if device is None:
+        await websocket.close(code=1008, reason="no such device")
+        return
+    mode = bastion_policy.resolve_mode(role, params.get("mode"))
+    if mode is None:
+        await websocket.close(code=1008, reason=f"the {role} role cannot open a console session")
+        return
+
+    def _int(name, default, lo, hi):
+        try:
+            return max(lo, min(int(params.get(name, default)), hi))
+        except (TypeError, ValueError):
+            return default
+
+    cols, rows = _int("cols", 120, 20, 500), _int("rows", 32, 5, 200)
+    client_ip = websocket.client.host if websocket.client else None
+
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+    outbox: asyncio.Queue = asyncio.Queue()
+
+    try:
+        session, banner = await loop.run_in_executor(
+            None, lambda: BASTION.open(device, user, role, mode, client_ip, cols, rows))
+    except Exception as e:
+        log.warning("bastion: %s could not open %s: %s", user, device.id, e)
+        await websocket.send_json({"t": "error", "message": str(e)})
+        await websocket.close(code=1011, reason="could not open the session")
+        return
+
+    # The reader thread must not touch the event loop directly.
+    session.attach(
+        on_output=lambda text: loop.call_soon_threadsafe(outbox.put_nowait, {"t": "out", "data": text}),
+        on_closed=lambda reason: loop.call_soon_threadsafe(outbox.put_nowait, {"t": "closed", "reason": reason}),
+    )
+
+    async def pump():
+        while True:
+            msg = await outbox.get()
+            await websocket.send_json(msg)
+            if msg["t"] == "closed":
+                return
+
+    sender = asyncio.create_task(pump())
+    await websocket.send_json({
+        "t": "ready", "session": session.id, "mode": mode, "platform": session.platform,
+        "device": device.id, "device_name": device.name, "read_only": session.read_only,
+        "banner": banner,
+    })
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            kind = msg.get("t")
+            try:
+                if kind == "line":
+                    sent, reason = await loop.run_in_executor(None, session.submit_line, msg.get("data", ""))
+                    if not sent:
+                        await websocket.send_json({"t": "refused", "line": msg.get("data", ""), "reason": reason})
+                elif kind == "data":
+                    await loop.run_in_executor(None, session.send_raw, msg.get("data", ""))
+                elif kind == "key":
+                    await loop.run_in_executor(None, session.send_key, msg.get("name", ""))
+                elif kind == "help":
+                    await loop.run_in_executor(None, session.help_request, msg.get("data", ""))
+                elif kind == "resize":
+                    session.resize(msg.get("cols", cols), msg.get("rows", rows))
+            except bastion_module.BastionError as e:
+                await websocket.send_json({"t": "error", "message": str(e)})
+            if session.closed:
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        log.exception("bastion: session %s failed", session.id)
+    finally:
+        session.close("browser closed")
+        BASTION.release(session.id)
+        sender.cancel()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
