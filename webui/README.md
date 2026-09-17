@@ -427,6 +427,19 @@ seconds, indefinitely. The API side of that is fixed too: every edge on a
 port now reports that port's state, resolved once from everything known
 about it, rather than leaving consumers to pick whichever came first.
 
+**Keep the Cloudscape packages on one generation.** Each token compiles to
+a CSS custom property whose name carries a hash of the theme build, so
+packages from different generations reference names the theme never
+defines - and every such reference silently falls back to its *light*
+default. That is what made command output white on a dark page: the
+code-view package asked for `--color-background-code-view-emuorz` while
+the installed components and global-styles defined
+`--color-background-code-view-6vvqfk`. Nothing errors; it just quietly
+ignores dark mode. Upgrading components, global-styles and
+board-components onto the same generation as code-view and design-tokens
+fixed it. If a component looks stuck in light mode, compare the hash it
+asks for against the one the theme defines before looking anywhere else.
+
 **On colour**: only the status colours are taken from the design tokens
 as values, because they read on a light or a dark page alike. Surfaces,
 borders and text are drawn in `currentColor` and inherit from the
