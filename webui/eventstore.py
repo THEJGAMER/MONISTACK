@@ -20,7 +20,7 @@ import hashlib
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import timezone
 
 import event_catalog
 
@@ -208,6 +208,13 @@ class EventStore:
         return n
 
     # --- reads -----------------------------------------------------------------
+
+    def latest_for(self, signature):
+        """The most recent episode for a signature, open or resolved -
+        what the SSH poll consults before raising, to find out whether
+        something newer than its snapshot has already settled the matter."""
+        return self._to_dict(self.db.query_one(
+            "SELECT * FROM events WHERE signature = %s ORDER BY id DESC LIMIT 1", (signature,)))
 
     def open_for(self, signature):
         return self._to_dict(self.db.query_one("SELECT * FROM events WHERE signature = %s AND resolved_at IS NULL", (signature,)))

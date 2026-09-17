@@ -533,9 +533,16 @@ and that line *is* the signal.
    reconciler observed* (up last poll, down now) - not on absolute state,
    or every unused port would be an event at startup - except a port
    someone classified on the Ports tab, which raises if it is down at
-   first sight. A resolve from the poll must postdate the event it would
-   close (a stale snapshot must not close a fresh outage). Fans and PSUs
-   are reconciled directly; consecutive failed polls raise
+   first sight. **Staleness is checked both ways**: the poll reads a cache
+   that can be most of a cycle old while syslog is immediate, so a poll
+   may neither resolve something raised after its snapshot was taken, nor
+   *raise* something syslog has already reported fixed since. Without the
+   second half, a fault that came and went inside one poll interval was
+   re-raised from the snapshot taken while it was down - seen in
+   production, 8.7 seconds after syslog had resolved it - and because a
+   returning fault re-opens its own event, that stretched the episode out
+   rather than leaving an obvious duplicate. Fans and PSUs are reconciled
+   directly; consecutive failed polls raise
    `device.unreachable`; CPU and memory thresholds hold for N polls; and
    optics and interface error counters are read here because syslog never
    carries them (see below).

@@ -24,9 +24,17 @@ Rules of the fallback, learned the hard way in the alarm era:
 - Error counters are cumulative, so only a *rise* is a fault: a port that
   logged errors once a year ago and never again is fine. A counter going
   backwards is a device reboot, not a negative error rate.
+- **Staleness cuts both ways.** The poll reads a cache that can be most of
+  a cycle old; syslog is immediate. A poll must not resolve something
+  raised after the snapshot was taken, and equally must not *raise*
+  something that syslog has already reported fixed since. Seen in
+  production: syslog resolved Te 1/41 at 09:54:56 and the poll re-raised
+  it 8.7 seconds later from a snapshot taken while it was still down.
 """
 import logging
 from datetime import datetime, timezone
+
+from eventstore import signature_for
 
 log = logging.getLogger("webui.events.reconcile")
 
@@ -68,15 +76,15 @@ class SshReconciler:
             polled_dt = _dt(polled_at)
             acted += self._ports(device_id, device, interfaces, polled_dt)
             acted += self._environment(device_id, device, status.get("env") or {}, polled_dt)
-            acted += self._compute(device_id, device, status)
-            acted += self._errors(device_id, device, interfaces)
+            acted += self._compute(device_id, device, status, polled_dt)
+            acted += self._errors(device_id, device, interfaces, polled_dt)
         # Optics ride the poller's slow cycle (every ~5 min), so they have
         # their own freshness stamp - checking them on the fast tick would
         # re-count the same reading every 15 seconds.
         optics_at = status.get("transceivers_polled")
         if optics_at and self._seen_optics_at.get(device_id) != optics_at:
             self._seen_optics_at[device_id] = optics_at
-            acted += self._optics(device_id, device, interfaces)
+            acted += self._optics(device_id, device, interfaces, _dt(optics_at))
         self.acted += acted
         return acted
 
@@ -87,9 +95,26 @@ class SshReconciler:
         optics and its error counters too, not only its link state."""
         return self.ports.severity_for(device_id, port, None) == "ignore"
 
-    def _raise(self, kind, device_id, device, subject, title, detail=None, severity=None):
+    def _superseded(self, kind, device_id, device, subject, fresh_as_of):
+        """Has anything newer than this snapshot already closed this?
+
+        The mirror of _resolve_if_stale_safe. Without it, a fault that
+        came and went inside one poll interval is re-raised from the
+        snapshot taken while it was down - and because a returning fault
+        re-opens its own event, that also drags the episode out."""
+        if fresh_as_of is None:
+            return False
+        last = self.store.latest_for(signature_for(kind, device_id or device, subject))
+        if not last or not last.get("resolved_at"):
+            return False
+        resolved = _dt(last["resolved_at"])
+        return resolved is not None and resolved > fresh_as_of
+
+    def _raise(self, kind, device_id, device, subject, title, detail=None, severity=None, fresh_as_of=None):
         sev = severity or self.settings.severity_for(kind)
         if sev == "ignore":
+            return 0
+        if self._superseded(kind, device_id, device, subject, fresh_as_of):
             return 0
         _, created = self.store.raise_event(kind, sev, device_id, device, subject, title, detail=detail, source="ssh")
         return 1 if created else 0
@@ -146,7 +171,8 @@ class SshReconciler:
                 first_sight = prev is None
                 if prev == "up" or (first_sight and self.ports.has_override(device_id, port)):
                     acted += self._raise("port.link_down", device_id, device, port, f"Link down: {port} on {device}",
-                                         detail="The SSH poll found it down" + (", on the first look at this port" if first_sight else ""), severity=sev)
+                                         detail="The SSH poll found it down" + (", on the first look at this port" if first_sight else ""),
+                                         severity=sev, fresh_as_of=polled_dt)
             elif state == "up":
                 acted += self._resolve_if_stale_safe("port.link_down", device_id, device, port, polled_dt, "SSH poll shows the port up")
         return acted
@@ -169,12 +195,13 @@ class SshReconciler:
                 acted += self._resolve_if_stale_safe("env.psu", device_id, device, subject, polled_dt, "SSH poll shows it up")
         for (kind, subject), state in faulted.items():
             name = "Power supply fault" if kind == "env.psu" else "Fan fault"
-            acted += self._raise(kind, device_id, device, subject, f"{name}: {subject} on {device}", detail=f"show environment reports it {state}")
+            acted += self._raise(kind, device_id, device, subject, f"{name}: {subject} on {device}",
+                                 detail=f"show environment reports it {state}", fresh_as_of=polled_dt)
         return acted
 
     # --- optics and error counters -------------------------------------------
 
-    def _optics(self, device_id, device, interfaces):
+    def _optics(self, device_id, device, interfaces, fresh_as_of=None):
         acted = 0
         ceiling = float(self.settings.params_for("optic.temperature").get("ceiling_c", 70))
         floor_dbm = float(self.settings.params_for("optic.rx_power_low").get("floor_dbm", -12))
@@ -190,7 +217,8 @@ class SshReconciler:
             self._optic_present[(device_id, port)] = now
             if was and not now:
                 acted += self._raise("optic.removed", device_id, device, port,
-                                     f"Transceiver removed: {port} on {device}", detail="the SSH poll no longer sees a module")
+                                     f"Transceiver removed: {port} on {device}",
+                                     detail="The SSH poll no longer sees a module", fresh_as_of=fresh_as_of)
             elif now and not was:
                 acted += self._resolve_now("optic.removed", device_id, port, "a transceiver is in the port again")
 
@@ -206,28 +234,28 @@ class SshReconciler:
                                f"Low receive power: {port} on {device}{rx_txt}",
                                "The module raised its own low-power alarm" if t.get("rx_power_low_alarm_flag")
                                else f"Receiving {rx:.1f} dBm, against a floor of {floor_dbm:.0f} dBm",
-                               "receive power is back within limits")
+                               "receive power is back within limits", fresh_as_of=fresh_as_of)
             acted += self._set("optic.rx_power_high", bool(t.get("rx_power_high_alarm_flag")), device_id, device, port,
                                f"High receive power: {port} on {device}{rx_txt}",
-                               "The module raised its own high-power alarm", "receive power is back within limits")
+                               "The module raised its own high-power alarm", "receive power is back within limits", fresh_as_of=fresh_as_of)
             fault = t.get("tx_fault_state") or t.get("tx_power_low_alarm_flag")
             acted += self._set("optic.tx_fault", bool(fault), device_id, device, port,
                                f"Transmit fault: {port} on {device}",
                                "The module reports a transmit fault" if t.get("tx_fault_state")
                                else f"Transmit power has fallen to {tx:.1f} dBm",
-                               "the module no longer reports a transmit fault")
+                               "the module no longer reports a transmit fault", fresh_as_of=fresh_as_of)
             hot = t.get("temperature_high_alarm_flag") or (temp is not None and temp >= ceiling)
             acted += self._set("optic.temperature", bool(hot), device_id, device, port,
                                f"Optic temperature: {port} on {device}" + (f" at {temp:.0f} C" if temp is not None else ""),
                                "The module raised its own temperature alarm" if t.get("temperature_high_alarm_flag")
                                else f"Running at {temp:.0f} C, against a ceiling of {ceiling:.0f} C",
-                               "the optic has cooled")
+                               "the optic has cooled", fresh_as_of=fresh_as_of)
         return acted
 
-    def _set(self, kind, faulted, device_id, device, subject, title, detail, cleared_detail):
+    def _set(self, kind, faulted, device_id, device, subject, title, detail, cleared_detail, fresh_as_of=None):
         """Raise while the condition holds, resolve the moment it stops."""
         if faulted:
-            return self._raise(kind, device_id, device, subject, title, detail=detail)
+            return self._raise(kind, device_id, device, subject, title, detail=detail, fresh_as_of=fresh_as_of)
         return self._resolve_now(kind, device_id, subject, cleared_detail)
 
     def _resolve_now(self, kind, device_id, subject, detail):
@@ -242,7 +270,7 @@ class SshReconciler:
         ("port.discards", ("input_discards", "output_discards"), "Discards"),
     )
 
-    def _errors(self, device_id, device, interfaces):
+    def _errors(self, device_id, device, interfaces, fresh_as_of=None):
         acted = 0
         for iface in interfaces:
             port = iface.get("port")
@@ -267,14 +295,15 @@ class SshReconciler:
                 if delta >= threshold:
                     acted += self._raise(kind, device_id, device, port,
                                          f"{label} rising: {port} on {device} (+{delta})",
-                                         detail=f"{delta} more since the last poll, {total} in total")
+                                         detail=f"{delta} more since the last poll, {total} in total",
+                                         fresh_as_of=fresh_as_of)
                 elif delta == 0:
                     acted += self._resolve_now(kind, device_id, port, f"no further increase ({total} in total)")
             if current:
                 self._counters[key] = {**previous, **current}
         return acted
 
-    def _compute(self, device_id, device, status):
+    def _compute(self, device_id, device, status, fresh_as_of=None):
         acted = 0
         cpu = ((status.get("cpu") or {}).get("overall") or {}).get("1min")
         if cpu is not None:
@@ -284,7 +313,8 @@ class SshReconciler:
                 self._cpu_passes[device_id] = n
                 if n >= max(1, int(p.get("polls", 3))):
                     acted += self._raise("compute.cpu_high", device_id, device, "cpu", f"High CPU on {device}: {float(cpu):.0f}%",
-                                         detail=f"At {float(cpu):.0f}% for {n} consecutive polls, against a threshold of {p.get('raise_percent', 90)}%")
+                                         detail=f"At {float(cpu):.0f}% for {n} consecutive polls, against a threshold of {p.get('raise_percent', 90)}%",
+                                         fresh_as_of=fresh_as_of)
             else:
                 self._cpu_passes[device_id] = 0
                 if float(cpu) <= float(p.get("clear_percent", 80)):
@@ -300,7 +330,8 @@ class SshReconciler:
                 self._mem_passes[device_id] = n
                 if n >= max(1, int(p.get("polls", 2))):
                     acted += self._raise("compute.memory_high", device_id, device, "memory", f"High memory on {device}: {pct:.0f}%",
-                                         detail=f"{pct:.0f}% in use for {n} consecutive polls, against a threshold of {p.get('raise_percent', 90)}%")
+                                         detail=f"{pct:.0f}% in use for {n} consecutive polls, against a threshold of {p.get('raise_percent', 90)}%",
+                                         fresh_as_of=fresh_as_of)
             else:
                 self._mem_passes[device_id] = 0
                 if pct <= float(p.get("clear_percent", 85)):

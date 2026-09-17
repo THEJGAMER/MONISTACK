@@ -36,6 +36,11 @@ class _StoreR(_Store):
     def open_kind(self, kind, device_id, subject):
         return self.open.get(signature_for(kind, device_id, subject))
 
+    def latest_for(self, signature):
+        """No history by default - see test_reconcile_staleness.py for the
+        subclass that has some."""
+        return None
+
 
 def _status(polled_at, ports=(), env=None, cpu=None, mem=None, error=None, interfaces=None, optics_at=None):
     return {"last_polled": polled_at, "last_error": error, "transceivers_polled": optics_at,
